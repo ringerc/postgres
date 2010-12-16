@@ -169,7 +169,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		pDump = loadDbgHelp();
 		if (pDump==NULL)
 		{
-			elog(WARNING, "crashdump: Cannot write dump, failed to load dbghelp.dll");
+			write_stderr("could not load dbghelp.dll, cannot write crashdump");
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
@@ -183,17 +183,16 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 							  NULL);
 		if (dumpFile==INVALID_HANDLE_VALUE)
 		{
-			elog(WARNING, "crashdump: Unable to open dump file %s for writing (win32 error %i)",
+			write_stderr("could not open crash dump file %s for writing: error code %d",
 					dumpPath, GetLastError());
-			elog(DEBUG1, "crashdump: is there a 'crashdump' directory within the data dir, and is it writable by the postgres user?");
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
 		if ((*pDump)(selfProcHandle, selfPid, dumpFile, dumpType, &ExInfo,
 					 NULL, NULL))
-			elog(WARNING,"crashdump: wrote crash dump to %s", &dumpPath[0]);
+			write_stderr("wrote crash dump to %s", dumpPath);
 		else
-			elog(WARNING,"crashdump: failed to write dump file to %s (win32 error %i)",
+			write_stderr("could not write crash dump to %s: error code %d",
 					dumpPath, GetLastError());
 
 		CloseHandle(dumpFile);
