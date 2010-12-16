@@ -135,6 +135,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 	if (attribs != INVALID_FILE_ATTRIBUTES && (attribs & FILE_ATTRIBUTE_DIRECTORY) )
 	{
 		/* 'crashdumps' exists and is a directory. Try to write a dump' */
+		HMODULE hDll = NULL;
 		IMAGEHLPAPIVERSION pApiVersion = NULL;
 		MINIDUMPWRITEDUMP pDump = NULL;
 		LPAPI_VERSION version;
