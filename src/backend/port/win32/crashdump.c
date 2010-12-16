@@ -189,7 +189,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 					 NULL, NULL))
 			write_stderr("wrote crash dump to %s", dumpPath);
 		else
-			write_stderr("could not write crash dump to %s: error code %d",
+			write_stderr("could not write crash dump to %s: error code %08x",
 					dumpPath, GetLastError());
 
 		CloseHandle(dumpFile);
