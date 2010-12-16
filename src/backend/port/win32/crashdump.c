@@ -57,6 +57,7 @@
  * http://www.debuginfo.com/articles/effminidumps.html
  */
 
+typedef LPAPI_VERSION (WINAPI *IMAGEHLPAPIVERSION)(void);
 typedef BOOL (WINAPI *MINIDUMPWRITEDUMP)(HANDLE hProcess, DWORD dwPid, HANDLE hFile, MINIDUMP_TYPE DumpType,
 									CONST PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
 									CONST PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
@@ -75,11 +76,10 @@ typedef BOOL (WINAPI *MINIDUMPWRITEDUMP)(HANDLE hProcess, DWORD dwPid, HANDLE hF
  * If NULL is returned, loading failed and the crash dump handler should
  * not try to continue.
  */
-static MINIDUMPWRITEDUMP
+static HMODULE
 loadDbgHelp(void)
 {
 	HMODULE hDll = NULL;
-	MINIDUMPWRITEDUMP pDump = NULL;
 	char dbgHelpPath[_MAX_PATH];
 
 	if (GetModuleFileName(NULL, dbgHelpPath, _MAX_PATH))
@@ -109,10 +109,7 @@ loadDbgHelp(void)
 		hDll = LoadLibrary("DBGHELP.DLL");
 	}
 
-	if (hDll!=NULL)
-		pDump = (MINIDUMPWRITEDUMP)GetProcAddress(hDll, "MiniDumpWriteDump");
-
-	return pDump;
+	return hDll;
 }
 
 
@@ -138,7 +135,9 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 	if (attribs != INVALID_FILE_ATTRIBUTES && (attribs & FILE_ATTRIBUTE_DIRECTORY) )
 	{
 		/* 'crashdumps' exists and is a directory. Try to write a dump' */
+		IMAGEHLPAPIVERSION pApiVersion = NULL;
 		MINIDUMPWRITEDUMP pDump = NULL;
+		LPAPI_VERSION version;
 		char dumpPath[_MAX_PATH];
 
 		/*
@@ -146,10 +145,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		 * and memory mapped files.
 		 */
 		MINIDUMP_TYPE dumpType = MiniDumpNormal |
-/*					 MiniDumpWithIndirectlyReferencedMemory |*/
 					 MiniDumpWithHandleData |
-/*					 MiniDumpWithThreadInfo |*/
-/*					 MiniDumpWithPrivateReadWriteMemory |*/
 					 MiniDumpWithDataSegs;
 
 		HANDLE selfProcHandle = GetCurrentProcess();
@@ -162,12 +158,33 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		ExInfo.ExceptionPointers = pExceptionInfo;
 		ExInfo.ClientPointers = FALSE;
 
-		/* Load the dbghelp.dll library */
-		pDump = loadDbgHelp();
-		if (pDump==NULL)
+		/* Load the dbghelp.dll library and functions */
+		hDll = loadDbgHelp();
+		pApiVersion = (IMAGEHLPAPIVERSION)GetProcAddress(hDll, "ImagehlpApiVersion");
+		pDump = (MINIDUMPWRITEDUMP)GetProcAddress(hDll, "MiniDumpWriteDump");
+
+		if (pApiVersion==NULL || pDump==NULL)
 		{
 			write_stderr("could not load dbghelp.dll, cannot write crashdump\n");
 			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
+		/*
+		 * Add additional flags for dumping if supported by the
+		 * loaded version of dbghelp.dll.
+		 */
+		version = (*pApiVersion)();
+		if (version->MajorVersion >= 6)
+		{
+			/* Supported in versions higher than 5.1 */
+			dumpType |= MiniDumpWithIndirectlyReferencedMemory |
+				MiniDumpWithPrivateReadWriteMemory;
+		}
+		if (version->MajorVersion > 6 ||
+			(version->MajorVersion == 6 && version->MinorVersion > 1))
+		{
+			/* Supported in versions higher than 6.1 */
+			dumpType |= MiniDumpWithThreadInfo;
 		}
 
 		systemTicks = GetTickCount();
