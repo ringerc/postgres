@@ -166,7 +166,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		pDump = loadDbgHelp();
 		if (pDump==NULL)
 		{
-			write_stderr("could not load dbghelp.dll, cannot write crashdump");
+			write_stderr("could not load dbghelp.dll, cannot write crashdump\n");
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
@@ -180,16 +180,16 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 							  NULL);
 		if (dumpFile==INVALID_HANDLE_VALUE)
 		{
-			write_stderr("could not open crash dump file %s for writing: error code %d",
+			write_stderr("could not open crash dump file %s for writing: error code %d\n",
 					dumpPath, GetLastError());
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
 		if ((*pDump)(selfProcHandle, selfPid, dumpFile, dumpType, &ExInfo,
 					 NULL, NULL))
-			write_stderr("wrote crash dump to %s", dumpPath);
+			write_stderr("wrote crash dump to %s\n", dumpPath);
 		else
-			write_stderr("could not write crash dump to %s: error code %08x",
+			write_stderr("could not write crash dump to %s: error code %08x\n",
 					dumpPath, GetLastError());
 
 		CloseHandle(dumpFile);
