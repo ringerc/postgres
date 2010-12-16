@@ -21,19 +21,18 @@ subdir = src/backend/port
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-OBJS = dynloader.o pg_sema.o pg_shmem.o pg_latch.o $(TAS)
+# The pg_ files are selected from several alternative implementations
+# by code in configure.in and src/tools/msvc/Mkvcbuild.pm (for win32).
+# Use that mechanism rather than trying to use Make conditionals, because
+# the win32 perl-based build scripts don't understand Make conditionals
+# very well.
+OBJS = dynloader.o pg_sema.o pg_shmem.o pg_latch.o pg_crashdump.o $(TAS)
 
 ifeq ($(PORTNAME), darwin)
 SUBDIRS += darwin
 endif
 ifeq ($(PORTNAME), win32)
 SUBDIRS += win32
-endif
-
-ifeq ($(PORTNAME), win32)
-OBJS += win32_crashdump.o
-else
-OBJS += unix_crashdump.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk
