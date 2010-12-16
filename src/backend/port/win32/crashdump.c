@@ -161,12 +161,18 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 
 		/* Load the dbghelp.dll library and functions */
 		hDll = loadDbgHelp();
+		if (hDll == NULL)
+		{
+			write_stderr("could not load dbghelp.dll, cannot write crashdump\n");
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
 		pApiVersion = (IMAGEHLPAPIVERSION)GetProcAddress(hDll, "ImagehlpApiVersion");
 		pDump = (MINIDUMPWRITEDUMP)GetProcAddress(hDll, "MiniDumpWriteDump");
 
 		if (pApiVersion==NULL || pDump==NULL)
 		{
-			write_stderr("could not load dbghelp.dll, cannot write crashdump\n");
+			write_stderr("could not load required functions in dbghelp.dll, cannot write crashdump\n");
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
