@@ -38,7 +38,7 @@
 
 #include "postgres.h"
 
-#define VC_EXTRALEAN
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
 #include <dbghelp.h>
