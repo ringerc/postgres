@@ -198,10 +198,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 
 		CloseHandle(dumpFile);
 	}
-	else
-	{
-		elog(WARNING, "crashdump: Not writing dump, output directory 'crashdumps' missing or not writable.");
-	}
+
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
