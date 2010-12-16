@@ -139,16 +139,8 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		IMAGEHLPAPIVERSION pApiVersion = NULL;
 		MINIDUMPWRITEDUMP pDump = NULL;
 		LPAPI_VERSION version;
+		MINIDUMP_TYPE dumpType;
 		char dumpPath[_MAX_PATH];
-
-		/*
-		 * Dump pretty much everything except shared memory, code segments,
-		 * and memory mapped files.
-		 */
-		MINIDUMP_TYPE dumpType = MiniDumpNormal |
-					 MiniDumpWithHandleData |
-					 MiniDumpWithDataSegs;
-
 		HANDLE selfProcHandle = GetCurrentProcess();
 		DWORD selfPid = GetProcessId(selfProcHandle);
 		HANDLE dumpFile;
@@ -177,10 +169,15 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		}
 
 		/*
-		 * Add additional flags for dumping if supported by the
-		 * loaded version of dbghelp.dll.
+		 * Dump as much as we can, except shared memory, code segments,
+		 * and memory mapped files.
+		 * Exactly what we can dump depends on the version of dbghelp.dll.
 		 */
 		version = (*pApiVersion)();
+
+		dumpType = MiniDumpNormal | MiniDumpWithHandleData |
+			MiniDumpWithDataSegs;
+
 		if (version->MajorVersion >= 6)
 		{
 			/* Supported in versions higher than 5.1 */
