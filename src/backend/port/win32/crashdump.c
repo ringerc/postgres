@@ -3,8 +3,8 @@
  * win32_crashdump.c
  *         Automatic crash dump creation for PostgreSQL on Windows
  *
- * The crashdump feature traps unhandled win32 exceptions produced by the backend
- * the module is loaded in, and tries to produce a Windows MiniDump crash
+ * The crashdump feature traps unhandled win32 exceptions produced by the
+ * backend, and tries to produce a Windows MiniDump crash
  * dump for later debugging and analysis. The machine performing the dump
  * doesn't need any special debugging tools; the user only needs to send
  * the dump to somebody who has the same version of PostgreSQL and has debugging
@@ -12,29 +12,26 @@
  *
  * crashdump module originally by Craig Ringer <ringerc@ringerc.id.au>
  *
- * LIMITATIONS:
- * ============
+ * LIMITATIONS
+ * ===========
  * This *won't* work in hard OOM situations or stack overflows.
  *
  * For those, it'd be necessary to take a much more complicated approach where
  * the handler switches to a new stack (if it can) and forks a helper process
- * to debug its self. That's in the too hard basket as far as I'm concerned;
- * this approach will get 90% of the results with 10% of the work.
+ * to debug its self.
  *
- * POSSIBLE FUTURE WORK:
- * =====================
+ * POSSIBLE FUTURE WORK
+ * ====================
  * For bonus points, the crash dump format permits embedding of user-supplied data.
  * If there's anything else (postgresql.conf? Last few lines of a log file?) that
  * should always be supplied with a crash dump, it could potentially be added,
- * though at the cost of a greater chance of the crash dump failing. Again,
- * I'm not going to tackle that, but thought it worth mentioning in case
- * someone wants it down the track.
+ * though at the cost of a greater chance of the crash dump failing.
  *
  *
- * Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  src/backend/port/win32_crashdump.c
+ *	  src/backend/port/win32/crashdump.c
  *
  *-------------------------------------------------------------------------
  */
@@ -48,7 +45,8 @@
 
 /*
  * Much of the following code is based on CodeProject and MSDN examples,
- * particularly http://www.codeproject.com/KB/debug/postmortemdebug_standalone1.aspx
+ * particularly
+ * http://www.codeproject.com/KB/debug/postmortemdebug_standalone1.aspx
  *
  * Useful MSDN articles:
  *
@@ -83,8 +81,6 @@ typedef BOOL (WINAPI *MINIDUMPWRITEDUMP)(HANDLE hProcess, DWORD dwPid, HANDLE hF
 static MINIDUMPWRITEDUMP
 loadDbgHelp(void)
 {
-	// Use the dbghelp.dll shipped with Pg if we can find and load
-	// it, otherwise fall back to the copy installed in Windows.
 	HMODULE hDll = NULL;
 	MINIDUMPWRITEDUMP pDump = NULL;
 	char dbgHelpPath[_MAX_PATH];
@@ -102,11 +98,13 @@ loadDbgHelp(void)
 		/*
 		 * Load whichever version of dbghelp.dll we can find.
 		 *
-		 * It is safe to call LoadLibrary with an unqualified name (thus searching
-		 * the PATH) only because the postmaster ensures that backends run in a sensible
-		 * environment with the datadir as the working directory. It's usually unsafe to
-		 * LoadLibrary("unqualifiedname.dll") because the user can run your program with
-		 * a CWD containing a malicious copy of "unqualifiedname.dll" thanks to the way
+		 * It is safe to call LoadLibrary with an unqualified name (thus
+		 * searching the PATH) only because the postmaster ensures that
+		 * backends run in a sensible environment with the datadir as
+		 * the working directory. It's usually unsafe to
+		 * LoadLibrary("unqualifiedname.dll")
+		 * because the user can run your program with a CWD containing
+		 * a malicious copy of "unqualifiedname.dll" thanks to the way
 		 * windows (rather insecurely) includes the CWD in the PATH by default.
 		 */
 		hDll = LoadLibrary( "DBGHELP.DLL" );
@@ -119,24 +117,23 @@ loadDbgHelp(void)
 }
 
 /*
- * This function is the exception handler passed to SetUnhandledExceptionFilter. It's invoked
- * only if there's an unhandled exception. The handler will use dbghelp.dll to generate a crash
- * dump, then resume the normal unhandled exception process, which will generally exit with a
- * an error message from the runtime.
+ * This function is the exception handler passed to SetUnhandledExceptionFilter.
+ * It's invoked only if there's an unhandled exception. The handler will use
+ * dbghelp.dll to generate a crash dump, then resume the normal unhandled
+ * exception process, which will generally exit with a an error message from
+ * the runtime.
  *
  * This function is run under the unhandled exception handler, effectively
  * in a crash context, so it should be careful with memory and avoid using
- * any PostgreSQL API or other functions that use PostgreSQL API. For that reason,
- * logging calls should not be made until after the dump has been written
- * successfully.
- *
+ * any PostgreSQL functions.
  */
 static LONG WINAPI
 crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 {
-	/* We only write crash dumps if the 'crashdumps' directory within
-	 * the postgres data directory exists. That's the documented way to
-	 * turn crash dumps on and off. */
+	/*
+	 * We only write crash dumps if the "crashdumps" directory within
+	 * the postgres data directory exists.
+	 */
 	DWORD attribs = GetFileAttributesA("crashdumps");
 	if (attribs != INVALID_FILE_ATTRIBUTES && (attribs & FILE_ATTRIBUTE_DIRECTORY) )
 	{
@@ -144,7 +141,10 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		MINIDUMPWRITEDUMP pDump = NULL;
 		char dumpPath[_MAX_PATH];
 
-		// Dump pretty much everything except shared memory, code segments, and memory mapped files
+		/*
+		 * Dump pretty much everything except shared memory, code segments,
+		 * and memory mapped files.
+		 */
 		MINIDUMP_TYPE dumpType = MiniDumpNormal|\
 					 MiniDumpWithIndirectlyReferencedMemory|\
 					 MiniDumpWithHandleData|\
@@ -200,9 +200,9 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+
 void
 pgwin32_install_crashdump_handler(void)
 {
-	// http://msdn.microsoft.com/en-us/library/ms680634(VS.85).aspx
 	SetUnhandledExceptionFilter( crashDumpHandler );
 }
