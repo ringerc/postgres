@@ -30,6 +30,12 @@ ifeq ($(PORTNAME), win32)
 SUBDIRS += win32
 endif
 
+ifeq ($(PORTNAME), win32)
+OBJS += win32_crashdump.o
+else
+OBJS += unix_crashdump.o
+endif
+
 include $(top_srcdir)/src/backend/common.mk
 
 tas.o: tas.s
