@@ -146,10 +146,10 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		 * and memory mapped files.
 		 */
 		MINIDUMP_TYPE dumpType = MiniDumpNormal |
-					 MiniDumpWithIndirectlyReferencedMemory |
+/*					 MiniDumpWithIndirectlyReferencedMemory |*/
 					 MiniDumpWithHandleData |
-					 MiniDumpWithThreadInfo |
-					 MiniDumpWithPrivateReadWriteMemory |
+/*					 MiniDumpWithThreadInfo |*/
+/*					 MiniDumpWithPrivateReadWriteMemory |*/
 					 MiniDumpWithDataSegs;
 
 		HANDLE selfProcHandle = GetCurrentProcess();
