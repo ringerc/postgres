@@ -84,15 +84,17 @@ loadDbgHelp(void)
 	HMODULE hDll = NULL;
 	MINIDUMPWRITEDUMP pDump = NULL;
 	char dbgHelpPath[_MAX_PATH];
-	if (GetModuleFileName( NULL, dbgHelpPath, _MAX_PATH ))
+
+	if (GetModuleFileName(NULL, dbgHelpPath, _MAX_PATH))
 	{
-		char *slash = strrchr( dbgHelpPath, '\\' );
+		char *slash = strrchr(dbgHelpPath, '\\');
 		if (slash)
 		{
-			strcpy( slash+1, "DBGHELP.DLL" );
-			hDll = LoadLibrary( dbgHelpPath );
+			strcpy(slash+1, "DBGHELP.DLL");
+			hDll = LoadLibrary(dbgHelpPath);
 		}
 	}
+
 	if (hDll==NULL)
 	{
 		/*
@@ -107,14 +109,15 @@ loadDbgHelp(void)
 		 * a malicious copy of "unqualifiedname.dll" thanks to the way
 		 * windows (rather insecurely) includes the CWD in the PATH by default.
 		 */
-		hDll = LoadLibrary( "DBGHELP.DLL" );
+		hDll = LoadLibrary("DBGHELP.DLL");
 	}
+
 	if (hDll!=NULL)
-	{
-		pDump = (MINIDUMPWRITEDUMP)GetProcAddress( hDll, "MiniDumpWriteDump" );
-	}
+		pDump = (MINIDUMPWRITEDUMP)GetProcAddress(hDll, "MiniDumpWriteDump");
+
 	return pDump;
 }
+
 
 /*
  * This function is the exception handler passed to SetUnhandledExceptionFilter.
@@ -145,23 +148,24 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		 * Dump pretty much everything except shared memory, code segments,
 		 * and memory mapped files.
 		 */
-		MINIDUMP_TYPE dumpType = MiniDumpNormal|\
-					 MiniDumpWithIndirectlyReferencedMemory|\
-					 MiniDumpWithHandleData|\
-					 MiniDumpWithThreadInfo|\
-					 MiniDumpWithPrivateReadWriteMemory|
+		MINIDUMP_TYPE dumpType = MiniDumpNormal |
+					 MiniDumpWithIndirectlyReferencedMemory |
+					 MiniDumpWithHandleData |
+					 MiniDumpWithThreadInfo |
+					 MiniDumpWithPrivateReadWriteMemory |
 					 MiniDumpWithDataSegs;
 
 		HANDLE selfProcHandle = GetCurrentProcess();
 		DWORD selfPid = GetProcessId(selfProcHandle);
 		HANDLE dumpFile;
 		DWORD systemTicks;
-
 		struct _MINIDUMP_EXCEPTION_INFORMATION ExInfo;
+
 		ExInfo.ThreadId = GetCurrentThreadId();
 		ExInfo.ExceptionPointers = pExceptionInfo;
 		ExInfo.ClientPointers = FALSE;
 
+		/* Load the dbghelp.dll library */
 		pDump = loadDbgHelp();
 		if (pDump==NULL)
 		{
@@ -170,27 +174,28 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		}
 
 		systemTicks = GetTickCount();
-		snprintf(&dumpPath[0], _MAX_PATH, "crashdumps\\postgres-pid%0i-%0i.mdmp", selfPid, systemTicks);
+		snprintf(dumpPath, _MAX_PATH,
+				 "crashdumps\\postgres-pid%0i-%0i.mdmp", selfPid, systemTicks);
 		dumpPath[_MAX_PATH-1] = '\0';
-		dumpFile = CreateFile( dumpPath, GENERIC_WRITE, FILE_SHARE_WRITE,\
-				NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+
+		dumpFile = CreateFile(dumpPath, GENERIC_WRITE, FILE_SHARE_WRITE,
+							  NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+							  NULL);
 		if (dumpFile==INVALID_HANDLE_VALUE)
 		{
 			elog(WARNING, "crashdump: Unable to open dump file %s for writing (win32 error %i)",
-					&dumpPath[0], GetLastError());
+					dumpPath, GetLastError());
 			elog(DEBUG1, "crashdump: is there a 'crashdump' directory within the data dir, and is it writable by the postgres user?");
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
-		if( (*pDump)( selfProcHandle, selfPid, dumpFile, dumpType, &ExInfo, NULL, NULL ) )
-		{
+		if ((*pDump)(selfProcHandle, selfPid, dumpFile, dumpType, &ExInfo,
+					 NULL, NULL))
 			elog(WARNING,"crashdump: wrote crash dump to %s", &dumpPath[0]);
-		}
 		else
-		{
 			elog(WARNING,"crashdump: failed to write dump file to %s (win32 error %i)",
-					&dumpPath[0], GetLastError());
-		}
+					dumpPath, GetLastError());
+
 		CloseHandle(dumpFile);
 	}
 	else
@@ -204,5 +209,5 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 void
 pgwin32_install_crashdump_handler(void)
 {
-	SetUnhandledExceptionFilter( crashDumpHandler );
+	SetUnhandledExceptionFilter(crashDumpHandler);
 }
