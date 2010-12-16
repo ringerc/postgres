@@ -1716,13 +1716,6 @@ else
   LATCH_IMPLEMENTATION="src/backend/port/win32_latch.c"
 fi
 
-# Select crashdump implementation type.
-if test "$PORTNAME" != "win32"; then
-  CRASHDUMP_IMPLEMENTATION="src/backend/port/unix_crashdump.c"
-else
-  CRASHDUMP_IMPLEMENTATION="src/backend/port/win32_crashdump.c"
-fi
-
 # If not set in template file, set bytes to use libc memset()
 if test x"$MEMSET_LOOP_LIMIT" = x"" ; then
   MEMSET_LOOP_LIMIT=1024
@@ -1865,7 +1858,6 @@ AC_CONFIG_LINKS([
   src/backend/port/pg_sema.c:${SEMA_IMPLEMENTATION}
   src/backend/port/pg_shmem.c:${SHMEM_IMPLEMENTATION}
   src/backend/port/pg_latch.c:${LATCH_IMPLEMENTATION}
-  src/backend/port/pg_crashdump.c:${CRASHDUMP_IMPLEMENTATION}
   src/include/dynloader.h:src/backend/port/dynloader/${template}.h
   src/include/pg_config_os.h:src/include/port/${template}.h
   src/Makefile.port:src/makefiles/Makefile.${template}

@@ -201,7 +201,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 }
 
 void
-installCrashDumpHandler(void)
+pgwin32_install_crashdump_handler(void)
 {
 	// http://msdn.microsoft.com/en-us/library/ms680634(VS.85).aspx
 	SetUnhandledExceptionFilter( crashDumpHandler );

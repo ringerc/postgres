@@ -687,8 +687,4 @@ extern int ExceptionalCondition(const char *conditionName,
 					 const char *errorType,
 					 const char *fileName, int lineNumber);
 
-/* backend/port/[platform]/crashdump.c */
-extern void
-installCrashDumpHandler();
-
 #endif   /* POSTGRES_H */
