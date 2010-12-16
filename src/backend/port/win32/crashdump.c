@@ -52,9 +52,6 @@
  *
  * http://msdn.microsoft.com/en-us/library/ff805116(v=VS.85).aspx
  * http://msdn.microsoft.com/en-us/library/ms679294(VS.85).aspx
- * http://msdn.microsoft.com/en-us/library/ms679291(VS.85).aspx
- * http://msdn.microsoft.com/en-us/library/ms680519(v=VS.85).aspx
- * http://msdn.microsoft.com/en-us/library/ms680360(VS.85).aspx
  *
  * Other useful articles on working with minidumps:
  * http://www.debuginfo.com/articles/effminidumps.html
