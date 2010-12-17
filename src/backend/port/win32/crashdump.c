@@ -181,11 +181,11 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 				MiniDumpWithPrivateReadWriteMemory;
 			write_stderr("Detected 5.2 or newer\n");
 		}
-		if (GetProcAddress(hDll, "SymEnumSourceFiles") != NULL)
+		if (GetProcAddress(hDll, "SymFromIndex") != NULL)
 		{
 			/* If this function exists, we have version 6.2 or newer */
 			dumpType |= MiniDumpWithThreadInfo;
-			write_stderr("Detected 5.1 or newer\n");
+			write_stderr("Detected 6.2 or newer\n");
 		}
 
 		systemTicks = GetTickCount();
