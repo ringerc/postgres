@@ -179,13 +179,11 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 			/* If this function exists, we have version 5.2 or newer */
 			dumpType |= MiniDumpWithIndirectlyReferencedMemory |
 				MiniDumpWithPrivateReadWriteMemory;
-			write_stderr("Detected 5.2 or newer\n");
 		}
 		if (GetProcAddress(hDll, "SymFromIndex") != NULL)
 		{
 			/* If this function exists, we have version 6.2 or newer */
 			dumpType |= MiniDumpWithThreadInfo;
-			write_stderr("Detected 6.2 or newer\n");
 		}
 
 		systemTicks = GetTickCount();
