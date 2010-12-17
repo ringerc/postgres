@@ -57,7 +57,6 @@
  * http://www.debuginfo.com/articles/effminidumps.html
  */
 
-typedef LPAPI_VERSION (WINAPI *IMAGEHLPAPIVERSION)(void);
 typedef BOOL (WINAPI *MINIDUMPWRITEDUMP)(HANDLE hProcess, DWORD dwPid, HANDLE hFile, MINIDUMP_TYPE DumpType,
 									CONST PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
 									CONST PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
@@ -136,9 +135,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 	{
 		/* 'crashdumps' exists and is a directory. Try to write a dump' */
 		HMODULE hDll = NULL;
-		IMAGEHLPAPIVERSION pApiVersion = NULL;
 		MINIDUMPWRITEDUMP pDump = NULL;
-		LPAPI_VERSION version;
 		MINIDUMP_TYPE dumpType;
 		char dumpPath[_MAX_PATH];
 		HANDLE selfProcHandle = GetCurrentProcess();
@@ -159,10 +156,9 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
-		pApiVersion = (IMAGEHLPAPIVERSION)GetProcAddress(hDll, "ImagehlpApiVersion");
 		pDump = (MINIDUMPWRITEDUMP)GetProcAddress(hDll, "MiniDumpWriteDump");
 
-		if (pApiVersion==NULL || pDump==NULL)
+		if (pDump==NULL)
 		{
 			write_stderr("could not load required functions in dbghelp.dll, cannot write crashdump\n");
 			return EXCEPTION_CONTINUE_SEARCH;
@@ -171,23 +167,22 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		/*
 		 * Dump as much as we can, except shared memory, code segments,
 		 * and memory mapped files.
-		 * Exactly what we can dump depends on the version of dbghelp.dll.
+		 * Exactly what we can dump depends on the version of dbghelp.dll,
+		 * see:
+		 * http://msdn.microsoft.com/en-us/library/ms680519(v=VS.85).aspx
 		 */
-		version = (*pApiVersion)();
-
 		dumpType = MiniDumpNormal | MiniDumpWithHandleData |
 			MiniDumpWithDataSegs;
 
-		if (version->MajorVersion >= 6)
+		if (GetProcAddress(hDll, "EnumDirTree") != NULL)
 		{
-			/* Supported in versions higher than 5.1 */
+			/* If this function exists, we have version 5.2 or newer */
 			dumpType |= MiniDumpWithIndirectlyReferencedMemory |
 				MiniDumpWithPrivateReadWriteMemory;
 		}
-		if (version->MajorVersion > 6 ||
-			(version->MajorVersion == 6 && version->MinorVersion > 1))
+		if (GetProcAddress(hDll, "SymEnumSourceFiles") != NULL)
 		{
-			/* Supported in versions higher than 6.1 */
+			/* If this function exists, we have version 6.2 or newer */
 			dumpType |= MiniDumpWithThreadInfo;
 		}
 
