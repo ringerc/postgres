@@ -18,14 +18,14 @@
  *
  * For those, it'd be necessary to take a much more complicated approach where
  * the handler switches to a new stack (if it can) and forks a helper process
- * to debug its self.
+ * to debug it self.
  *
  * POSSIBLE FUTURE WORK
  * ====================
- * For bonus points, the crash dump format permits embedding of user-supplied data.
- * If there's anything else (postgresql.conf? Last few lines of a log file?) that
- * should always be supplied with a crash dump, it could potentially be added,
- * though at the cost of a greater chance of the crash dump failing.
+ * For bonus points, the crash dump format permits embedding of user-supplied
+ * data. If there's anything else that should always be supplied with a crash
+ * dump (postgresql.conf? Last few lines of a log file?), it could potentially
+ * be added, though at the cost of a greater chance of the crash dump failing.
  *
  *
  * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
@@ -116,7 +116,7 @@ loadDbgHelp(void)
  * This function is the exception handler passed to SetUnhandledExceptionFilter.
  * It's invoked only if there's an unhandled exception. The handler will use
  * dbghelp.dll to generate a crash dump, then resume the normal unhandled
- * exception process, which will generally exit with a an error message from
+ * exception process, which will generally exit with an error message from
  * the runtime.
  *
  * This function is run under the unhandled exception handler, effectively
