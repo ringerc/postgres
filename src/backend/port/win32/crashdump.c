@@ -94,16 +94,9 @@ loadDbgHelp(void)
 	if (hDll==NULL)
 	{
 		/*
-		 * Load whichever version of dbghelp.dll we can find.
-		 *
-		 * It is safe to call LoadLibrary with an unqualified name (thus
-		 * searching the PATH) only because the postmaster ensures that
-		 * backends run in a sensible environment with the datadir as
-		 * the working directory. It's usually unsafe to
-		 * LoadLibrary("unqualifiedname.dll")
-		 * because the user can run your program with a CWD containing
-		 * a malicious copy of "unqualifiedname.dll" thanks to the way
-		 * windows (rather insecurely) includes the CWD in the PATH by default.
+		 * Load whichever version of dbghelp.dll we can find in the normal
+		 * DLL search path, which will usually be the one that shipped
+		 * with the operating system.
 		 */
 		hDll = LoadLibrary("DBGHELP.DLL");
 	}
