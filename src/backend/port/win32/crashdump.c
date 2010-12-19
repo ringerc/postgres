@@ -63,47 +63,6 @@ typedef BOOL (WINAPI *MINIDUMPWRITEDUMP)(HANDLE hProcess, DWORD dwPid, HANDLE hF
 									CONST PMINIDUMP_CALLBACK_INFORMATION CallbackParam
 									);
 
-/*
- * To perform a crash dump, we need to load dbghelp.dll and find the
- * MiniDumpWriteDump function. If possible, the copy of dbghelp.dll
- * shipped with PostgreSQL is loaded; failing that, the system copy will
- * be used.
- *
- * This function is called in crash handler context. It can't trust that much
- * of the backend is working.
- *
- * If NULL is returned, loading failed and the crash dump handler should
- * not try to continue.
- */
-static HMODULE
-loadDbgHelp(void)
-{
-	HMODULE hDll = NULL;
-	char dbgHelpPath[_MAX_PATH];
-
-	if (GetModuleFileName(NULL, dbgHelpPath, _MAX_PATH))
-	{
-		char *slash = strrchr(dbgHelpPath, '\\');
-		if (slash)
-		{
-			strcpy(slash+1, "DBGHELP.DLL");
-			hDll = LoadLibrary(dbgHelpPath);
-		}
-	}
-
-	if (hDll==NULL)
-	{
-		/*
-		 * Load whichever version of dbghelp.dll we can find in the normal
-		 * DLL search path, which will usually be the one that shipped
-		 * with the operating system.
-		 */
-		hDll = LoadLibrary("DBGHELP.DLL");
-	}
-
-	return hDll;
-}
-
 
 /*
  * This function is the exception handler passed to SetUnhandledExceptionFilter.
@@ -142,7 +101,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 		ExInfo.ClientPointers = FALSE;
 
 		/* Load the dbghelp.dll library and functions */
-		hDll = loadDbgHelp();
+		hDll = LoadLibrary("dbghelp.dll");
 		if (hDll == NULL)
 		{
 			write_stderr("could not load dbghelp.dll, cannot write crashdump\n");
