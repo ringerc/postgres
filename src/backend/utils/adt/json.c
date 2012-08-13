@@ -917,7 +917,7 @@ array_dim_to_json(StringInfo result, int dim, int ndims, int *dims, Datum *vals,
  * Turn an array into JSON.
  */
 static void
-array_to_json_internal(Datum array, StringInfo result, bool use_line_feeds)
+json_from_arrays_internal(Datum array, StringInfo result, bool use_line_feeds)
 {
 	ArrayType  *v = DatumGetArrayTypeP(array);
 	Oid			element_type = ARR_ELEMTYPE(v);
@@ -1054,6 +1054,81 @@ composite_to_json(Datum composite, StringInfo result, bool use_line_feeds)
 	ReleaseTupleDesc(tupdesc);
 }
 
+
+/*
+ * Convert a text[] array of keys and a json[] array of values into a json object.
+ *
+ * Much of this is shamelessly cribbed from hstore_from_arrays. Unlike hstore_from_arrays,
+ * however, a null values array is not accepted.
+ */
+/* DISABLED
+ * See mailing list discussion that dead-ends this approach, starting at:
+ *    http://archives.postgresql.org/message-id/502872C2.2050906@ringerc.id.au
+ * particularly
+ *    http://archives.postgresql.org/message-id/21962.1344833311@sss.pgh.pa.us
+static void
+json_object_from_arrays_internal(ArrayType key_array, boolean keys_null,
+								 ArrayType value_array, boolean values_null,
+								 StringInfo result, bool use_line_feeds)
+{
+	Datum	   *key_datums;
+	bool	   *key_nulls;
+	int			key_count;
+	Datum	   *value_datums;
+	bool	   *value_nulls;
+	int			value_count;
+	ArrayType  *key_array;
+	ArrayType  *value_array;
+	int			i;
+    const char *sep;
+
+	// Sanity checks
+	if (keys_null && values_null)
+		PG_RETURN_NULL();
+	else if (keys_null || values_null)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("Either key or values arrays was null")));
+
+	Assert(ARR_ELEMTYPE(key_array) == TEXTOID);
+	Assert(ARR_ELEMTYPE(value_array) == JSONOID);
+	
+	if (ARR_NDIM(keys) > 1 || ARR_NDIM(values) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("wrong number of array subscripts")));
+
+	if ((ARR_NDIM(key_array) > 0 || ARR_NDIM(value_array) > 0) &&
+		(ARR_NDIM(key_array) != ARR_NDIM(value_array) ||
+		 ARR_DIMS(key_array)[0] != ARR_DIMS(value_array)[0] ||
+		 ARR_LBOUND(key_array)[0] != ARR_LBOUND(value_array)[0]))
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("arrays must have same bounds")));
+
+	// Sanity checking done, unpack the arrays
+	deconstruct_array(key_array,
+					  TEXTOID, -1, false, 'i',
+					  &key_datums, &key_nulls, &key_count);
+
+	deconstruct_array(value_array,
+					  JSONOID, -1, false, 'i',
+					  &value_datums, &value_nulls, &value_count);
+
+	Assert( key_count == value_count );
+	
+	// then loop over them, building a JSON object
+
+    sep = use_line_feeds ? ",\n " : ",";
+
+	appendStringInfoChar(result, '{');
+	for (i = 0; i < key_count; ++i)
+	{
+	}
+	appendStringInfoChar(result, '{');
+}
+*/
+
 /*
  * SQL function array_to_json(row)
  */
@@ -1117,6 +1192,47 @@ row_to_json_pretty(PG_FUNCTION_ARGS)
 
 	composite_to_json(array, result, use_line_feeds);
 
+	PG_RETURN_TEXT_P(cstring_to_text(result->data));
+}
+
+/**
+ * SQL function to build a new JSON object from a pair of arrays,
+ * like hstore(text[], text[]).
+ * 
+ * Arg0 is a one-dimensional text[] array of unescaped, un-quoted names.
+ * Arg1 is a one-dimensional json[] array of values.
+ *
+ * Nulls are legal in both arrays.
+ *
+ */
+extern Datum
+json_object_from_arrays(PG_FUNCTION_ARGS)
+{
+	ArrayType	keys = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType	values = PG_GETARG_ARRAYTYPE_P(1);
+	StringInfo	result;
+
+	result = makeStringInfo();
+	json_object_from_arrays_internal(keys, PG_ARGISNULL(0), values, PG_ARGISNULL(1), result, use_line_feeds);
+	
+	PG_RETURN_TEXT_P(cstring_to_text(result->data));
+}
+
+/**
+ * SQL function to build a new JSON object from a pair of arrays,
+ * like hstore(text[], text[]), with pretty-printing option.
+ */
+extern Datum
+json_object_from_arrays(PG_FUNCTION_ARGS)
+{
+	ArrayType	keys = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType	values = PG_GETARG_ARRAYTYPE_P(1);
+	bool		use_line_feeds = PG_GETARG_BOOL(2);
+	StringInfo	result;
+
+	result = makeStringInfo();
+	json_object_from_arrays_internal(keys, PG_ARGISNULL(0), values, PG_ARGISNULL(1), result, use_line_feeds);
+	
 	PG_RETURN_TEXT_P(cstring_to_text(result->data));
 }
 
