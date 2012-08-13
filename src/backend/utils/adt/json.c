@@ -1121,6 +1121,34 @@ row_to_json_pretty(PG_FUNCTION_ARGS)
 }
 
 /*
+ * SQL function value_to_json(value)
+ *
+ * Wraps datum_to_json for use from SQL, so any element may be
+ * converted to json.
+ */
+extern Datum
+value_to_json(PG_FUNCTION_ARGS)
+{
+	Datum		arg0 = PG_GETARG_DATUM(0);
+	Oid			arg0type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	StringInfo	result;
+	TYPCATEGORY tcategory;
+	Oid			typoutput;
+	bool		typisvarlena;
+
+	if (arg0type == JSONOID)
+		tcategory = TYPCATEGORY_JSON;
+	else
+		tcategory = TypeCategory(arg0type);
+	
+	getTypeOutputInfo(arg0type, &typoutput, &typisvarlena);
+
+	result = makeStringInfo();
+	datum_to_json(arg0, PG_ARGISNULL(0), result, tcategory, typoutput);
+	PG_RETURN_TEXT_P(cstring_to_text(result->data));
+}
+
+/*
  * Produce a JSON string literal, properly escaping characters in the text.
  */
 void

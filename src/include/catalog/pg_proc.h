@@ -4091,6 +4091,10 @@ DATA(insert OID = 3155 (  row_to_json	   PGNSP PGUID 12 1 0 0 0 f f f f t f s 1 
 DESCR("map row to json");
 DATA(insert OID = 3156 (  row_to_json	   PGNSP PGUID 12 1 0 0 0 f f f f t f s 2 0 114 "2249 16" _null_ _null_ _null_ _null_ row_to_json_pretty _null_ _null_ _null_ ));
 DESCR("map row to json with optional pretty printing");
+DATA(insert OID = 3164 (  value_to_json	   PGNSP PGUID 12 1 0 0 0 f f f f f f s 1 0 114 "2283" _null_ _null_ _null_ _null_ value_to_json _null_ _null_ _null_ ));
+DESCR("Convert a simple value to json, quoting and escaping if necessary");
+DATA(insert OID = 3169 (  value_to_json	   PGNSP PGUID 12 1 0 0 0 f f f f f f s 1 0 114 "25" _null_ _null_ _null_ _null_ value_to_json _null_ _null_ _null_ ));
+DESCR("Convert a simple value to json, quoting and escaping if necessary");
 
 /* uuid */
 DATA(insert OID = 2952 (  uuid_in		   PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 2950 "2275" _null_ _null_ _null_ _null_ uuid_in _null_ _null_ _null_ ));

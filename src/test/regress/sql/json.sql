@@ -113,3 +113,42 @@ FROM (SELECT '-Infinity'::float8 AS "float8field") q;
 -- json input
 SELECT row_to_json(q)
 FROM (SELECT '{"a":1,"b": [2,3,4,"d","e","f"],"c":{"p":1,"q":2}}'::json AS "jsonfield") q;
+
+-- value_to_json(json)
+SELECT value_to_json('{"a":1}'::json);
+
+-- value_to_json(text)
+SELECT value_to_json('{"a":1}'::text);
+
+-- value_to_json(unspecified-text)
+SELECT value_to_json('{"a":1}');
+
+-- value_to_json(integer)
+SELECT value_to_json(24);
+
+-- value_to_json(float)
+SELECT value_to_json('24.9'::float8);
+
+-- value_to_json(NaN)
+SELECT value_to_json('NaN'::float8);
+
+-- value_to_json(Infinity)
+SELECT value_to_json('Infinity'::float8);
+
+-- value_to_json(-Infinity)
+SELECT value_to_json('-Infinity'::float8);
+
+-- value_to_json(json[])
+SELECT value_to_json(ARRAY[ '1'::json, '"4"'::json, '{"a":1}'::json ]::json[]);
+
+-- value_to_json(text[])
+SELECT value_to_json(ARRAY[ '1', '"4"', '{"a":1}' ]::text[]);
+
+-- value_to_json(int[])
+SELECT value_to_json(ARRAY[1,2,3,4,-1]);
+
+-- value_to_json(row)
+SELECT value_to_json(row(1,'foo'));
+
+-- value_to_json(emptyrow)
+SELECT value_to_json(row());
