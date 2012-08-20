@@ -1540,4 +1540,71 @@ SELECT pg_advisory_lock(q.id) FROM
     indexes should be used instead.
    </para>
   </sect1>
+
+  <sect1 id="mvcc-exceptions">
+   <title>Exceptions to normal transactional rules</title>
+
+   <para>
+    Some PostgreSQL features, functions and data types differ from the
+    usual transactional behaviour described in this chapter. Differences
+    are generally mentioned in the documentation sections for the
+    features they affect. Such exceptions are collected here for
+    easy reference.
+   </para>
+
+   <para>
+    The following actions and features don't follow the typical
+    transactional rules:
+   </para>
+
+   <itemizedlist>
+    <listitem>
+     <para>
+      Serial pseudo-types <xref linkend="datatype-serial">
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <literal>SEQUENCE</literal>s - <xref linkend="functions-sequence">
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      Advisory locks - <xref linkend="advisory-locks">
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      Disk writes to files outside the database, as performed by
+      <literal>COPY ... TO</literal>, adminpack functions, and other add-ons.
+      See <xref linkend="sql-copy">, <xref linkend="adminpack">.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      Any network I/O or inter-process communication not explicitly
+      described as transactional in its documentation. For example,
+      sending an email from PL/PerlU would not be transactional;
+      the email would be sent before the transaction commits and
+      could not be un-sent if the transaction were to roll back.
+    </listitem>
+   </itemizedlist>
+
+   <note>
+    <para>
+     When working with external non-transactional resources like files
+     on disk or network sockets the two-phase commit feature can be
+     useful. See: <xref linkend="sql-prepare-transaction">
+    </para>
+    <para>
+     LISTEN/NOTIFY provides a lighter weight but still transaction-friendly method of
+     triggering changes outside the database in response to changes inside the
+     database. A LISTENing helper program running outside the database can
+     perform actions when it gets a NOTIFY after a transaction commits.  See:
+     <xref linkend="sql-notify">.
+    </para>
+   </note>
+
+  </sect1>
+
  </chapter>
