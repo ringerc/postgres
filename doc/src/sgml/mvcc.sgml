@@ -267,8 +267,7 @@
        made to a <literal>SEQUENCE</literal> (and therefore the counter of a
        <literal>SERIAL</literal>) are immediately visible to all other
        transactions and are not rolled back if the transaction that made the
-       changes aborts.  See <xref linkend="functions-sequence"> and
-       <xref linkend="datatype-serial">.
+       changes aborts.  See <xref linkend="mvcc-exceptions">.
      </para>
    </important>
 
