@@ -100,8 +100,8 @@ pgwin32_open(const char *fileName, int fileFlags,...)
 		 */
 		DWORD		err = GetLastError();
 
-		if (err == ERROR_SHARING_VIOLATION ||
-			err == ERROR_LOCK_VIOLATION)
+		if ((err == ERROR_SHARING_VIOLATION ||
+			err == ERROR_LOCK_VIOLATION) && loops < 300)
 		{
 			pg_usleep(100000);
 			loops++;
@@ -114,9 +114,6 @@ pgwin32_open(const char *fileName, int fileFlags,...)
 						 errdetail("Continuing to retry for 30 seconds."),
 						 errhint("You might have antivirus, backup, or similar software interfering with the database system.")));
 #endif
-
-			if (loops < 300)
-				continue;
 		}
 
 		_dosmaperr(err);
