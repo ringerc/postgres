@@ -73,6 +73,19 @@ select format('%1$s %13$s', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
 select format('%1s', 1);
 select format('%1$', 1);
 select format('%1$1', 1);
---checkk mix of positional and ordered placeholders
+--check mix of positional and ordered placeholders
 select format('Hello %s %1$s %s', 'World', 'Hello again');
 select format('Hello %s %s, %2$s %2$s', 'World', 'Hello again');
+
+-- check pass variadic argument
+select format('%s, %s', variadic array['Hello','World']);
+-- multidimensional array is supported
+select format('%s, %s', variadic array[['Nazdar','Svete'],['Hello','World']]);
+-- check others datatypes
+select format('%s, %s', variadic array[1, 2]);
+select format('%s, %s', variadic array[true, false]);
+select format('%s, %s', variadic array[true, false]::text[]);
+
+-- check positional placeholders
+select format('%2$s, %1$s', variadic array['first', 'second']);
+select format('%2$s, %1$s', variadic array[1, 2]);

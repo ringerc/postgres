@@ -8542,7 +8542,7 @@ generate_function_name(Oid funcid, int nargs, List *argnames,
 							   NIL, argnames, nargs, argtypes,
 							   !OidIsValid(procform->provariadic), true,
 							   &p_funcid, &p_rettype,
-							   &p_retset, NULL, &p_nvargs, &p_true_typeids, NULL);
+							   &p_retset, &p_nvargs, &p_true_typeids, NULL);
 	if ((p_result == FUNCDETAIL_NORMAL ||
 		 p_result == FUNCDETAIL_AGGREGATE ||
 		 p_result == FUNCDETAIL_WINDOWFUNC) &&

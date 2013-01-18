@@ -2330,6 +2330,7 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->funcid = expr->funcid;
 				newexpr->funcresulttype = expr->funcresulttype;
 				newexpr->funcretset = expr->funcretset;
+				newexpr->merge_vararg = expr->merge_vararg;
 				newexpr->funcformat = expr->funcformat;
 				newexpr->funccollid = expr->funccollid;
 				newexpr->inputcollid = expr->inputcollid;
@@ -3625,6 +3626,7 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 		fexpr.funcid = funcid;
 		fexpr.funcresulttype = result_type;
 		fexpr.funcretset = func_form->proretset;
+		fexpr.merge_vararg = false;
 		fexpr.funcformat = COERCE_EXPLICIT_CALL;
 		fexpr.funccollid = result_collid;
 		fexpr.inputcollid = input_collid;
@@ -3959,6 +3961,7 @@ evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 	newexpr->funcid = funcid;
 	newexpr->funcresulttype = result_type;
 	newexpr->funcretset = false;
+	newexpr->merge_vararg = false;
 	newexpr->funcformat = COERCE_EXPLICIT_CALL;	/* doesn't matter */
 	newexpr->funccollid = result_collid;		/* doesn't matter */
 	newexpr->inputcollid = input_collid;
@@ -4089,6 +4092,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	fexpr->funcid = funcid;
 	fexpr->funcresulttype = result_type;
 	fexpr->funcretset = false;
+	fexpr->merge_vararg = false;			/* SQL cannot be variadic "any" */
 	fexpr->funcformat = COERCE_EXPLICIT_CALL;	/* doesn't matter */
 	fexpr->funccollid = result_collid;	/* doesn't matter */
 	fexpr->inputcollid = input_collid;

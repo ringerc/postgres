@@ -78,6 +78,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	List	   *argdefaults;
 	Node	   *retval;
 	bool		retset;
+	bool		merge_vararg;
 	int			nvargs;
 	FuncDetailCode fdresult;
 
@@ -214,8 +215,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	fdresult = func_get_detail(funcname, fargs, argnames, nargs,
 							   actual_arg_types,
 							   !func_variadic, true,
-							   &funcid, &rettype, &retset, &nvargs,
-							   &declared_arg_types, &argdefaults);
+							   &funcid, &rettype, &retset, &merge_vararg,
+							   &nvargs, &declared_arg_types, &argdefaults);
 	if (fdresult == FUNCDETAIL_COERCION)
 	{
 		/*
@@ -384,6 +385,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		funcexpr->funcid = funcid;
 		funcexpr->funcresulttype = rettype;
 		funcexpr->funcretset = retset;
+		funcexpr->merge_vararg = merge_vararg;
 		funcexpr->funcformat = COERCE_EXPLICIT_CALL;
 		/* funccollid and inputcollid will be set by parse_collate.c */
 		funcexpr->args = fargs;
@@ -1001,6 +1003,15 @@ func_select_candidate(int nargs,
  * they don't need that check made.  Note also that when fargnames isn't NIL,
  * the fargs list must be passed if the caller wants actual argument position
  * information to be returned into the NamedArgExpr nodes.
+ *
+ * Special use case is a call variadic function with "any" variadic parameter and
+ * with variadic argument - argument market VARIADIC modifier. Variadic "any"
+ * function expect unpacked variadic arguments passed in fcinfo->args like usual
+ * parameter. Others variadic functions expect variadic argument as a array. So
+ * when we don't wont expand variadic parameter and we have variadic "any"
+ * function, we have to unpack a array to fcinfo->args array and we have to
+ * create short life FmgrInfo fake structure. When this use case is identified,
+ * then output in merge_vararg is true.
  */
 FuncDetailCode
 func_get_detail(List *funcname,
@@ -1013,6 +1024,7 @@ func_get_detail(List *funcname,
 				Oid *funcid,	/* return value */
 				Oid *rettype,	/* return value */
 				bool *retset,	/* return value */
+				bool *merge_vararg,	/* optional return value */
 				int *nvargs,	/* return value */
 				Oid **true_typeids,		/* return value */
 				List **argdefaults)		/* optional return value */
@@ -1301,6 +1313,10 @@ func_get_detail(List *funcname,
 				*argdefaults = defaults;
 			}
 		}
+
+		if (merge_vararg != NULL)
+			*merge_vararg = !expand_variadic && pform->provariadic == ANYOID;
+
 		if (pform->proisagg)
 			result = FUNCDETAIL_AGGREGATE;
 		else if (pform->proiswindow)

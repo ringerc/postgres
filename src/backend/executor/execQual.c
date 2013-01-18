@@ -1728,6 +1728,116 @@ restart:
 	}
 
 	/*
+	 * this is support for variadic function corner case - using variadic argument
+	 * with VARIADIC modifier when variadic "any" function is called. In this case
+	 * we have to create short lived flinfo and fcinfo, because function descriptors
+	 * can be different in any call of variadic function - depends on content of
+	 * variadic array argument.
+	 */
+	if (IsA(fcache->xprstate.expr, FuncExpr) && ((FuncExpr *) fcache->xprstate.expr)->merge_vararg)
+	{
+		FmgrInfo sfinfo;			/* short lived fake finfo */
+		FunctionCallInfo	scinfo;		/* short lived fake fcinfo */
+		FuncExpr sfexpr;			/* short lived fake fcinfo */
+		MemoryContext		oldContext;
+		Oid				vararg_type;
+		Oid				elem_type;
+		bool				elem_typbyval;
+		int16				elem_typlen;
+		char				elem_typalign;
+		ArrayType		*arr;
+		ArrayIterator		iterator;
+		List		*params_exprs;
+		ListCell	*lc;
+		int		n;
+		Datum			value;
+		bool			isnull;
+		int			slice;
+		FuncExpr			*fexpr = (FuncExpr *) fcache->xprstate.expr;
+
+		/* sanity check, a variadic argument should be a array */
+		if (fcinfo->argnull[fcinfo->nargs - 1])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("variadic argument cannot be null")));
+
+		vararg_type = get_fn_expr_argtype(fcinfo->flinfo, fcinfo->nargs - 1);
+		if (!OidIsValid(vararg_type))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not determinate variadic argument data type")));
+		if (!OidIsValid(get_element_type(vararg_type)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("variadic argument should be an array")));
+
+		/* switch to short lived per-tuple context for node's copies */
+		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+		arr = DatumGetArrayTypeP(fcinfo->arg[fcinfo->nargs - 1]);
+		slice = ARR_NDIM(arr) > 1 ? ARR_NDIM(arr) - 1 : 0;
+		elem_type = slice > 0 ? vararg_type : ARR_ELEMTYPE(arr);
+
+		/* ToDo: use element_type depends for dimensions */
+		get_typlenbyvalalign(elem_type,
+							 &elem_typlen,
+							 &elem_typbyval,
+							 &elem_typalign);
+
+		scinfo = (FunctionCallInfo) palloc(sizeof(FunctionCallInfoData));
+
+		/* create short lived copies of fmgr data */
+		fmgr_info_copy(&sfinfo, fcinfo->flinfo, fcinfo->flinfo->fn_mcxt);
+		memcpy(scinfo, fcinfo, sizeof(FunctionCallInfoData));
+		scinfo->flinfo = &sfinfo;
+
+		iterator = array_create_iterator(arr, slice);
+
+		/*
+		 * we have to create short lived fn_expr because variadic 
+		 * "any" functions takes types from expression nodes via get_fn_expr_argtype.
+		 */
+		n = 0;
+		params_exprs = NIL;
+		foreach(lc, fexpr->args)
+		{
+			/* don't copy last "variadic argument */
+			if (n >= fcinfo->nargs - 1)
+				break;
+
+			params_exprs = lappend(params_exprs, lc->data.ptr_value);
+			n++;
+		}
+
+		while (array_iterate(iterator, &value, &isnull))
+		{
+			/* replace variadic argument */
+			scinfo->arg[n] = value;
+			scinfo->argnull[n] = isnull;
+
+			params_exprs = lappend(params_exprs, makeConst(elem_type,
+										    -1,
+										    scinfo->fncollation,
+										    elem_typlen,
+										    value,
+										    isnull,
+										    elem_typbyval));
+			n++;
+		}
+
+		array_free_iterator(iterator);
+
+		memcpy(&sfexpr, fexpr, sizeof(FuncExpr));
+		sfexpr.args = params_exprs;
+		sfinfo.fn_expr = (fmNodePtr) &sfexpr;
+
+		scinfo->nargs = n;
+		fcinfo = scinfo;
+
+		MemoryContextSwitchTo(oldContext);
+	}
+
+	/*
 	 * Now call the function, passing the evaluated parameter values.
 	 */
 	if (fcache->func.fn_retset || hasSetArg)

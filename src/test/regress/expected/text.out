@@ -228,7 +228,7 @@ select format('%1$', 1);
 ERROR:  unterminated conversion specifier
 select format('%1$1', 1);
 ERROR:  unrecognized conversion specifier "1"
---checkk mix of positional and ordered placeholders
+--check mix of positional and ordered placeholders
 select format('Hello %s %1$s %s', 'World', 'Hello again');
             format             
 -------------------------------
@@ -239,5 +239,51 @@ select format('Hello %s %s, %2$s %2$s', 'World', 'Hello again');
                       format                      
 --------------------------------------------------
  Hello World Hello again, Hello again Hello again
+(1 row)
+
+-- check pass variadic argument
+select format('%s, %s', variadic array['Hello','World']);
+    format    
+--------------
+ Hello, World
+(1 row)
+
+-- multidimensional array is supported
+select format('%s, %s', variadic array[['Nazdar','Svete'],['Hello','World']]);
+            format             
+-------------------------------
+ {Nazdar,Svete}, {Hello,World}
+(1 row)
+
+-- check others datatypes
+select format('%s, %s', variadic array[1, 2]);
+ format 
+--------
+ 1, 2
+(1 row)
+
+select format('%s, %s', variadic array[true, false]);
+ format 
+--------
+ t, f
+(1 row)
+
+select format('%s, %s', variadic array[true, false]::text[]);
+   format    
+-------------
+ true, false
+(1 row)
+
+-- check positional placeholders
+select format('%2$s, %1$s', variadic array['first', 'second']);
+    format     
+---------------
+ second, first
+(1 row)
+
+select format('%2$s, %1$s', variadic array[1, 2]);
+ format 
+--------
+ 2, 1
 (1 row)
 

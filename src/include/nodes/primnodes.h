@@ -340,6 +340,8 @@ typedef struct FuncExpr
 	Oid			funcid;			/* PG_PROC OID of the function */
 	Oid			funcresulttype; /* PG_TYPE OID of result value */
 	bool		funcretset;		/* true if function returns set */
+	bool		merge_vararg;		/* if true, then do unpack last array argument */
+									/* to fmgr args */
 	CoercionForm funcformat;	/* how to display this function call */
 	Oid			funccollid;		/* OID of collation of result */
 	Oid			inputcollid;	/* OID of collation that function should use */

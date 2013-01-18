@@ -346,8 +346,8 @@ lookup_agg_function(List *fnName,
 	 */
 	fdresult = func_get_detail(fnName, NIL, NIL,
 							   nargs, input_types, false, false,
-							   &fnOid, rettype, &retset, NULL,
-							   &nvargs, &true_oid_array, NULL);
+							   &fnOid, rettype, &retset, &nvargs,
+							   &true_oid_array, NULL);
 
 	/* only valid case is a normal function not returning a set */
 	if (fdresult != FUNCDETAIL_NORMAL || !OidIsValid(fnOid))
