@@ -597,11 +597,16 @@ _PG_init(void)
 	}
 	EmitWarningsOnPlaceholders("bdr");
 
-	/* initialize other modules that need shared memory */
+out:
+	/*
+	 * initialize other modules that need shared memory
+	 *
+	 * Do so even if we haven't any remote nodes setup, the shared memory might
+	 * still be needed for some sql callable functions or such.
+	 */
 
 	/* register a slot for every remote node */
 	bdr_count_shmem_init(nregistered);
 
-out:
 	MemoryContextSwitchTo(old_context);
 }
