@@ -433,6 +433,9 @@ bdr_count_unserialize(void)
 	BdrCountSerialize serial;
 	Size read_size;
 
+	if (bdr_count_shmem_ctl == NULL)
+		elog(ERROR, "cannot use bdr statistics function without loading bdr");
+
 	LWLockAcquire(bdr_count_shmem_ctl->lock, LW_EXCLUSIVE);
 
 	fd = OpenTransientFile((char *) path,
