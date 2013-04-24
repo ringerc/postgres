@@ -478,6 +478,9 @@ _PG_init(void)
 	MemoryContext old_context;
 	Size nregistered = 0;
 
+	if (!process_shared_preload_libraries_in_progress)
+		elog(ERROR, "bdr can only be loaded via shared_preload_libraries");
+
 	/* guc's et al need to survive this */
 	old_context = MemoryContextSwitchTo(TopMemoryContext);
 
