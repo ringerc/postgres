@@ -21,4 +21,3 @@ AS 'MODULE_PATHNAME';
 
 CREATE VIEW pg_stat_bdr AS SELECT * FROM pg_stat_bdr();
 REVOKE ALL ON FUNCTION pg_stat_bdr() FROM PUBLIC;
-

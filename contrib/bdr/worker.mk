@@ -20,3 +20,19 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+# Disabled because these tests require "wal_level=logical", which
+# typical installcheck users do not have (e.g. buildfarm clients).
+installcheck:;
+
+submake-regress:
+	$(MAKE) -C $(top_builddir)/src/test/regress
+
+check: all | submake-regress
+	$(pg_regress_check) \
+	    --temp-config $(top_srcdir)/contrib/bdr/bdr.conf \
+	    --temp-install=./tmp_check \
+	    --extra-install=contrib/bdr \
+	    extension
+
+PHONY: submake-regress
