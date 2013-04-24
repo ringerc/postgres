@@ -56,6 +56,14 @@ static ReplicationState *local_replication_state = NULL;
 /*RSTATE */
 #define REPLICATION_STATE_MAGIC (uint32)0x1257DADE
 
+#ifndef UINT16_MAX
+#define UINT16_MAX ((1<<16) - 1)
+#else
+#if UINT16_MAX != ((1<<16) - 1)
+#error "uh, wrong UINT16_MAX?"
+#endif
+#endif
+
 /*
  * Check for a persistent repication identifier identified by remotesysid,
  * remotetli, remotedb, riname, rilocaldb.
