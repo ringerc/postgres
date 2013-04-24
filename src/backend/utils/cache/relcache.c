@@ -4964,14 +4964,18 @@ RelationIsDoingTimetravelInternal(Relation relation)
 
 	/*
 	 * XXX: Doing this test instead of using IsSystemNamespace has the
-	 * advantage of classifying toast tables correctly.
+	 * advantage of classifying a catalog relation's toast tables as a
+	 * timetravel relation as well. This is safe since even a oid wraparound
+	 * will preserve this property (c.f. GetNewObjectId()).
 	 */
 	if (RelationGetRelid(relation) < FirstNormalObjectId)
 		return true;
 
 	/*
-	 * also log relevant data if we want the table to behave as a catalog
+	 * Also log relevant data if we want the table to behave as a catalog
 	 * table, although its not a system provided one.
+	 * XXX: we need to make sure both the relation and its toast relation have
+	 * the flag set!
 	 */
 	if (RelationIsTreatedAsCatalogTable(relation))
 	    return true;
