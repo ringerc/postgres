@@ -196,7 +196,7 @@ extern void CheckLogicalReplicationRequirements(void);
 extern void StartupLogicalReplication(XLogRecPtr checkPointRedo);
 
 /* GUCs */
-extern int	max_logical_slots;
+extern PGDLLIMPORT int max_logical_slots;
 
 extern LogicalDecodingContext *CreateLogicalDecodingContext(
 	LogicalDecodingSlot *slot,
@@ -207,6 +207,5 @@ extern LogicalDecodingContext *CreateLogicalDecodingContext(
 	LogicalOutputPluginWriterWrite do_write);
 extern bool LogicalDecodingContextReady(LogicalDecodingContext *ctx);
 extern void FreeLogicalDecodingContext(LogicalDecodingContext *ctx);
-
 
 #endif
