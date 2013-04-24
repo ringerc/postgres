@@ -515,6 +515,8 @@ sub mkvcbuild
 			     'bdr_count.c');
 	$bdr_apply->AddReference($postgres);
 	$bdr_apply->AddLibrary('wsock32.lib');
+	$bdr_apply->AddIncludeDir('src\interfaces\libpq');
+	$bdr_apply->AddReference($libpq);
 
 	my $D;
 	opendir($D, 'contrib') || croak "Could not opendir on contrib!\n";
