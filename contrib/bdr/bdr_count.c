@@ -33,10 +33,6 @@
 #include "utils/builtins.h"
 #include "utils/syscache.h"
 
-#ifdef EXEC_BACKEND
-#error "EXEC_BACKEND is not supported"
-#endif
-
 /*
  * Statistics about logical replication
  *
