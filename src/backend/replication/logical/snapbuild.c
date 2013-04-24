@@ -334,13 +334,30 @@ SnapBuildBuildSnapshot(Snapstate *snapstate, TransactionId xid)
 									  + sizeof(TransactionId) * 1 /* toplevel xid */);
 
 	snapshot->satisfies = HeapTupleSatisfiesMVCCDuringDecoding;
-	/*
-	 * we copy all currently in progress transaction to ->xip, all
-	 * transactions added to the transaction that committed during running -
-	 * which thus need to be considered visible in SnapshotNow semantics - get
-	 * copied to ->subxip.
+	/* ---
+	 * We misuse the original meaning of SnapshotData's xip and subxip fields
+	 * to make the more fitting for our needs.
 	 *
-	 * XXX: Do we want extra fields for those two instead?
+	 * In the 'xip' array we store transactions that have to be treated as
+	 * committed. Since we will only ever look at tuples from transactions that
+	 * have modified the catalog its more efficient to store those few that
+	 * exist between xmin and xmax (frequently there are none).
+	 *
+	 * Snapshots that are used in transactions that have modified the catalog
+	 * also use the 'subxip' array to store their toplevel xid and all the
+	 * subtransaction xids so we can recognize when we need to treat rows as
+	 * visible that are not in xip but still need to be visible. Subxip only
+	 * gets filled when the transaction is copied into the context of a catalog
+	 * modifying transaction since we otherwise share a snapshot between
+	 * transactions. As long as a txn hasn't modified the catalog it doesn't
+	 * need to treat any uncommitted rows as visible, so there is no need for
+	 * those xids.
+	 *
+	 * Both arrays are ordered in a way that allows them to be search via
+	 * bsearch().
+	 *
+	 * XXX: Do we want extra fields instead of misusing existing ones instead?
+	 * ---
 	 */
 	Assert(TransactionIdIsNormal(snapstate->xmin));
 	Assert(TransactionIdIsNormal(snapstate->xmax));
@@ -348,7 +365,7 @@ SnapBuildBuildSnapshot(Snapstate *snapstate, TransactionId xid)
 	snapshot->xmin = snapstate->xmin;
 	snapshot->xmax = snapstate->xmax;
 
-	/* store all transaction to be treated as committed */
+	/* store all transaction to be treated as committed by this transaction */
 	snapshot->xip = (TransactionId *) ((char *) snapshot + sizeof(SnapshotData));
 	snapshot->xcnt = snapstate->committed.xcnt;
 	memcpy(snapshot->xip, snapstate->committed.xip,
@@ -356,7 +373,10 @@ SnapBuildBuildSnapshot(Snapstate *snapstate, TransactionId xid)
 	/* sort so we can bsearch() */
 	qsort(snapshot->xip, snapshot->xcnt, sizeof(TransactionId), xidComparator);
 
-
+	/*
+	 * empty as this for now is a snapshot used in transactions that don't
+	 * modify the catalog
+	 */
 	snapshot->subxcnt = 0;
 	snapshot->subxip = NULL;
 
