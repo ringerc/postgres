@@ -130,8 +130,8 @@ static void SnapBuildSnapIncRefcount(Snapshot snap);
 static void SnapBuildDistributeSnapshotNow(Snapstate *snapstate, ReorderBuffer *reorder, XLogRecPtr lsn);
 
 /* on disk serialization & restore */
-static bool SnapBuildRestore(Snapstate *state, XLogRecPtr lsn);
-static void SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn);
+static bool SnapBuildRestore(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn);
+static void SnapBuildSerialize(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn);
 
 
 /*
@@ -551,7 +551,8 @@ SnapBuildProcessChange(ReorderBuffer *reorder, Snapstate *snapstate,
 
 			/* refcount of the transaction */
 			SnapBuildSnapIncRefcount(snapstate->snapshot);
-			ReorderBufferSetBaseSnapshot(reorder, xid, buf->origptr, snapstate->snapshot);
+			ReorderBufferSetBaseSnapshot(reorder, xid, buf->origptr,
+										 snapstate->snapshot);
 		}
 	}
 
@@ -641,7 +642,7 @@ SnapBuildDecodeCallback(ReorderBuffer *reorder, Snapstate *snapstate,
 				return SNAPBUILD_DECODE;
 			}
 			/* valid on disk state */
-			else if (SnapBuildRestore(snapstate, buf->origptr))
+			else if (SnapBuildRestore(snapstate, reorder, buf->origptr))
 			{
 				Assert(snapstate->state == SNAPBUILD_CONSISTENT);
 				return SNAPBUILD_DECODE;
@@ -719,6 +720,7 @@ SnapBuildDecodeCallback(ReorderBuffer *reorder, Snapstate *snapstate,
 							}
 						}
 #endif
+						SnapBuildSerialize(snapstate, reorder, buf->origptr);
 					case XLOG_CHECKPOINT_ONLINE:
 						{
 							/*
@@ -739,8 +741,7 @@ SnapBuildDecodeCallback(ReorderBuffer *reorder, Snapstate *snapstate,
 							xl_running_xacts *running =
 								(xl_running_xacts *) buf->record_data;
 
-							if (snapstate->state == SNAPBUILD_CONSISTENT)
-								SnapBuildSerialize(snapstate, buf->origptr);
+							SnapBuildSerialize(snapstate, reorder, buf->origptr);
 
 							/*
 							 * update range of interesting xids. We don't
@@ -818,7 +819,7 @@ SnapBuildDecodeCallback(ReorderBuffer *reorder, Snapstate *snapstate,
 								 * relmapper change has generated.
 								 */
 								ReorderBufferAddInvalidations(reorder, xid,
-														   InvalidXLogRecPtr,
+														   buf->origptr,
 								                           xlrec->nmsgs,
 														   inval_msgs);
 
@@ -1345,7 +1346,7 @@ typedef struct SnapstateOnDisk
  * hasn't already been done by another decoding process.
  */
 static void
-SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
+SnapBuildSerialize(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn)
 {
 	Size needed_size =
 		sizeof(SnapstateOnDisk) +
@@ -1359,6 +1360,13 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
 	char path[MAXPGPATH];
 	int ret;
 	struct stat stat_buf;
+
+	/*
+	 * no point in serializing if we cannot continue to work immediately after
+	 * restoring the snapshot
+	 */
+	if (state->state < SNAPBUILD_CONSISTENT)
+		return;
 
 	/*
 	 * FIXME: Timeline handling
@@ -1376,13 +1384,33 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
 	if (ret != 0 && errno != ENOENT)
 		ereport(ERROR, (errmsg("could not stat snapbuild state file %s", path)));
 	else if (ret == 0)
+	{
+		/*
+		 * somebody else has already serialized to this point, don't overwrite
+		 * but remember location
+		 */
+		state->last_serialized_snapshot = lsn;
+		ReorderBufferSetRestartPoint(reorder, lsn);
 		return;
+	}
+
+	/*
+	 * there is an obvious race condition here between the time we stat(2) the
+	 * file and us writing the file. But we rename the file into place
+	 * atomically and all files created need to contain the same data anyway,
+	 * so this is perfectly fine, although a bit wasteful. Locking seems like
+	 * pointless overhead.
+	 */
 
 	elog(LOG, "serializing snapshot to %s", path);
 
+	/* to make sure only we will write to this tempfile, include pid */
 	sprintf(tmppath, "pg_llog/snapshots/%X-%X.snap.%u.tmp",
 	        (uint32)(lsn >> 32), (uint32)lsn, getpid());
 
+	/*
+	 * unlink if file already exists, needs to have been before a crash/error
+	 */
 	if (unlink(tmppath) != 0 && errno != ENOENT)
 		ereport(ERROR, (errmsg("could not unlink old file %s", path)));
 
@@ -1391,7 +1419,7 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
 	ondisk->magic = SNAPSTATE_MAGIC;
 	ondisk->size = needed_size;
 
-	/* copy state */
+	/* copy state per struct assignment, lalala lazy. */
 	ondisk->state = *state;
 
 	/* NULL-ify memory-only data */
@@ -1409,8 +1437,6 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
 	ondisk_c += sizeof(TransactionId) * state->committed.xcnt;
 
 	/* we have valid data now, open tempfile and write it there */
-	/* FIXME: locking! */
-
 	fd = OpenTransientFile(tmppath,
 						   O_CREAT | O_EXCL | O_WRONLY | PG_BINARY,
 						   S_IRUSR | S_IWUSR);
@@ -1427,7 +1453,11 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
 	}
 
 	/*
-	 * XXX: Do the fsync() via checkpoints/restartpoints
+	 * fsync the file before renaming so that even if we crash after this we
+	 * have either a fully valid file or nothing.
+	 *
+	 * XXX: Do the fsync() via checkpoints/restartpoints, doing it here has
+	 * some noticeable overhead?
 	 */
 	if (pg_fsync(fd) != 0)
 	{
@@ -1451,9 +1481,14 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
 				 errmsg("could not rename snapbuild state file from \"%s\" to \"%s\": %m",
 						tmppath, path)));
 	}
+
 	/* make sure we persist */
 	fsync_fname(path, false);
 	fsync_fname("pg_llog/snapshots", true);
+
+	/* remember serialization point */
+	state->last_serialized_snapshot = lsn;
+	ReorderBufferSetRestartPoint(reorder, lsn);
 }
 
 /*
@@ -1461,7 +1496,7 @@ SnapBuildSerialize(Snapstate *state, XLogRecPtr lsn)
  * location indicated by 'lsn'. Returns true if successfull, false otherwise.
  */
 static bool
-SnapBuildRestore(Snapstate *state, XLogRecPtr lsn)
+SnapBuildRestore(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn)
 {
 	SnapstateOnDisk ondisk;
 	int fd;
@@ -1478,7 +1513,9 @@ SnapBuildRestore(Snapstate *state, XLogRecPtr lsn)
 	if (fd < 0 && errno == ENOENT)
 		return false;
 	else if (fd < 0)
-		ereport(ERROR, (errmsg("could not open snapbuild state file %s", path)));
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open snapbuild state file %s", path)));
 
 	elog(LOG, "really restoring from %s", path);
 
@@ -1525,7 +1562,9 @@ SnapBuildRestore(Snapstate *state, XLogRecPtr lsn)
 	/*
 	 * ok, we now have a sensible snapshot here, figure out if it has more
 	 * information than we have.
-	 *
+	 */
+
+	/*
 	 * We are only interested in consistent snapshots for now, comparing
 	 * whether one imcomplete snapshot is more "advanced" seems to be
 	 * unnecessarily complex.
@@ -1571,6 +1610,8 @@ SnapBuildRestore(Snapstate *state, XLogRecPtr lsn)
 	}
 	state->snapshot = SnapBuildBuildSnapshot(state, InvalidTransactionId);
 	SnapBuildSnapIncRefcount(state->snapshot);
+
+	ReorderBufferSetRestartPoint(reorder, lsn);
 
 	return true;
 

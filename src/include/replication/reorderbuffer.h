@@ -113,6 +113,12 @@ typedef struct ReorderBufferTXN
 	 */
 	XLogRecPtr	last_lsn;
 
+	/*
+	 * LSN of the last lsn at which snapshot information reside, so we can
+	 * restart decoding from there and fully recover this transaction from WAL.
+	 */
+	XLogRecPtr restart_decoding_lsn;
+
 	/* origin of the change that caused this transaction */
 	RepNodeId origin_id;
 
@@ -281,6 +287,8 @@ struct ReorderBuffer
 	slist_head cached_tuplebufs;
 	Size		nr_cached_tuplebufs;
 
+	XLogRecPtr current_restart_decoding_lsn;
+
 	/* buffer for disk<->memory conversions */
 	char *outbuf;
 	Size outbufsize;
@@ -314,6 +322,10 @@ bool ReorderBufferIsXidKnown(ReorderBuffer *cache, TransactionId xid);
 void ReorderBufferXidSetTimetravel(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn);
 bool ReorderBufferXidDoesTimetravel(ReorderBuffer *cache, TransactionId xid);
 bool ReorderBufferXidHasBaseSnapshot(ReorderBuffer *cache, TransactionId xid);
+
+ReorderBufferTXN *ReorderBufferGetOldestTXN(ReorderBuffer *);
+
+void ReorderBufferSetRestartPoint(ReorderBuffer *cache, XLogRecPtr ptr);
 
 void ReorderBufferStartup(void);
 #endif

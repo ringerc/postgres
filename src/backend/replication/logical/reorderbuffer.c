@@ -132,7 +132,10 @@ typedef struct ReorderBufferToastEnt
 static ReorderBufferTXN *ReorderBufferGetTXN(ReorderBuffer *cache);
 static void ReorderBufferReturnTXN(ReorderBuffer *cache, ReorderBufferTXN *txn);
 static ReorderBufferTXN *ReorderBufferTXNByXid(ReorderBuffer *cache, TransactionId xid,
-                                         bool create, bool *is_new);
+											   bool create, bool *is_new, XLogRecPtr lsn,
+											   bool register_as_top);
+
+static void AssertTXNLsnOrder(ReorderBuffer *cache);
 
 /*
  * support functions for lsn-order iterating over the ->changes of a
@@ -434,12 +437,15 @@ ReorderBufferReturnTupleBuf(ReorderBuffer *cache, ReorderBufferTupleBuf *tuple)
  * entry.
  */
 static ReorderBufferTXN *
-ReorderBufferTXNByXid(ReorderBuffer *cache, TransactionId xid, bool create, bool *is_new)
+ReorderBufferTXNByXid(ReorderBuffer *cache, TransactionId xid, bool create,
+					  bool *is_new, XLogRecPtr lsn, bool register_as_top)
 {
 	ReorderBufferTXN *txn = NULL;
 	ReorderBufferTXNByIdEnt *ent = NULL;
 	bool found = false;
 	bool cached = false;
+
+	Assert(!create || lsn != InvalidXLogRecPtr);
 
 	/*
 	 * check the one-entry lookup cache first
@@ -481,6 +487,14 @@ ReorderBufferTXNByXid(ReorderBuffer *cache, TransactionId xid, bool create, bool
 		ent->txn = ReorderBufferGetTXN(cache);
 		ent->txn->xid = xid;
 		txn = ent->txn;
+		txn->lsn = lsn;
+		txn->restart_decoding_lsn = cache->current_restart_decoding_lsn;
+
+		if (register_as_top)
+		{
+			dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
+			AssertTXNLsnOrder(cache);
+		}
 	}
 
 	/* update cache */
@@ -502,13 +516,8 @@ ReorderBufferAddChange(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn,
                     ReorderBufferChange *change)
 {
 	bool is_new;
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new);
-
-	if (is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
+	ReorderBufferTXN *txn =
+		ReorderBufferTXNByXid(cache, xid, true, &is_new, lsn, true);
 
 	change->lsn = lsn;
 	Assert(InvalidXLogRecPtr != lsn);
@@ -519,6 +528,52 @@ ReorderBufferAddChange(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn,
 	ReorderBufferCheckSerializeTXN(cache, txn);
 }
 
+static void
+AssertTXNLsnOrder(ReorderBuffer *cache)
+{
+#ifdef USE_ASSERT_CHECKING
+	dlist_iter txn_it;
+	XLogRecPtr last_lsn = InvalidXLogRecPtr;
+	dlist_foreach(txn_it, &cache->toplevel_by_lsn)
+	{
+		ReorderBufferTXN *cur_txn;
+		cur_txn = dlist_container(ReorderBufferTXN, node, txn_it.cur);
+		Assert(cur_txn->lsn != InvalidXLogRecPtr);
+
+		if (cur_txn->last_lsn != InvalidXLogRecPtr)
+			Assert(cur_txn->lsn <= cur_txn->last_lsn);
+
+		if (last_lsn != InvalidXLogRecPtr)
+			Assert(last_lsn < cur_txn->lsn);
+
+		Assert(!cur_txn->is_known_as_subxact);
+		last_lsn = cur_txn->lsn;
+	}
+#endif
+}
+
+ReorderBufferTXN *
+ReorderBufferGetOldestTXN(ReorderBuffer *cache)
+{
+	ReorderBufferTXN *txn;
+
+	if (dlist_is_empty(&cache->toplevel_by_lsn))
+		return NULL;
+
+	AssertTXNLsnOrder(cache);
+
+	txn = dlist_head_element(ReorderBufferTXN, node, &cache->toplevel_by_lsn);
+
+	Assert(!txn->is_known_as_subxact);
+	Assert(txn->lsn != InvalidXLogRecPtr);
+	return txn;
+}
+
+void
+ReorderBufferSetRestartPoint(ReorderBuffer *cache, XLogRecPtr ptr)
+{
+	cache->current_restart_decoding_lsn = ptr;
+}
 
 void
 ReorderBufferAssignChild(ReorderBuffer *cache, TransactionId xid,
@@ -529,30 +584,38 @@ ReorderBufferAssignChild(ReorderBuffer *cache, TransactionId xid,
 	bool top_is_new;
 	bool sub_is_new;
 
-	txn = ReorderBufferTXNByXid(cache, xid, true, &top_is_new);
+	txn = ReorderBufferTXNByXid(cache, xid, true, &top_is_new, lsn, true);
 
-	if (top_is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
-
-	subtxn = ReorderBufferTXNByXid(cache, subxid, true, &sub_is_new);
+	subtxn =
+		ReorderBufferTXNByXid(cache, subxid, true, &sub_is_new, lsn, false);
 
 	if (sub_is_new)
 	{
-		subtxn->lsn = lsn;
+		/*
+		 * we assign subtransactions to top level transaction even if we don't
+		 * have data for it yet, assignment records frequently reference xids
+		 * that have not yet produced any records. Knowing those aren't top
+		 * level xids allows us to make processing cheaper in some places.
+		 */
 		dlist_push_tail(&txn->subtxns, &subtxn->node);
+		txn->nsubtxns++;
 	}
 	else if (!subtxn->is_known_as_subxact)
 	{
+		subtxn->is_known_as_subxact = true;
+
+		/* remove from lsn order list of top-level transactions */
 		dlist_delete(&subtxn->node);
+
+		/* add to toplevel transaction */
 		dlist_push_tail(&txn->subtxns, &subtxn->node);
+		txn->nsubtxns++;
 	}
 }
 
 /*
- * Associate a subtransaction with its toplevel transaction.
+ * Associate a subtransaction with its toplevel transaction during commit
+ * time. There may no be any further changes added after this.
  */
 void
 ReorderBufferCommitChild(ReorderBuffer *cache, TransactionId xid,
@@ -562,21 +625,18 @@ ReorderBufferCommitChild(ReorderBuffer *cache, TransactionId xid,
 	ReorderBufferTXN *subtxn;
 	bool top_is_new;
 
-	subtxn = ReorderBufferTXNByXid(cache, subxid, false, NULL);
+	subtxn = ReorderBufferTXNByXid(cache, subxid, false, NULL,
+								   InvalidXLogRecPtr, false);
 	/*
 	 * No need to do anything if that subtxn didn't contain any changes
 	 */
 	if (!subtxn)
 		return;
 
-	txn = ReorderBufferTXNByXid(cache, xid, true, &top_is_new);
-
-	if (top_is_new)
-	{
-		/* FIXME: This gives the wrong position in the list! */
-		txn->lsn = subtxn->lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
+	/*
+	 * FIXME: Using the subtxn lsn as top lsn isn't great (if we're creating)!
+	 */
+	txn = ReorderBufferTXNByXid(cache, xid, true, &top_is_new, lsn, true);
 
 	subtxn->last_lsn = lsn;
 
@@ -586,8 +646,10 @@ ReorderBufferCommitChild(ReorderBuffer *cache, TransactionId xid,
 	{
 		subtxn->is_known_as_subxact = true;
 
-		/* remove from toplevel xacts list */
+		/* remove from lsn order list of top-level transactions */
 		dlist_delete(&subtxn->node);
+
+		/* add to subtransaction list */
 		dlist_push_tail(&txn->subtxns, &subtxn->node);
 		txn->nsubtxns++;
 	}
@@ -1089,13 +1151,16 @@ void
 ReorderBufferCommit(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn,
 					RepNodeId origin, TimestampTz commit_time)
 {
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, false, NULL);
+	ReorderBufferTXN *txn;
 	ReorderBufferIterTXNState *iterstate = NULL;
 	ReorderBufferChange *change;
 	CommandId command_id = FirstCommandId;
 	Snapshot snapshot_mvcc;
 	Snapshot snapshot_now;
 	Relation relation = NULL;
+
+	txn = ReorderBufferTXNByXid(cache, xid, false, NULL,
+								InvalidXLogRecPtr, false);
 
 	/* empty transaction */
 	if (!txn)
@@ -1289,7 +1354,8 @@ ReorderBufferCommit(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn,
 void
 ReorderBufferAbort(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn)
 {
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, false, NULL);
+	ReorderBufferTXN *txn =	ReorderBufferTXNByXid(cache, xid, false, NULL,
+												  InvalidXLogRecPtr, false);
 
 	/* no changes in this commit */
 	if (!txn)
@@ -1306,8 +1372,8 @@ ReorderBufferAbort(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn)
 bool
 ReorderBufferIsXidKnown(ReorderBuffer *cache, TransactionId xid)
 {
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, false, NULL);
-
+	ReorderBufferTXN *txn =	ReorderBufferTXNByXid(cache, xid, false, NULL,
+												  InvalidXLogRecPtr, false);
 	return txn != NULL;
 }
 
@@ -1318,15 +1384,7 @@ void
 ReorderBufferAddSnapshot(ReorderBuffer *cache, TransactionId xid,
                          XLogRecPtr lsn, Snapshot snap)
 {
-	bool is_new;
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new);
 	ReorderBufferChange *change = ReorderBufferGetChange(cache);
-
-	if (is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
 
 	change->snapshot = snap;
 	change->action_internal = REORDER_BUFFER_CHANGE_INTERNAL_SNAPSHOT;
@@ -1338,14 +1396,8 @@ void
 ReorderBufferSetBaseSnapshot(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn, Snapshot snap)
 {
 	bool is_new;
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new);
-
-	if (is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
-
+	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new,
+												  lsn, true);
 	Assert(txn->base_snapshot == NULL);
 
 	txn->base_snapshot = snap;
@@ -1377,16 +1429,9 @@ ReorderBufferAddNewTupleCids(ReorderBuffer *cache, TransactionId xid, XLogRecPtr
 							 RelFileNode node, ItemPointerData tid,
 							 CommandId cmin, CommandId cmax, CommandId combocid)
 {
-	bool is_new;
-
 	ReorderBufferChange *change = ReorderBufferGetChange(cache);
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new);
-
-	if (is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
+	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, NULL,
+												  lsn, true);
 
 	change->tuplecid.node = node;
 	change->tuplecid.tid = tid;
@@ -1409,15 +1454,8 @@ void
 ReorderBufferAddInvalidations(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn,
                                 Size nmsgs, SharedInvalidationMessage* msgs)
 {
-	bool is_new;
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new);
-
-	if (is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
-
+	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, NULL,
+												  lsn, true);
 
 	if (txn->ninvalidations)
 		elog(ERROR, "only ever add one set of invalidations");
@@ -1449,14 +1487,8 @@ ReorderBufferExecuteInvalidations(ReorderBuffer *cache, ReorderBufferTXN *txn)
 void
 ReorderBufferXidSetTimetravel(ReorderBuffer *cache, TransactionId xid, XLogRecPtr lsn)
 {
-	bool is_new;
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, &is_new);
-
-	if (is_new)
-	{
-		txn->lsn = lsn;
-		dlist_push_tail(&cache->toplevel_by_lsn, &txn->node);
-	}
+	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, true, NULL,
+												  lsn, true);
 
 	txn->does_timetravel = true;
 }
@@ -1468,7 +1500,9 @@ ReorderBufferXidSetTimetravel(ReorderBuffer *cache, TransactionId xid, XLogRecPt
 bool
 ReorderBufferXidDoesTimetravel(ReorderBuffer *cache, TransactionId xid)
 {
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, false, NULL);
+	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, false, NULL,
+												  InvalidXLogRecPtr, false);
+
 	if (!txn)
 		return false;
 	return txn->does_timetravel;
@@ -1480,7 +1514,9 @@ ReorderBufferXidDoesTimetravel(ReorderBuffer *cache, TransactionId xid)
 bool
 ReorderBufferXidHasBaseSnapshot(ReorderBuffer *cache, TransactionId xid)
 {
-	ReorderBufferTXN *txn = ReorderBufferTXNByXid(cache, xid, false, NULL);
+	ReorderBufferTXN *txn =	ReorderBufferTXNByXid(cache, xid, false, NULL,
+												  InvalidXLogRecPtr, false);
+
 	if (!txn)
 		return false;
 	return txn->base_snapshot != NULL;
@@ -1953,6 +1989,7 @@ ReorderBufferStartup(void)
 							 errmsg("could not remove xid data file \"%s\": %m",
 									path)));
 			}
+			/* XXX: WARN? */
 		}
 		FreeDir(spill_dir);
 	}

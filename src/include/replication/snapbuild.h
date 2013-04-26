@@ -65,7 +65,7 @@ typedef struct Snapstate
 
 	/*
 	 * Don't replay commits from an LSN <= this LSN. This can be set externally
-	 * but it will also be advanced (never reatreat) from within snapbuild.c.
+	 * but it will also be advanced (never retreat) from within snapbuild.c.
 	 */
 	XLogRecPtr transactions_after;
 
@@ -80,6 +80,11 @@ typedef struct Snapstate
 	 * see catalog modifications.
 	 */
 	Snapshot snapshot;
+
+	/*
+	 * LSN of the last location we are sure a snapshot has been serialized to.
+	 */
+	XLogRecPtr last_serialized_snapshot;
 
 	/* variable length data */
 
