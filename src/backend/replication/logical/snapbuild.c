@@ -740,6 +740,7 @@ SnapBuildDecodeCallback(ReorderBuffer *reorder, Snapstate *snapstate,
 						{
 							xl_running_xacts *running =
 								(xl_running_xacts *) buf->record_data;
+							ReorderBufferTXN *txn;
 
 							SnapBuildSerialize(snapstate, reorder, buf->origptr);
 
@@ -778,6 +779,41 @@ SnapBuildDecodeCallback(ReorderBuffer *reorder, Snapstate *snapstate,
 							  */
 							 IncreaseLogicalXminForSlot(buf->origptr,
 														running->oldestRunningXid);
+
+							 /*
+							  * Also tell the slot where we can restart
+							  * decoding from. We don't want to do that after
+							  * every commit because changing that implies an
+							  * fsync...
+							  */
+							 txn = ReorderBufferGetOldestTXN(reorder);
+
+							 /*
+							  * oldest ongoing txn might have started when we
+							  * didn't yet serialize anything because we
+							  * haven't reached a consistent state yet.
+							  */
+							 if (txn != NULL &&
+								 txn->restart_decoding_lsn !=
+								 InvalidXLogRecPtr)
+							 {
+								 IncreaseRestartDecodingForSlot(
+									 buf->origptr,
+									 txn->restart_decoding_lsn);
+
+							 }
+							 /*
+							  * no ongoing transaction, can reuse the last
+							  * serialized snapshot if we have one.
+							  */
+							 else if (txn == NULL &&
+									  reorder->current_restart_decoding_lsn !=
+									  InvalidXLogRecPtr)
+							 {
+								 IncreaseRestartDecodingForSlot(
+									 buf->origptr,
+									 snapstate->last_serialized_snapshot);
+							 }
 
 							 break;
 						}
@@ -1361,12 +1397,17 @@ SnapBuildSerialize(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn)
 	int ret;
 	struct stat stat_buf;
 
+	Assert(lsn != InvalidXLogRecPtr);
+	Assert(state->last_serialized_snapshot == InvalidXLogRecPtr ||
+		   state->last_serialized_snapshot <= lsn);
+
 	/*
 	 * no point in serializing if we cannot continue to work immediately after
 	 * restoring the snapshot
 	 */
 	if (state->state < SNAPBUILD_CONSISTENT)
 		return;
+
 
 	/*
 	 * FIXME: Timeline handling
@@ -1390,8 +1431,7 @@ SnapBuildSerialize(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn)
 		 * but remember location
 		 */
 		state->last_serialized_snapshot = lsn;
-		ReorderBufferSetRestartPoint(reorder, lsn);
-		return;
+		goto out;
 	}
 
 	/*
@@ -1488,7 +1528,9 @@ SnapBuildSerialize(Snapstate *state, ReorderBuffer *reorder, XLogRecPtr lsn)
 
 	/* remember serialization point */
 	state->last_serialized_snapshot = lsn;
-	ReorderBufferSetRestartPoint(reorder, lsn);
+
+out:
+	ReorderBufferSetRestartPoint(reorder, state->last_serialized_snapshot);
 }
 
 /*

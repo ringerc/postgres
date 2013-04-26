@@ -127,14 +127,46 @@ IncreaseLogicalXminForSlot(XLogRecPtr lsn, TransactionId xmin)
 	SpinLockAcquire(&MyLogicalDecodingSlot->mutex);
 
 	/*
-	 * Only increase if the previous values have been applied...
+	 * Only increase if the previous values have been applied, otherwise we
+	 * might never end up updating if the receiver acks too slowly.
 	 */
-	if (!MyLogicalDecodingSlot->candidate_lsn != InvalidXLogRecPtr)
+	if (MyLogicalDecodingSlot->candidate_lsn == InvalidXLogRecPtr ||
+		(lsn == MyLogicalDecodingSlot->candidate_lsn &&
+		 !TransactionIdIsValid(MyLogicalDecodingSlot->candidate_xmin)))
 	{
 		MyLogicalDecodingSlot->candidate_lsn = lsn;
 		MyLogicalDecodingSlot->candidate_xmin = xmin;
 		elog(LOG, "got new xmin %u at %X/%X", xmin,
 			 (uint32)(lsn >> 32), (uint32)lsn); /* FIXME: log level */
+	}
+	SpinLockRelease(&MyLogicalDecodingSlot->mutex);
+}
+
+void
+IncreaseRestartDecodingForSlot(XLogRecPtr current_lsn, XLogRecPtr restart_lsn)
+{
+	Assert(MyLogicalDecodingSlot != NULL);
+	Assert(restart_lsn != InvalidXLogRecPtr);
+	Assert(current_lsn != InvalidXLogRecPtr);
+
+	SpinLockAcquire(&MyLogicalDecodingSlot->mutex);
+
+	/*
+	 * Only increase if the previous values have been applied, otherwise we
+	 * might never end up updating if the receiver acks too slowly. A missed
+	 * value here will just cause some extra effort after reconnecting.
+	 */
+	if (MyLogicalDecodingSlot->candidate_lsn == InvalidXLogRecPtr ||
+		(current_lsn == MyLogicalDecodingSlot->candidate_lsn &&
+		 MyLogicalDecodingSlot->candidate_restart_decoding == InvalidXLogRecPtr))
+	{
+		MyLogicalDecodingSlot->candidate_lsn = current_lsn;
+		MyLogicalDecodingSlot->candidate_restart_decoding = restart_lsn;
+ /* FIXME: log level */
+		elog(LOG, "got new restart lsn %X/%X at %X/%X",
+			 (uint32)(restart_lsn >> 32), (uint32)restart_lsn,
+			 (uint32)(current_lsn >> 32), (uint32)current_lsn);
+
 	}
 	SpinLockRelease(&MyLogicalDecodingSlot->mutex);
 }
@@ -170,13 +202,15 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 			 * ->effective_xmin once the new state is fsynced to disk. After a
 			 * crash ->effective_xmin is set to ->xmin.
 			 */
-			if (slot->xmin != slot->candidate_xmin)
+			if (TransactionIdIsValid(slot->candidate_xmin) &&
+				slot->xmin != slot->candidate_xmin)
 			{
 				slot->xmin = slot->candidate_xmin;
 				updated_xmin = true;
 			}
 
-			if (slot->restart_decoding != slot->candidate_restart_decoding)
+			if (slot->candidate_restart_decoding != InvalidXLogRecPtr &&
+				slot->restart_decoding != slot->candidate_restart_decoding)
 			{
 				slot->restart_decoding = slot->candidate_restart_decoding;
 				updated_restart = true;
@@ -331,6 +365,7 @@ void LogicalDecodingAcquireFreeSlot(const char *name, const char *plugin)
 	MyLogicalDecodingSlot = slot;
 
 	slot->last_required_checkpoint = GetRedoRecPtr();
+	slot->restart_decoding = slot->last_required_checkpoint;
 	slot->in_use = true;
 	slot->active = true;
 	slot->database = MyDatabaseId;

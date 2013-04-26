@@ -744,6 +744,7 @@ InitLogicalReplication(InitLogicalReplicationCmd *cmd)
 
 	/* FIXME */
 	MyLogicalDecodingSlot->last_required_checkpoint = startptr;
+	MyLogicalDecodingSlot->restart_decoding = startptr;
 
 	for (;;)
 	{
@@ -893,7 +894,9 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 	 * Initialize position to the received one, then the xlog records begin to
 	 * be shipped from that position
 	 */
-	sentPtr = MyLogicalDecodingSlot->last_required_checkpoint;
+	Assert(MyLogicalDecodingSlot->last_required_checkpoint <=
+		   MyLogicalDecodingSlot->restart_decoding);
+	sentPtr = MyLogicalDecodingSlot->restart_decoding;
 	logical_startptr = sentPtr;
 
 	/* Also update the start position status in shared memory */
@@ -902,13 +905,17 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 		volatile WalSnd *walsnd = MyWalSnd;
 
 		SpinLockAcquire(&walsnd->mutex);
-		walsnd->sentPtr = MyLogicalDecodingSlot->last_required_checkpoint;
+		walsnd->sentPtr = MyLogicalDecodingSlot->restart_decoding;
 		SpinLockRelease(&walsnd->mutex);
 	}
 
 	if (cmd->startpoint == InvalidXLogRecPtr)
 		cmd->startpoint = MyLogicalDecodingSlot->confirmed_flush;
 	logical_decoding_ctx->snapshot_builder->transactions_after = cmd->startpoint;
+
+	elog(LOG, "starting to decode from %X/%X, replay %X/%X",
+		 (uint32)(MyWalSnd->sentPtr >> 32), (uint32)MyWalSnd->sentPtr,
+		 (uint32)(cmd->startpoint >> 32), (uint32)cmd->startpoint);
 
 	replication_active = true;
 
@@ -2155,7 +2162,6 @@ XLogSendLogical(bool *caughtup)
 											 ALLOCSET_DEFAULT_INITSIZE,
 											 ALLOCSET_DEFAULT_MAXSIZE);
 	}
-
 
 	record = XLogReadRecord(logical_decoding_ctx->reader, logical_startptr, &errm);
 	logical_startptr = InvalidXLogRecPtr;

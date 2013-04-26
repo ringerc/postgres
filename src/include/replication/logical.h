@@ -189,6 +189,9 @@ extern void ComputeLogicalXmin(void);
 
 /* change logical xmin */
 extern void IncreaseLogicalXminForSlot(XLogRecPtr lsn, TransactionId xmin);
+/* change recovery restart location */
+extern void IncreaseRestartDecodingForSlot(XLogRecPtr current_lsn, XLogRecPtr restart_lsn);
+
 extern void LogicalConfirmReceivedLocation(XLogRecPtr lsn);
 
 extern void CheckLogicalReplicationRequirements(void);
