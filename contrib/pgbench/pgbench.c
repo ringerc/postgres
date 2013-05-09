@@ -160,6 +160,9 @@ char	   *index_tablespace = NULL;
  */
 #define SCALE_32BIT_THRESHOLD 20000
 
+/* Maximum number of different databases/dsns that pgbench can connect to. */
+#define MAX_DBNAMES 100
+
 bool		use_log;			/* log transaction latencies to a file */
 bool		use_quiet;			/* quiet logging onto stderr */
 int			agg_interval;		/* log aggregates instead of individual transactions */
@@ -170,7 +173,8 @@ int			main_pid;			/* main process id used in log filename */
 char	   *pghost = "";
 char	   *pgport = "";
 char	   *login = NULL;
-char	   *dbName;
+char	   *dbNames[MAX_DBNAMES];
+int			n_dbNames;
 const char *progname;
 
 volatile bool timer_exceeded = false;	/* flag from signal handler */
@@ -501,7 +505,7 @@ doConnect(void)
 		keywords[3] = "password";
 		values[3] = password;
 		keywords[4] = "dbname";
-		values[4] = dbName;
+		values[4] = dbNames[0];
 		keywords[5] = "fallback_application_name";
 		values[5] = progname;
 		keywords[6] = NULL;
@@ -514,7 +518,7 @@ doConnect(void)
 		if (!conn)
 		{
 			fprintf(stderr, "Connection to database \"%s\" failed\n",
-					dbName);
+					dbNames[0]);
 			return NULL;
 		}
 
@@ -532,7 +536,7 @@ doConnect(void)
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
 		fprintf(stderr, "Connection to database \"%s\" failed:\n%s",
-				dbName, PQerrorMessage(conn));
+				dbNames[0], PQerrorMessage(conn));
 		PQfinish(conn);
 		return NULL;
 	}
@@ -2345,15 +2349,20 @@ main(int argc, char **argv)
 	}
 
 	if (argc > optind)
-		dbName = argv[optind];
+	{
+		n_dbNames = 1;
+		dbNames[0] = argv[optind];
+		/* TODO: more dbnames */
+	}
 	else
 	{
+		n_dbNames = 1;
 		if ((env = getenv("PGDATABASE")) != NULL && *env != '\0')
-			dbName = env;
+			dbNames[0] = env;
 		else if (login != NULL && *login != '\0')
-			dbName = login;
+			dbNames[0] = login;
 		else
-			dbName = "";
+			dbNames[0] = "";
 	}
 
 	if (is_init_mode)
@@ -2453,10 +2462,10 @@ main(int argc, char **argv)
 	{
 		if (duration <= 0)
 			printf("pghost: %s pgport: %s nclients: %d nxacts: %d dbName: %s\n",
-				   pghost, pgport, nclients, nxacts, dbName);
+				   pghost, pgport, nclients, nxacts, dbNames[0]);
 		else
 			printf("pghost: %s pgport: %s nclients: %d duration: %d dbName: %s\n",
-				   pghost, pgport, nclients, duration, dbName);
+				   pghost, pgport, nclients, duration, dbNames[0]);
 	}
 
 	/* opening connection... */
@@ -2466,7 +2475,7 @@ main(int argc, char **argv)
 
 	if (PQstatus(con) == CONNECTION_BAD)
 	{
-		fprintf(stderr, "Connection to database '%s' failed.\n", dbName);
+		fprintf(stderr, "Connection to database '%s' failed.\n", dbNames[0]);
 		fprintf(stderr, "%s", PQerrorMessage(con));
 		exit(1);
 	}
