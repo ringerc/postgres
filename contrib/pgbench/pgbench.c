@@ -161,7 +161,7 @@ char	   *index_tablespace = NULL;
 #define SCALE_32BIT_THRESHOLD 20000
 
 /* Maximum number of different databases/dsns that pgbench can connect to. */
-#define MAX_DBNAMES 100
+#define MAX_DBNAMES 200
 
 bool		use_log;			/* log transaction latencies to a file */
 bool		use_quiet;			/* quiet logging onto stderr */
@@ -173,8 +173,9 @@ int			main_pid;			/* main process id used in log filename */
 char	   *pghost = "";
 char	   *pgport = "";
 char	   *login = NULL;
-char	   *dbNames[MAX_DBNAMES];
-int			n_dbNames;
+char	   *dbNames[MAX_DBNAMES]; /* List of databases used for this run */
+int			n_dbNames;            /* Number of populated entries in dbNames */
+
 const char *progname;
 
 volatile bool timer_exceeded = false;	/* flag from signal handler */
@@ -225,6 +226,7 @@ typedef struct
 	instr_time *exec_elapsed;	/* time spent executing cmds (per Command) */
 	int		   *exec_count;		/* number of cmd executions (per Command) */
 	unsigned short random_state[3];		/* separate randomness for each thread */
+	char * dbName;				/* Database this thread's clients should connect to */
 } TState;
 
 #define INVALID_THREAD		((pthread_t) 0)
@@ -329,7 +331,9 @@ usage(void)
 {
 	printf("%s is a benchmarking tool for PostgreSQL.\n\n"
 		   "Usage:\n"
-		   "  %s [OPTION]... [DBNAME]\n"
+		   "  %s [OPTION]... [DBNAME [DBNAME [...]]]\n"
+		   "\nDBNAME may be a conninfo string like:\n"
+		   "  \"host=10.1.1.2 user=postgres dbname=master\"\n"
 		   "\nInitialization options:\n"
 		   "  -i           invokes initialization mode\n"
 		   "  -F NUM       fill factor\n"
@@ -345,12 +349,14 @@ usage(void)
 		   "  --unlogged-tables\n"
 		   "               create tables as unlogged tables\n"
 		   "\nBenchmarking options:\n"
-		"  -c NUM       number of concurrent database clients (default: 1)\n"
+		   "  -c NUM       number of concurrent database clients (default: 1)\n"
+		   "               (must be a multiple of number of threads)\n"
 		   "  -C           establish new connection for each transaction\n"
 		   "  -D VARNAME=VALUE\n"
 		   "               define variable for use by custom script\n"
 		   "  -f FILENAME  read transaction script from FILENAME\n"
-		   "  -j NUM       number of threads (default: 1)\n"
+		   "  -j NUM       number of threads (default: 1).\n"
+		   "               (Must be multiple of number of dbnames)\n"
 		   "  -l           write transaction times to log file\n"
 		   "  -M simple|extended|prepared\n"
 		   "               protocol for submitting queries to server (default: simple)\n"
@@ -479,7 +485,7 @@ executeStatement(PGconn *con, const char *sql)
 
 /* set up a connection to the backend */
 static PGconn *
-doConnect(void)
+doConnect(char * dbName)
 {
 	PGconn	   *conn;
 	static char *password = NULL;
@@ -505,7 +511,7 @@ doConnect(void)
 		keywords[3] = "password";
 		values[3] = password;
 		keywords[4] = "dbname";
-		values[4] = dbNames[0];
+		values[4] = dbName;
 		keywords[5] = "fallback_application_name";
 		values[5] = progname;
 		keywords[6] = NULL;
@@ -518,7 +524,7 @@ doConnect(void)
 		if (!conn)
 		{
 			fprintf(stderr, "Connection to database \"%s\" failed\n",
-					dbNames[0]);
+					dbName);
 			return NULL;
 		}
 
@@ -536,7 +542,7 @@ doConnect(void)
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
 		fprintf(stderr, "Connection to database \"%s\" failed:\n%s",
-				dbNames[0], PQerrorMessage(conn));
+				dbName, PQerrorMessage(conn));
 		PQfinish(conn);
 		return NULL;
 	}
@@ -919,10 +925,10 @@ top:
 		if (commands[st->state]->type == SQL_COMMAND)
 		{
 			if (debug)
-				fprintf(stderr, "client %d receiving\n", st->id);
+				fprintf(stderr, "client %d on thread %d receiving\n", st->id, thread->tid);
 			if (!PQconsumeInput(st->con))
 			{					/* there's something wrong */
-				fprintf(stderr, "Client %d aborted in state %d. Probably the backend died while processing.\n", st->id, st->state);
+				fprintf(stderr, "Client %d on thread %d aborted in state %d. Probably the backend died while processing.\n", st->id, thread->tid, st->state);
 				return clientDone(st, false);
 			}
 			if (PQisBusy(st->con))
@@ -1081,8 +1087,10 @@ top:
 		instr_time	start,
 					end;
 
+		if (debug)
+			fprintf(stderr, "client %d on thread %d connecting to %s\n", st->id, thread->tid, thread->dbName);
 		INSTR_TIME_SET_CURRENT(start);
-		if ((st->con = doConnect()) == NULL)
+		if ((st->con = doConnect(thread->dbName)) == NULL)
 		{
 			fprintf(stderr, "Client %d aborted in establishing connection.\n", st->id);
 			return clientDone(st, false);
@@ -1112,7 +1120,7 @@ top:
 			sql = assignVariables(st, sql);
 
 			if (debug)
-				fprintf(stderr, "client %d sending %s\n", st->id, sql);
+				fprintf(stderr, "client %d on thread %d sending %s\n", st->id, thread->tid, sql);
 			r = PQsendQuery(st->con, sql);
 			free(sql);
 		}
@@ -1124,7 +1132,7 @@ top:
 			getQueryParams(st, command, params);
 
 			if (debug)
-				fprintf(stderr, "client %d sending %s\n", st->id, sql);
+				fprintf(stderr, "client %d on thread %d sending %s\n", st->id, thread->tid, sql);
 			r = PQsendQueryParams(st->con, sql, command->argc - 1,
 								  NULL, params, NULL, NULL, 0);
 		}
@@ -1158,7 +1166,7 @@ top:
 			preparedStatementName(name, st->use_file, st->state);
 
 			if (debug)
-				fprintf(stderr, "client %d sending %s\n", st->id, name);
+				fprintf(stderr, "client %d on thread %d sending %s\n", st->id, thread->tid, name);
 			r = PQsendQueryPrepared(st->con, name, command->argc - 1,
 									params, NULL, NULL, 0);
 		}
@@ -1168,7 +1176,7 @@ top:
 		if (r == 0)
 		{
 			if (debug)
-				fprintf(stderr, "client %d cannot send %s\n", st->id, command->argv[0]);
+				fprintf(stderr, "client %d on thread %d cannot send %s\n", st->id, thread->tid, command->argv[0]);
 			st->ecnt++;
 		}
 		else
@@ -1182,7 +1190,7 @@ top:
 
 		if (debug)
 		{
-			fprintf(stderr, "client %d executing \\%s", st->id, argv[0]);
+			fprintf(stderr, "client %d on thread %d executing \\%s", st->id, thread->tid, argv[0]);
 			for (i = 1; i < argc; i++)
 				fprintf(stderr, " %s", argv[i]);
 			fprintf(stderr, "\n");
@@ -1496,7 +1504,10 @@ init(bool is_no_vacuum)
 	double		elapsed_sec, remaining_sec;
 	int			log_interval = 1;
 
-	if ((con = doConnect()) == NULL)
+	/* In init mode only dbNames[0] can be populated */
+	if (debug)
+		fprintf(stderr, "init client connecting to %s", dbNames[0]);
+	if ((con = doConnect(dbNames[0])) == NULL)
 		exit(1);
 
 	for (i = 0; i < lengthof(DDLs); i++)
@@ -2018,6 +2029,8 @@ printResults(int ttype, int normal_xacts, int nclients,
 	printf("query mode: %s\n", QUERYMODE[querymode]);
 	printf("number of clients: %d\n", nclients);
 	printf("number of threads: %d\n", nthreads);
+	if (n_dbNames > 1)
+			printf("number of databases: %d\n", n_dbNames);
 	if (duration <= 0)
 	{
 		printf("number of transactions per client: %d\n", nxacts);
@@ -2350,9 +2363,30 @@ main(int argc, char **argv)
 
 	if (argc > optind)
 	{
-		n_dbNames = 1;
-		dbNames[0] = argv[optind];
-		/* TODO: more dbnames */
+		if (argc - optind > MAX_DBNAMES)
+		{
+			/* Should probably be dynamic, but not worth the hassle */
+			fprintf(stderr, "Can only connect to %i DBs at a time; increase MAX_DBNAMES in pgbench.c and recompile.\n", MAX_DBNAMES);
+			exit(1);
+		}
+		if (is_init_mode > 0 && argc - optind > 1)
+		{
+			/* 
+			 * Even if we could run init mode once for each DB, it'd be slow
+			 * unless we just forked and run multiple copies of ourselves.  For
+			 * now it's fine to just make the user do that.
+			 */
+			fprintf(stderr, "Only one target database may be specified for init mode. Run it once for each DB.\n");
+			exit(1);
+		}
+		if ( nthreads % (argc - optind) != 0 )
+		{
+			fprintf(stderr, "Number of threads [-j] (%d) must be an even multiple of number of target database connections (%d)\n", nthreads, (argc-optind));
+			exit(1);
+		}
+		for (i = 0; i < (argc-optind); i++ )
+			dbNames[i] = argv[optind+i];
+		n_dbNames = argc - optind;
 	}
 	else
 	{
@@ -2468,8 +2502,10 @@ main(int argc, char **argv)
 				   pghost, pgport, nclients, duration, dbNames[0]);
 	}
 
-	/* opening connection... */
-	con = doConnect();
+	/* opening connection to the first database to run the required setup... */
+	if (debug)
+		fprintf(stderr, "Connecting to %s for initial setup\n", dbNames[0]);
+	con = doConnect(dbNames[0]);
 	if (con == NULL)
 		exit(1);
 
@@ -2537,6 +2573,8 @@ main(int argc, char **argv)
 		}
 	}
 	PQfinish(con);
+	if (debug)
+		fprintf(stderr, "Disconnected from database after initial setup\n");
 
 	/* set random seed */
 	INSTR_TIME_SET_CURRENT(start_time);
@@ -2576,6 +2614,8 @@ main(int argc, char **argv)
 		thread->random_state[0] = random();
 		thread->random_state[1] = random();
 		thread->random_state[2] = random();
+		/* Distribute dbnames evenly between threads */
+		thread->dbName = dbNames[i % n_dbNames];
 
 		if (is_latencies)
 		{
@@ -2705,7 +2745,9 @@ threadRun(void *arg)
 		/* make connections to the database */
 		for (i = 0; i < nstate; i++)
 		{
-			if ((state[i].con = doConnect()) == NULL)
+			if (debug)
+				fprintf(stderr, "client %d on thread %d connecting to %s\n", state[i].id, thread->tid, thread->dbName);
+			if ((state[i].con = doConnect(thread->dbName)) == NULL)
 				goto done;
 		}
 	}
