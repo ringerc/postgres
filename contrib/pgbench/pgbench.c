@@ -132,6 +132,11 @@ int			foreign_keys = 0;
 int			unlogged_tables = 0;
 
 /*
+ * Force a checkpoint after vacuum and before benchmark runs?
+ */
+int			force_checkpoint = 0;
+
+/*
  * log sampling rate (1.0 = log everything, 0.0 = option not given)
  */
 double		sample_rate = 0.0;
@@ -368,6 +373,8 @@ usage(void)
 	 "  -t NUM       number of transactions each client runs (default: 10)\n"
 		   "  -T NUM       duration of benchmark test in seconds\n"
 		   "  -v           vacuum all four standard tables before tests\n"
+ 		   "  --force-checkpoint\n"
+		   "               force a CHECKPOINT before benchmarks (superuser only)\n"
 		   "  --aggregate-interval=NUM\n"
 		   "               aggregate data over NUM seconds\n"
 		   "  --sampling-rate=NUM\n"
@@ -2103,6 +2110,7 @@ main(int argc, char **argv)
 		{"unlogged-tables", no_argument, &unlogged_tables, 1},
 		{"sampling-rate", required_argument, NULL, 4},
 		{"aggregate-interval", required_argument, NULL, 5},
+		{"force-checkpoint", no_argument, &force_checkpoint, 6},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -2571,6 +2579,12 @@ main(int argc, char **argv)
 			executeStatement(con, "vacuum analyze pgbench_accounts");
 			fprintf(stderr, "end.\n");
 		}
+	}
+	if (force_checkpoint)
+	{
+		fprintf(stderr, "starting CHECKPOINT...");
+		executeStatement(con, "CHECKPOINT;");
+		fprintf(stderr, "end\n");
 	}
 	PQfinish(con);
 	if (debug)
