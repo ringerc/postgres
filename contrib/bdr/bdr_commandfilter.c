@@ -16,6 +16,26 @@ static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 
 static bool bdr_permit_unsafe_commands;
 
+/*
+ * Check the passed rangevar, locking it and looking it up in the cache
+ * then determine if the relation requires logging to WAL. If it does, then
+ * right now BDR won't cope with it and we must reject the operation that
+ * touches this relation.
+ */
+static void
+error_on_persistent_rv(RangeVar *rv, const char * cmdtag)
+{
+	bool needswal;
+	Relation rel;
+	if (rv == NULL)
+		ereport(ERROR, (errmsg("Unqualified command %s is unsafe with BDR active.", cmdtag)));
+	rel = heap_openrv(rv, AccessExclusiveLock);
+	needswal = RelationNeedsWAL(rel);
+	heap_close(rel, AccessExclusiveLock);
+	if (needswal)
+		ereport(ERROR, (errmsg("%s may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", cmdtag, rv->relname)));
+}
+
 static void
 bdr_commandfilter(Node *parsetree,
                 const char *queryString,
@@ -26,16 +46,12 @@ bdr_commandfilter(Node *parsetree,
 {
 	int severity = ERROR;
 	ListCell *cell;
-	RangeVar *rv;
-	Relation rel;
-	bool needswal;
 
 	ereport(DEBUG4, (errmsg_internal("bdr_commandfilter ProcessUtility_hook invoked")));
 	if (bdr_permit_unsafe_commands)
 		severity = WARNING;
 	
 
-	/* TODO: Permit 'unsafe' statements on TEMPORARY and UNLOGGED tables */
 	switch (nodeTag(parsetree)) {
 		case T_TruncateStmt:
 			/*
@@ -48,26 +64,25 @@ bdr_commandfilter(Node *parsetree,
 			 * relation list.
 			 */
 			foreach(cell, ((TruncateStmt*)parsetree)->relations)
-			{
-				rv = lfirst(cell);
-				rel = heap_openrv(rv, AccessExclusiveLock);
-				needswal = RelationNeedsWAL(rel);
-				heap_close(rel, AccessExclusiveLock);
-				if (needswal)
-					ereport(ERROR, (errmsg("TRUNCATE may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", RelationGetRelationName(rel))));
-			}
+				error_on_persistent_rv(lfirst(cell), "TRUNCATE");
 			break;
 
 		case T_ClusterStmt:
-			/* TODO: Permit CLUSTER on UNLOGGED or TEMPORARY tables */
-			ereport(severity, (errmsg("CLUSTER is unsafe with BDR active.")));
+			error_on_persistent_rv(((ClusterStmt*)parsetree)->relation, "CLUSTER");
 			break;
 
 		case T_VacuumStmt:
 			/* We must prevent VACUUM FULL, but allow normal VACUUM */
 			/* TODO: Permit VACUUM FULL on UNLOGGED or TEMPORARY tables */
 			if ( ((VacuumStmt *) parsetree)->options & VACOPT_FULL)
-				ereport(severity, (errmsg("VACUUM FULL is unsafe with BDR active, use only ordinary VACUUM.")));
+			{
+				/* VACUUM FULL might still be OK if it's on a TEMPORARY or UNLOGGED table */
+				error_on_persistent_rv(((VacuumStmt*)parsetree)->relation, "VACUUM FULL");
+			}
+			break;
+
+		case T_AlterTableStmt:
+			error_on_persistent_rv(((AlterTableStmt*)parsetree)->relation, "ALTER TABLE");
 			break;
 
 		case T_RenameStmt:
@@ -78,14 +93,11 @@ bdr_commandfilter(Node *parsetree,
 			break;
 
 		case T_CreateStmt:
+			/* relpersistence is already set for CREATE */
 			if ((((CreateStmt*)parsetree)->relation->relpersistence) == 'p')
 				ereport(severity, (errmsg("CREATE TABLE is only safe for UNLOGGED or TEMPORARY tables when BDR is active")));
 				break;
 
-		case T_AlterTableStmt:
-			if ((((AlterTableStmt*)parsetree)->relation->relpersistence) == 'p')
-				ereport(severity, (errmsg("Most ALTER TABLE commands are only safe for UNLOGGED or TEMPORARY tables when BDR is active")));
-				break;
 				
 		default:
 			break;
