@@ -103,7 +103,7 @@ static void bdr_count_unserialize(void);
 
 #define BDR_COUNT_STAT_COLS 13
 
-extern Datum pg_stat_bdr(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_bdr(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(pg_stat_bdr);
 
@@ -291,7 +291,7 @@ bdr_count_disconnect(void)
 }
 
 Datum
-pg_stat_bdr(PG_FUNCTION_ARGS)
+pg_stat_get_bdr(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc	tupdesc;

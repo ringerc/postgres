@@ -237,13 +237,17 @@ bdr_apply_main(void *main_arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
+	/* Connect to our database */
+	BackgroundWorkerInitializeConnection(bdr_apply_con->dbname, NULL);
+
+	/* always work in our own schema */
+	SetConfigOption("search_path", "bdr, pg_catalog",
+					PGC_BACKEND, PGC_S_OVERRIDE);
+
 	/* setup synchronous commit according to the user's wishes */
 	if (bdr_synchronous_commit != NULL)
 		SetConfigOption("synchronous_commit", bdr_synchronous_commit,
 						PGC_BACKEND, PGC_S_OVERRIDE);	/* other context? */
-
-	/* Connect to our database */
-	BackgroundWorkerInitializeConnection(bdr_apply_con->dbname, NULL);
 
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "bdr apply top-level resource owner");
 	bdr_saved_resowner = CurrentResourceOwner;
@@ -528,6 +532,10 @@ bdr_sequencer_main(void *main_arg)
 
 	/* Connect to our database */
 	BackgroundWorkerInitializeConnection(bdr_sequencer_con->dbname, NULL);
+
+	/* always work in our own schema */
+	SetConfigOption("search_path", "bdr, pg_catalog",
+					PGC_BACKEND, PGC_S_OVERRIDE);
 
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "bdr seq top-level resource owner");
 	bdr_saved_resowner = CurrentResourceOwner;

@@ -1,6 +1,12 @@
 --\echo Use "CREATE EXTENSION bdr" to load this file. \quit
 
-CREATE FUNCTION pg_stat_bdr(
+--CREATE ROLE bdr NOLOGIN SUPERUSER;
+--SET ROLE bdr;
+
+CREATE SCHEMA bdr;
+SET LOCAL search_path = bdr;
+
+CREATE FUNCTION pg_stat_get_bdr(
     OUT rep_node_id oid,
     OUT riremotesysid name,
     OUT riremotedb oid,
@@ -19,8 +25,9 @@ RETURNS SETOF record
 LANGUAGE C
 AS 'MODULE_PATHNAME';
 
-CREATE VIEW pg_stat_bdr AS SELECT * FROM pg_stat_bdr();
-REVOKE ALL ON FUNCTION pg_stat_bdr() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_stat_get_bdr() FROM PUBLIC;
+
+CREATE VIEW pg_stat_bdr AS SELECT * FROM pg_stat_get_bdr();
 
 CREATE TABLE bdr_sequence_values
 (
@@ -48,6 +55,9 @@ CREATE TABLE bdr_sequence_values
     EXCLUDE USING gist(seqschema WITH =, seqname WITH =, seqrange WITH &&) WHERE (confirmed),
     PRIMARY KEY(owning_sysid, owning_tlid, owning_dboid, owning_riname, seqschema, seqname, seqrange)
 );
+SELECT pg_catalog.pg_extension_config_dump('bdr_sequence_values', '');
+
+REVOKE ALL ON TABLE bdr_sequence_values FROM PUBLIC;
 
 CREATE INDEX bdr_sequence_values_chunks ON bdr_sequence_values(seqschema, seqname, seqrange);
 CREATE INDEX bdr_sequence_values_newchunk ON bdr_sequence_values(seqschema, seqname, upper(seqrange));
@@ -73,6 +83,8 @@ CREATE TABLE bdr_sequence_elections
 
     PRIMARY KEY(owning_sysid, owning_tlid, owning_dboid, owning_riname, seqschema, seqname, seqrange)
 );
+SELECT pg_catalog.pg_extension_config_dump('bdr_sequence_elections', '');
+REVOKE ALL ON TABLE bdr_sequence_values FROM PUBLIC;
 
 
 CREATE TABLE bdr_votes
@@ -92,7 +104,8 @@ CREATE TABLE bdr_votes
     reason text CHECK (reason IS NULL OR vote = false),
     UNIQUE(vote_sysid, vote_tlid, vote_dboid, vote_riname, vote_election_id, voter_sysid, voter_tlid, voter_dboid, voter_riname)
 );
-
+SELECT pg_catalog.pg_extension_config_dump('bdr_votes', '');
+REVOKE ALL ON TABLE bdr_votes FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION bdr_sequence_alloc(INTERNAL)
  RETURNS INTERNAL
@@ -130,3 +143,5 @@ VALUES (
     'bdr_sequence_setval',
     'bdr_sequence_options'
 );
+
+RESET search_path;

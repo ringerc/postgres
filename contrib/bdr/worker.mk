@@ -4,7 +4,7 @@ MODULE_big = bdr
 OBJS = bdr.o bdr_apply.o bdr_count.o bdr_seq.o
 
 EXTENSION = bdr
-DATA = bdr--0.1.sql bdr--0.1--0.2.sql bdr--0.2.sql
+DATA = bdr--0.5.sql
 
 PG_CPPFLAGS = -I$(libpq_srcdir)
 SHLIB_LINK = $(libpq)

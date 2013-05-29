@@ -577,8 +577,7 @@ bdr_sequencer_lock_rel(char *relname)
 	Oid nspoid;
 	Oid relid;
 
-	/* FIXME: fix hardcoded schema */
-	nspoid = get_namespace_oid("public", false);
+	nspoid = get_namespace_oid("bdr", false);
 	relid = get_relname_relid(relname, nspoid);
 	if (!relid)
 		elog(ERROR, "cache lookup failed for relation public.%s", relname);
