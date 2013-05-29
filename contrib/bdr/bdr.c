@@ -57,6 +57,8 @@ PG_MODULE_MAGIC;
 
 void		_PG_init(void);
 
+extern void init_bdr_commandfilter(void);
+
 /*
  * Converts an int64 to network byte order.
  */
@@ -605,6 +607,9 @@ _PG_init(void)
 	/* if nothing is configured, we're done */
 	if (connections == NULL)
 		goto out;
+
+	/* otherwise, set up a ProcessUtility_hook to stop unsupported commands being run */
+	init_bdr_commandfilter();
 
 	if (!SplitIdentifierString(connections, ',', &cons))
 	{
