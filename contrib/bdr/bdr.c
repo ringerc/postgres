@@ -111,8 +111,13 @@ sendFeedback(PGconn *conn, XLogRecPtr blockpos, int64 now, bool replyRequested,
 	int			len = 0;
 	static XLogRecPtr lastpos = InvalidXLogRecPtr;
 
-	if (!force && (blockpos == lastpos))
+	Assert(blockpos != InvalidXLogRecPtr);
+
+	if (!force && (blockpos <= lastpos))
 		return true;
+
+	if (blockpos < lastpos)
+		blockpos = lastpos;
 
 	replybuf[len] = 'r';
 	len += 1;
@@ -127,7 +132,8 @@ sendFeedback(PGconn *conn, XLogRecPtr blockpos, int64 now, bool replyRequested,
 	replybuf[len] = replyRequested ? 1 : 0;		/* replyRequested */
 	len += 1;
 
-	elog(LOG, "sending feedback to %X/%X",
+	elog(LOG, "sending feedback (force %d, reply requested %d) to %X/%X",
+		 force, replyRequested,
 		 (uint32) (blockpos >> 32), (uint32) blockpos);
 
 	lastpos = blockpos;
@@ -461,17 +467,25 @@ bdr_apply_main(void *main_arg)
 				{
 					int			hdr_len = 0;
 					char	   *data;
-					XLogRecPtr	temp;
+					XLogRecPtr	start_lsn;
+					XLogRecPtr	end_lsn;
 
 					hdr_len = 1;	/* msgtype 'w' */
+
+					start_lsn = recvint64(&copybuf[hdr_len]);
+
 					hdr_len += 8;		/* dataStart */
+
+					end_lsn = recvint64(&copybuf[hdr_len]);
+
 					hdr_len += 8;		/* walEnd */
 					hdr_len += 8;		/* sendTime */
 
-					temp = recvint64(&copybuf[1]);
+					if (last_received < start_lsn)
+						last_received = start_lsn;
 
-					if (last_received < temp)
-						last_received = temp;
+					if (last_received < end_lsn)
+						last_received = end_lsn;
 
 					data = copybuf + hdr_len;
 
@@ -479,7 +493,11 @@ bdr_apply_main(void *main_arg)
 				}
 				else if (copybuf[0] == 'k')
 				{
-					sendFeedback(streamConn, last_received,
+					XLogRecPtr	temp;
+
+					temp = recvint64(&copybuf[1]);
+
+					sendFeedback(streamConn, temp,
 								 GetCurrentTimestamp(), false, true);
 				}
 				/* other message types are purposefully ignored */
