@@ -4,6 +4,8 @@
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
+#include "utils/rel.h"
+#include "access/heapam.h"
 
 /*
  * bdr_commandfilter.c: a ProcessUtility_hook to prevent a cluster from running
@@ -23,6 +25,11 @@ bdr_commandfilter(Node *parsetree,
                 char *completionTag)
 {
 	int severity = ERROR;
+	ListCell *cell;
+	RangeVar *rv;
+	Relation rel;
+	bool needswal;
+
 	ereport(DEBUG4, (errmsg_internal("bdr_commandfilter ProcessUtility_hook invoked")));
 	if (bdr_permit_unsafe_commands)
 		severity = WARNING;
@@ -30,22 +37,56 @@ bdr_commandfilter(Node *parsetree,
 
 	/* TODO: Permit 'unsafe' statements on TEMPORARY and UNLOGGED tables */
 	switch (nodeTag(parsetree)) {
-		case T_AlterTableStmt:
-		case T_AlterTableCmd:
 		case T_TruncateStmt:
+			/*
+			 * Constraints on permanent tables may reference only
+			 * permanent tables. So if we can verify that there are
+			 * no permanent tables in the list it's OK to permit
+			 * the command even in the presence of CASCADE; we don't
+			 * have to resolve the cascade because we know it's not
+			 * going to affect permanent tables if none appear in the
+			 * relation list.
+			 */
+			foreach(cell, ((TruncateStmt*)parsetree)->relations)
+			{
+				rv = lfirst(cell);
+				rel = heap_openrv(rv, AccessExclusiveLock);
+				needswal = RelationNeedsWAL(rel);
+				heap_close(rel, AccessExclusiveLock);
+				if (needswal)
+					ereport(ERROR, (errmsg("TRUNCATE may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", RelationGetRelationName(rel))));
+			}
+			break;
+
 		case T_ClusterStmt:
-			ereport(severity, (errmsg("Command %s is unsafe with BDR active, see the documentation and bdr.permit_unsafe_commands", completionTag)));
+			/* TODO: Permit CLUSTER on UNLOGGED or TEMPORARY tables */
+			ereport(severity, (errmsg("CLUSTER is unsafe with BDR active.")));
+			break;
+
 		case T_VacuumStmt:
 			/* We must prevent VACUUM FULL, but allow normal VACUUM */
+			/* TODO: Permit VACUUM FULL on UNLOGGED or TEMPORARY tables */
 			if ( ((VacuumStmt *) parsetree)->options & VACOPT_FULL)
 				ereport(severity, (errmsg("VACUUM FULL is unsafe with BDR active, use only ordinary VACUUM.")));
 			break;
+
 		case T_RenameStmt:
-		case T_CreateStmt:
 		case T_CreateTableAsStmt:
 		case T_DropStmt:
 		case T_DropOwnedStmt:
-			ereport(WARNING, (errmsg("Command %s is unsafe with BDR active unless it only affects TEMPORARY and UNLOGGED tables or non-table objects", completionTag)));
+			ereport(WARNING, (errmsg("%s is unsafe with BDR active unless it only affects TEMPORARY and UNLOGGED tables or non-table objects", completionTag)));
+			break;
+
+		case T_CreateStmt:
+			if ((((CreateStmt*)parsetree)->relation->relpersistence) == 'p')
+				ereport(severity, (errmsg("CREATE TABLE is only safe for UNLOGGED or TEMPORARY tables when BDR is active")));
+				break;
+
+		case T_AlterTableStmt:
+			if ((((AlterTableStmt*)parsetree)->relation->relpersistence) == 'p')
+				ereport(severity, (errmsg("Most ALTER TABLE commands are only safe for UNLOGGED or TEMPORARY tables when BDR is active")));
+				break;
+				
 		default:
 			break;
 	}
