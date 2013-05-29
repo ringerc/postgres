@@ -6,6 +6,7 @@
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "access/heapam.h"
+#include "catalog/namespace.h"
 
 /*
  * bdr_commandfilter.c: a ProcessUtility_hook to prevent a cluster from running
@@ -23,17 +24,17 @@ static bool bdr_permit_unsafe_commands;
  * touches this relation.
  */
 static void
-error_on_persistent_rv(RangeVar *rv, const char * cmdtag)
+error_on_persistent_rv(RangeVar *rv, const char * cmdtag, LOCKMODE lockmode, int severity)
 {
 	bool needswal;
 	Relation rel;
 	if (rv == NULL)
-		ereport(ERROR, (errmsg("Unqualified command %s is unsafe with BDR active.", cmdtag)));
-	rel = heap_openrv(rv, AccessExclusiveLock);
+		ereport(severity, (errmsg("Unqualified command %s is unsafe with BDR active.", cmdtag)));
+	rel = heap_openrv(rv, lockmode);
 	needswal = RelationNeedsWAL(rel);
-	heap_close(rel, AccessExclusiveLock);
+	heap_close(rel, lockmode);
 	if (needswal)
-		ereport(ERROR, (errmsg("%s may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", cmdtag, rv->relname)));
+		ereport(severity, (errmsg("%s may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", cmdtag, rv->relname)));
 }
 
 static void
@@ -46,6 +47,7 @@ bdr_commandfilter(Node *parsetree,
 {
 	int severity = ERROR;
 	ListCell *cell;
+	DropStmt* dropStatement;
 
 	ereport(DEBUG4, (errmsg_internal("bdr_commandfilter ProcessUtility_hook invoked")));
 	if (bdr_permit_unsafe_commands)
@@ -64,11 +66,11 @@ bdr_commandfilter(Node *parsetree,
 			 * relation list.
 			 */
 			foreach(cell, ((TruncateStmt*)parsetree)->relations)
-				error_on_persistent_rv(lfirst(cell), "TRUNCATE");
+				error_on_persistent_rv(lfirst(cell), "TRUNCATE", AccessExclusiveLock, severity);
 			break;
 
 		case T_ClusterStmt:
-			error_on_persistent_rv(((ClusterStmt*)parsetree)->relation, "CLUSTER");
+			error_on_persistent_rv(((ClusterStmt*)parsetree)->relation, "CLUSTER", AccessExclusiveLock, severity);
 			break;
 
 		case T_VacuumStmt:
@@ -77,26 +79,46 @@ bdr_commandfilter(Node *parsetree,
 			if ( ((VacuumStmt *) parsetree)->options & VACOPT_FULL)
 			{
 				/* VACUUM FULL might still be OK if it's on a TEMPORARY or UNLOGGED table */
-				error_on_persistent_rv(((VacuumStmt*)parsetree)->relation, "VACUUM FULL");
+				error_on_persistent_rv(((VacuumStmt*)parsetree)->relation, "VACUUM FULL", AccessExclusiveLock, severity);
 			}
 			break;
 
-		case T_AlterTableStmt:
-			error_on_persistent_rv(((AlterTableStmt*)parsetree)->relation, "ALTER TABLE");
-			break;
-
 		case T_RenameStmt:
-		case T_CreateTableAsStmt:
-		case T_DropStmt:
-		case T_DropOwnedStmt:
-			ereport(WARNING, (errmsg("%s is unsafe with BDR active unless it only affects TEMPORARY and UNLOGGED tables or non-table objects", completionTag)));
+		case T_AlterTableStmt:
+			error_on_persistent_rv(((AlterTableStmt*)parsetree)->relation, "ALTER TABLE", AccessExclusiveLock, severity);
 			break;
 
+		case T_DropStmt:
+			/*
+			 * DROP is fun to handle, since a DropStmt might be for a matview, index,
+			 * etc, not just a table, per the comment on RemoveRelations in tablecmds.c
+			 *
+			 * We only handle the table case.
+			 */
+ 			dropStatement = (DropStmt*)parsetree;
+			if (dropStatement->removeType == OBJECT_TABLE)
+			{
+				foreach(cell, dropStatement->objects)
+				{
+					/* TODO: Is there any case where the nested list can be >1 entry long? If not, why is there a nested list? */
+					if ( ((List*)lfirst(cell))->length != 1)
+						elog(WARNING, "Internal error: Expected one-item nested list in DROP");
+					else
+						error_on_persistent_rv(makeRangeVarFromNameList((List *) lfirst(cell)), "DROP TABLE", AccessExclusiveLock, severity);
+				}
+			}
+			break;
+
+		case T_CreateTableAsStmt:
 		case T_CreateStmt:
 			/* relpersistence is already set for CREATE */
 			if ((((CreateStmt*)parsetree)->relation->relpersistence) == 'p')
 				ereport(severity, (errmsg("CREATE TABLE is only safe for UNLOGGED or TEMPORARY tables when BDR is active")));
 				break;
+
+		case T_DropOwnedStmt:
+			ereport(severity, (errmsg("DROP OWNED is unsafe with BDR active unless it only affects TEMPORARY and UNLOGGED tables or non-table objects")));
+			break;
 
 				
 		default:
