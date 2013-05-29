@@ -24,17 +24,20 @@ static bool bdr_permit_unsafe_commands;
  * touches this relation.
  */
 static void
-error_on_persistent_rv(RangeVar *rv, const char * cmdtag, LOCKMODE lockmode, int severity)
+error_on_persistent_rv(RangeVar *rv, const char * cmdtag, LOCKMODE lockmode, int severity, bool missing_ok)
 {
 	bool needswal;
 	Relation rel;
 	if (rv == NULL)
 		ereport(severity, (errmsg("Unqualified command %s is unsafe with BDR active.", cmdtag)));
-	rel = heap_openrv(rv, lockmode);
-	needswal = RelationNeedsWAL(rel);
-	heap_close(rel, lockmode);
-	if (needswal)
-		ereport(severity, (errmsg("%s may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", cmdtag, rv->relname)));
+	rel = heap_openrv_extended(rv, lockmode, missing_ok);
+	if (rel != NULL)
+	{
+		needswal = RelationNeedsWAL(rel);
+		heap_close(rel, lockmode);
+		if (needswal)
+			ereport(severity, (errmsg("%s may only affect UNLOGGED or TEMPORARY tables when BDR is active; %s is a regular table", cmdtag, rv->relname)));
+	}
 }
 
 static void
@@ -48,6 +51,9 @@ bdr_commandfilter(Node *parsetree,
 	int severity = ERROR;
 	ListCell *cell;
 	DropStmt* dropStatement;
+	RenameStmt *renameStatement;
+	VacuumStmt *vacuumStatement;
+	AlterTableStmt* alterTableStatement;
 
 	ereport(DEBUG4, (errmsg_internal("bdr_commandfilter ProcessUtility_hook invoked")));
 	if (bdr_permit_unsafe_commands)
@@ -66,26 +72,34 @@ bdr_commandfilter(Node *parsetree,
 			 * relation list.
 			 */
 			foreach(cell, ((TruncateStmt*)parsetree)->relations)
-				error_on_persistent_rv(lfirst(cell), "TRUNCATE", AccessExclusiveLock, severity);
+				error_on_persistent_rv(lfirst(cell), "TRUNCATE", AccessExclusiveLock, severity, false);
 			break;
 
 		case T_ClusterStmt:
-			error_on_persistent_rv(((ClusterStmt*)parsetree)->relation, "CLUSTER", AccessExclusiveLock, severity);
+			error_on_persistent_rv(((ClusterStmt*)parsetree)->relation, "CLUSTER", AccessExclusiveLock, severity, false);
 			break;
 
 		case T_VacuumStmt:
 			/* We must prevent VACUUM FULL, but allow normal VACUUM */
-			/* TODO: Permit VACUUM FULL on UNLOGGED or TEMPORARY tables */
-			if ( ((VacuumStmt *) parsetree)->options & VACOPT_FULL)
+		 	/* TODO: Permit VACUUM FULL on UNLOGGED or TEMPORARY tables */
+			vacuumStatement = (VacuumStmt *) parsetree;
+			if ( vacuumStatement->options & VACOPT_FULL)
 			{
 				/* VACUUM FULL might still be OK if it's on a TEMPORARY or UNLOGGED table */
-				error_on_persistent_rv(((VacuumStmt*)parsetree)->relation, "VACUUM FULL", AccessExclusiveLock, severity);
+				error_on_persistent_rv(vacuumStatement->relation, "VACUUM FULL", AccessExclusiveLock, severity, false);
 			}
 			break;
 
-		case T_RenameStmt:
 		case T_AlterTableStmt:
-			error_on_persistent_rv(((AlterTableStmt*)parsetree)->relation, "ALTER TABLE", AccessExclusiveLock, severity);
+			alterTableStatement = (AlterTableStmt*)parsetree;
+			error_on_persistent_rv(alterTableStatement->relation, "ALTER TABLE", AccessExclusiveLock, severity, alterTableStatement->missing_ok);
+			break;
+
+		case T_RenameStmt:
+			renameStatement = (RenameStmt*)parsetree;
+			if (renameStatement->renameType == OBJECT_TABLE) {
+				error_on_persistent_rv(renameStatement->relation, "ALTER TABLE ... RENAME", AccessExclusiveLock, severity, renameStatement->missing_ok);
+			}
 			break;
 
 		case T_DropStmt:
@@ -104,7 +118,7 @@ bdr_commandfilter(Node *parsetree,
 					if ( ((List*)lfirst(cell))->length != 1)
 						elog(WARNING, "Internal error: Expected one-item nested list in DROP");
 					else
-						error_on_persistent_rv(makeRangeVarFromNameList((List *) lfirst(cell)), "DROP TABLE", AccessExclusiveLock, severity);
+						error_on_persistent_rv(makeRangeVarFromNameList((List *) lfirst(cell)), "DROP TABLE", AccessExclusiveLock, severity, dropStatement->missing_ok);
 				}
 			}
 			break;
@@ -117,6 +131,7 @@ bdr_commandfilter(Node *parsetree,
 				break;
 
 		case T_DropOwnedStmt:
+			/* We don't try to handle DROP OWNED at this point, there's just too much logic */
 			ereport(severity, (errmsg("DROP OWNED is unsafe with BDR active unless it only affects TEMPORARY and UNLOGGED tables or non-table objects")));
 			break;
 
