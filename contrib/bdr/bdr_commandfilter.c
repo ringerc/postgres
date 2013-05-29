@@ -22,8 +22,11 @@ bdr_commandfilter(Node *parsetree,
                 DestReceiver *dest,
                 char *completionTag)
 {
-
+	int severity = ERROR;
 	ereport(DEBUG4, (errmsg_internal("bdr_commandfilter ProcessUtility_hook invoked")));
+	if (bdr_permit_unsafe_commands)
+		severity = WARNING;
+	
 
 	/* TODO: Permit 'unsafe' statements on TEMPORARY and UNLOGGED tables */
 	switch (nodeTag(parsetree)) {
@@ -31,15 +34,11 @@ bdr_commandfilter(Node *parsetree,
 		case T_AlterTableCmd:
 		case T_TruncateStmt:
 		case T_ClusterStmt:
-			if (bdr_permit_unsafe_commands)
-				ereport(WARNING, (errmsg("Command %s is unsafe with BDR active but is being permitted because bdr.permit_unsafe_commands is on.", completionTag)));
-			else
-				ereport(ERROR, (errmsg("Command %s is unsafe with BDR active, see the documentation and bdr.permit_unsafe_commands", completionTag)));
-			break;
+			ereport(severity, (errmsg("Command %s is unsafe with BDR active, see the documentation and bdr.permit_unsafe_commands", completionTag)));
 		case T_VacuumStmt:
 			/* We must prevent VACUUM FULL, but allow normal VACUUM */
-			/* TODO */
-			ereport(WARNING, (errmsg("VACUUM FULL is unsafe with BDR active, use only ordinary VACUUM.")));
+			if ( ((VacuumStmt *) parsetree)->options & VACOPT_FULL)
+				ereport(severity, (errmsg("VACUUM FULL is unsafe with BDR active, use only ordinary VACUUM.")));
 			break;
 		case T_RenameStmt:
 		case T_CreateStmt:
