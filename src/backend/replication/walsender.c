@@ -2784,8 +2784,12 @@ wait_for_remote_lsn(int32 pid, XLogRecPtr ptr, bool wait_for_apply)
 				break;
 		}
 
+
 		if (!done)
+		{
 			pg_usleep(10 * 1000);
+			CHECK_FOR_INTERRUPTS();
+		}
 	}
 	while (!done);
 }
