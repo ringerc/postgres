@@ -129,7 +129,7 @@ const Size	max_memtries = 4096;
 
 /* Size of the slab caches used for frequently allocated objects */
 const Size	max_cached_changes = 4096 * 2;
-const Size	max_cached_tuplebufs = 1024;		/* ~8MB */
+const Size	max_cached_tuplebufs = 4096 * 4;		/* ~8MB */
 const Size	max_cached_transactions = 512;
 
 
