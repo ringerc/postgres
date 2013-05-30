@@ -4661,7 +4661,7 @@ xact_redo_commit_internal(TransactionId xid, XLogRecPtr lsn,
 
 	if (xinfo & XACT_CONTAINS_ORIGIN)
 	{
-		elog(LOG, "restoring origin of node %u to %X/%X",
+		elog(DEBUG2, "restoring origin of node %u to %X/%X",
 			 origin->origin_node_id,
 			 (uint32)(origin->origin_lsn >> 32),
 			 (uint32)origin->origin_lsn);
