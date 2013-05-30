@@ -997,7 +997,7 @@ SnapBuildDecodeCallback(ReorderBuffer * reorder, Snapstate * snapstate,
 			}
 		case RM_HEAP2_ID:
 			{
-				switch (info)
+				switch (info & XLOG_HEAP_OPMASK)
 				{
 					case XLOG_HEAP2_MULTI_INSERT:
 						{
