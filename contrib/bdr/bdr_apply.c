@@ -79,7 +79,9 @@ process_remote_begin(char *data, size_t r)
 			(uint32) (*origlsn >> 32), (uint32) *origlsn,
 			timestamptz_to_str(*committime));
 
-	elog(LOG, "%s", statbuf);
+	
+	if (bdr_log_apply)
+		elog(LOG, "%s", statbuf);
 
 	pgstat_report_activity(STATE_RUNNING, statbuf);
 
@@ -123,9 +125,10 @@ process_remote_commit(char *data, size_t r)
 	committime = (TimestampTz *) data;
 	data += sizeof(TimestampTz);
 
-	elog(LOG, "COMMIT origin(lsn, timestamp): %X/%X, %s",
-		 (uint32) (*origlsn >> 32), (uint32) *origlsn,
-		 timestamptz_to_str(*committime));
+	if (bdr_log_apply)
+		elog(LOG, "COMMIT origin(lsn, timestamp): %X/%X, %s",
+			 (uint32) (*origlsn >> 32), (uint32) *origlsn,
+			 timestamptz_to_str(*committime));
 
 	Assert(*origlsn == replication_origin_lsn);
 	Assert(*committime == replication_origin_timestamp);
