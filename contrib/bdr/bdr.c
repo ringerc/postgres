@@ -586,10 +586,9 @@ _PG_init(void)
 	Size		nregistered = 0;
 
 	char	  **used_databases;
-	Size		num_used_databases;
+	Size		num_used_databases = 0;
 
 	size_t		off;
-	bool		found;
 	char		fullname[128];
 
 	if (!process_shared_preload_libraries_in_progress)
@@ -633,7 +632,6 @@ _PG_init(void)
 	}
 
 	used_databases = malloc(sizeof(char *) * list_length(cons));
-	num_used_databases = 0;
 
 	/* Common apply worker values */
 	apply_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
@@ -664,6 +662,7 @@ _PG_init(void)
 		char	   *optname_dsn = palloc(strlen(name) + 30);
 		char	   *optname_delay = palloc(strlen(name) + 30);
 		BDRWorkerCon *con;
+		bool		found = false;
 
 		con = palloc(sizeof(BDRWorkerCon));
 		con->dsn = (char *) lfirst(c);
