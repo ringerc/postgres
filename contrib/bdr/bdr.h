@@ -14,7 +14,6 @@
 #include "access/xlogdefs.h"
 #include "utils/resowner.h"
 
-
 typedef struct BDRWorkerCon
 {
 	/* name specified in configuration */
@@ -46,6 +45,8 @@ typedef struct BDRSequencerCon
 extern ResourceOwner bdr_saved_resowner;
 extern BDRWorkerCon *bdr_apply_con;
 extern BDRSequencerCon *bdr_sequencer_con;
+
+extern bool bdr_log_apply;
 
 /* apply support */
 extern void process_remote_begin(char *data, size_t r);

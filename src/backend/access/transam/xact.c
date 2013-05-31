@@ -1112,7 +1112,7 @@ RecordTransactionCommit(void)
 			if (guc_replication_origin_id != InvalidRepNodeId)
 			{
 				Assert(replication_origin_lsn != InvalidXLogRecPtr);
-				elog(LOG, "logging origin id");
+				elog(DEBUG1, "logging origin id");
 				xlrec.xinfo |= XACT_CONTAINS_ORIGIN;
 				origin.origin_node_id = guc_replication_origin_id;
 				origin.origin_lsn = replication_origin_lsn;

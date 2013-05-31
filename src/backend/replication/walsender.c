@@ -880,7 +880,7 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 {
 	StringInfoData buf;
 
-	elog(WARNING, "Starting logical replication");
+	elog(INFO, "Starting logical replication");
 
 	/* make sure that our requirements are still fulfilled */
 	CheckLogicalReplicationRequirements();
@@ -936,7 +936,7 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 		cmd->startpoint = MyLogicalDecodingSlot->confirmed_flush;
 	logical_decoding_ctx->snapshot_builder->transactions_after = cmd->startpoint;
 
-	elog(LOG, "starting to decode from %X/%X, replay %X/%X",
+	elog(DEBUG1, "starting to decode from %X/%X, replay %X/%X",
 		 (uint32)(MyWalSnd->sentPtr >> 32), (uint32)MyWalSnd->sentPtr,
 		 (uint32)(cmd->startpoint >> 32), (uint32)cmd->startpoint);
 
@@ -2784,8 +2784,12 @@ wait_for_remote_lsn(int32 pid, XLogRecPtr ptr, bool wait_for_apply)
 				break;
 		}
 
+
 		if (!done)
+		{
 			pg_usleep(10 * 1000);
+			CHECK_FOR_INTERRUPTS();
+		}
 	}
 	while (!done);
 }

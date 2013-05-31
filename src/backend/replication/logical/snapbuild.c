@@ -1148,7 +1148,7 @@ SnapBuildAddCommittedTxn(Snapstate * snapstate, TransactionId xid)
 
 		/* XXX: put in a limit here as a defense against bugs? */
 
-		elog(WARNING, "increasing space for committed transactions to %zu",
+		elog(DEBUG1, "increasing space for committed transactions to %zu",
 			 snapstate->committed.xcnt_space);
 
 		snapstate->committed.xip = repalloc(snapstate->committed.xip,
@@ -1577,7 +1577,7 @@ SnapBuildRestore(Snapstate * state, ReorderBuffer * reorder, XLogRecPtr lsn)
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY, 0);
 
-	elog(LOG, "restoring snapbuild state from %s", path);
+	elog(DEBUG1, "restoring snapbuild state from %s", path);
 
 	if (fd < 0 && errno == ENOENT)
 		return false;
