@@ -1049,7 +1049,11 @@ bdr_sequence_alloc(PG_FUNCTION_ARGS)
 
 	values = fastgetattr(seqtuple, 11, RelationGetDescr(seqrel), &isnull);
 	if (isnull)
-		elog(ERROR, "uninitialized sequence");
+		ereport( ERROR, (
+			errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("The sequence %s is not yet initialised from the global sequence co-ordinator. Try again soon.", seq->sequence_name.data),
+			errhint("Global sequences take time to intialize. Keep checking nextval(...) until it returns a result.")
+		));
 
 	curval = (BdrSequenceValues *) VARDATA_ANY(DatumGetByteaP(values));
 
