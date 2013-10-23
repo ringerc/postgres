@@ -94,6 +94,7 @@ test: delete
 test: namespace
 test: prepared_xacts
 test: privileges
+test: rowsecurity
 test: security_label
 test: collate
 test: matview

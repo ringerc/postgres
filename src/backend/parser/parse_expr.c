@@ -1459,6 +1459,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		case EXPR_KIND_OFFSET:
 		case EXPR_KIND_RETURNING:
 		case EXPR_KIND_VALUES:
+		case EXPR_KIND_ROW_SECURITY:
 			/* okay */
 			break;
 		case EXPR_KIND_CHECK_CONSTRAINT:
@@ -2640,6 +2641,8 @@ ParseExprKindName(ParseExprKind exprKind)
 			return "EXECUTE";
 		case EXPR_KIND_TRIGGER_WHEN:
 			return "WHEN";
+		case EXPR_KIND_ROW_SECURITY:
+			return "ROW SECURITY";
 
 			/*
 			 * There is intentionally no default: case here, so that the

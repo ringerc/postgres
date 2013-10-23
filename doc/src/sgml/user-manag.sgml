@@ -439,4 +439,149 @@ DROP ROLE <replaceable>name</replaceable>;
   </para>
  </sect1>
 
+ <sect1 id="row-security">
+  <title>Row-security</title>
+  <para>
+   <productname>PostgreSQL</productname> v9.4 or later provides
+   row-security feature, like several commercial database
+   management system. It allows table owner to assign a particular
+   condition that performs as a security policy of the table; only
+   rows that satisfies the condition should be visible, except for
+   a case when superuser runs queries.
+  </para>
+  <para>
+   Row-security policy can be set using <literal>SET ROW SECURITY</literal>
+   command of <xref linkend="SQL-ALTERTABLE"> statement, as an expression
+   form that returns a value of type boolean. This expression can contain
+   references to columns of the relation, so it enables to construct
+   arbitrary rule to make access control decision based on contents of
+   each rows.
+  </para>
+  <para>
+   For example, the following <literal>customer</literal> table has
+   <literal>uname</literal> field to store user name, and it assume
+   we don't want to expose any properties of other customers.
+   The following command set <literal>current_user = uname</literal>
+   as row-security policy on the <literal>customer</literal> table.
+<screen>
+postgres=> ALTER TABLE customer SET ROW SECURITY
+                                FOR ALL TO (current_user = uname);
+ALTER TABLE
+</screen>
+   <xref linkend="SQL-EXPLAIN"> command shows how row-security policy
+   works on the supplied query.
+<screen>
+postgres=> EXPLAIN(costs off) SELECT * FROM customer WHERE f_leak(upasswd);
+                 QUERY PLAN
+--------------------------------------------
+ Subquery Scan on customer
+   Filter: f_leak(customer.upasswd)
+   ->  Seq Scan on customer customer_1
+         Filter: ("current_user"() = uname)
+(4 rows)
+</screen>
+   This query execution plan means the preconfigured row-security policy is
+   implicitly added, and scan plan on the target relation being wrapped up
+   with a sub-query.
+   It ensures user given qualifiers, including functions with side effects,
+   are never executed earlier than the row-security policy regardless of
+   its cost, except for the cases when these were fully leakproof.
+   This design helps to tackle the scenario described in
+   <xref linkend="RULES-PRIVILEGES">; that introduces the order to evaluate
+   qualifiers is significant to keep confidentiality of invisible rows.
+  </para>
+
+  <para>
+   On the other hand, this design allows superusers to bypass checks with
+   row-security.
+   It ensures <application>pg_dump</application> can obtain a complete set
+   of database backup, and avoid to execute Trojan horse trap, being injected
+   as a row-security policy of user-defined table, with privileges of
+   superuser.
+  </para>
+
+  <para>
+   In case of queries on inherited tables, row-security policy of the parent
+   relation is not applied to child relations. Scope of the row-security
+   policy is limited to the relation on which it is set.
+<screen>
+postgres=> EXPLAIN(costs off) SELECT * FROM t1 WHERE f_leak(y);
+             QUERY PLAN
+-------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         Filter: f_leak(t1.y)
+         ->  Seq Scan on t1 t1_1
+               Filter: ((x % 2) = 0)
+   ->  Seq Scan on t2
+         Filter: f_leak(y)
+   ->  Subquery Scan on t3
+         Filter: f_leak(t3.y)
+         ->  Seq Scan on t3 t3_1
+               Filter: ((x % 2) = 1)
+(11 rows)
+</screen>
+    In the above example, <literal>t1</literal> has inherited
+    child table <literal>t2</literal> and <literal>t3</literal>,
+    and row-security policy is set on only <literal>t1</literal>,
+    and <literal>t3</literal>, not <literal>t2</literal>.
+
+    The row-security policy of <literal>t1</literal>, <literal>x</literal>
+    must be even-number, is appended only <literal>t1</literal>,
+    neither <literal>t2</literal> nor <literal>t3</literal>.
+    On the contrary, <literal>t3</literal> has different row-security policy;
+    <literal>x</literal> must be odd-number.
+  </para>
+
+  <para>
+   Row-security feature also works to queries for writer-operations; such as
+   <xref linkend="SQL-INSERT">, <xref linkend="SQL-UPDATE"> or
+   <xref linkend="SQL-DELETE"> commands.
+   It ensures all the modified rows satisfies configured row-security policy.
+   The below query tries to update e-mail address of the
+   <literal>customer</> table, and configured row-security makes sure all the
+   modified rows's <literal>uname</> field has to match with
+   <literal>current_user</>.
+  </para>
+<screen>
+postgres=> EXPLAIN (costs off) UPDATE customer SET email = 'alice@example.com';
+                    QUERY PLAN
+--------------------------------------------------
+ Update on customer
+   ->  Subquery Scan on customer
+         ->  Seq Scan on customer customer_1
+               Filter: ("current_user"() = uname)
+(4 rows)
+</screen>
+  <para>
+   Modification of a certain table is consist of two different stuffs; one
+   is fetch rows to be modified from the result relation (except for
+   <literal>INSERT</> command), second is insertion of rows to the
+   result relation. Usually, before-row trigger or check constraints are
+   run in the second phase. In addition, row-security policy is also checked
+   on this stage, to prevent to insert or update rows with unprivileged
+   values.
+  </para>
+
+  <para>
+   Unlike other commercial database systems, we don't have any plan to allow
+   individual row-security policy for each command type. Even if we want to
+   perform with difference policy between <xref linkend="SQL-SELECT"> and
+   <xref linkend="SQL-DELETE">, <literal>RETURNING</> clause can leak the rows
+   to be invisible using <xref linkend="SQL-DELETE"> command.
+  </para>
+
+  <para>
+   Even though it is not a specific matter in row-security, please be careful
+   if you plan to use <literal>current_user</> in row-level security policy.
+   <xref linkend="SQL-DECLARE"> and <xref linkend="SQL-FETCH"> allows to
+   switch current user identifier during execution of the query.
+   Thus, it can fetch the first 100 rows with privilege of <literal>alice</>,
+   then remaining rows with privilege of <literal>bob</>. If and when query
+   execution plan contains some kind of materialization and row-security
+   policy contains <literal>current_user</>, the fetched tuples in
+   <literal>bob</>'s screen might be evaluated according to the privilege of
+   <literal>alice</>.
+  </para>
+ </sect1>
 </chapter>
