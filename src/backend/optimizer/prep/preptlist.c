@@ -37,8 +37,49 @@
 
 
 static List *expand_targetlist(List *tlist, int command_type,
-				  Index result_relation, List *range_table);
+							   Index result_relation, Index source_relation,
+							   List *range_table);
 
+/*
+ * lookup_varattno
+ *
+ * This routine returns an attribute number to reference a particular
+ * attribute. In case when the target relation is really relation,
+ * we can reference arbitrary attribute (including system column)
+ * without any translations. However, we have to translate varattno
+ * of Var that references sub-queries being originated from regular
+ * relations with row-level security policy due to nature of sub-query
+ * that has no system-column.
+ */
+static AttrNumber
+lookup_varattno(AttrNumber attno, Index rt_index, List *rtables)
+{
+	RangeTblEntry  *rte = rt_fetch(rt_index, rtables);
+
+	if (rte->rtekind == RTE_SUBQUERY &&
+		rte->subquery->querySource == QSRC_ROW_SECURITY)
+	{
+		ListCell   *cell;
+
+		foreach (cell, rte->subquery->targetList)
+		{
+			TargetEntry *tle = lfirst(cell);
+			Var			*var;
+
+			if (IsA(tle->expr, Const))
+				continue;
+
+			var = (Var *) tle->expr;
+			Assert(IsA(var, Var));
+
+			if (var->varattno == attno)
+				return tle->resno;
+		}
+		elog(ERROR, "invalid attno %d on row-security subquery target-list",
+			 attno);
+	}
+	return attno;
+}
 
 /*
  * preprocess_targetlist
@@ -51,6 +92,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 {
 	Query	   *parse = root->parse;
 	int			result_relation = parse->resultRelation;
+	int			source_relation = parse->sourceRelation;
 	List	   *range_table = parse->rtable;
 	CmdType		command_type = parse->commandType;
 	ListCell   *lc;
@@ -73,8 +115,12 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	 * 10/94
 	 */
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
+	{
 		tlist = expand_targetlist(tlist, command_type,
-								  result_relation, range_table);
+								  result_relation,
+								  source_relation,
+								  range_table);
+	}
 
 	/*
 	 * Add necessary junk columns for rowmarked rels.  These values are needed
@@ -96,7 +142,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		{
 			/* It's a regular table, so fetch its TID */
 			var = makeVar(rc->rti,
-						  SelfItemPointerAttributeNumber,
+						  lookup_varattno(SelfItemPointerAttributeNumber,
+										  rc->rti, range_table),
 						  TIDOID,
 						  -1,
 						  InvalidOid,
@@ -112,7 +159,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 			if (rc->isParent)
 			{
 				var = makeVar(rc->rti,
-							  TableOidAttributeNumber,
+							  lookup_varattno(TableOidAttributeNumber,
+											  rc->rti, range_table),
 							  OIDOID,
 							  -1,
 							  InvalidOid,
@@ -195,7 +243,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  */
 static List *
 expand_targetlist(List *tlist, int command_type,
-				  Index result_relation, List *range_table)
+				  Index result_relation, Index source_relation,
+				  List *range_table)
 {
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
@@ -217,6 +266,9 @@ expand_targetlist(List *tlist, int command_type,
 	rel = heap_open(getrelid(result_relation, range_table), NoLock);
 
 	numattrs = RelationGetNumberOfAttributes(rel);
+
+	if (source_relation == 0)
+		source_relation = result_relation;
 
 	for (attrno = 1; attrno <= numattrs; attrno++)
 	{
@@ -298,8 +350,10 @@ expand_targetlist(List *tlist, int command_type,
 				case CMD_UPDATE:
 					if (!att_tup->attisdropped)
 					{
-						new_expr = (Node *) makeVar(result_relation,
-													attrno,
+						new_expr = (Node *) makeVar(source_relation,
+													lookup_varattno(attrno,
+														source_relation,
+														range_table),
 													atttype,
 													atttypmod,
 													attcollation,
