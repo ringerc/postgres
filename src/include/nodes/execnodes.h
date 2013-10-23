@@ -308,6 +308,8 @@ typedef struct JunkFilter
  *		ConstraintExprs			array of constraint-checking expr states
  *		junkFilter				for removing junk attributes from tuples
  *		projectReturning		for computing a RETURNING list
+ *		rowSecurity				for row-security checks
+ *		rowSecParams			param-list if row-security has SubLink
  * ----------------
  */
 typedef struct ResultRelInfo
@@ -329,6 +331,8 @@ typedef struct ResultRelInfo
 	List	  **ri_ConstraintExprs;
 	JunkFilter *ri_junkFilter;
 	ProjectionInfo *ri_projectReturning;
+	Node	   *ri_rowSecurity;
+	List	   *ri_rowSecParams;
 } ResultRelInfo;
 
 /* ----------------

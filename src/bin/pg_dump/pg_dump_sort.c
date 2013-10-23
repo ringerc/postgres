@@ -1342,6 +1342,11 @@ describeDumpableObject(DumpableObject *obj, char *buf, int bufsize)
 					 "BLOB DATA  (ID %d)",
 					 obj->dumpId);
 			return;
+		case DO_ROW_SECURITY:
+			snprintf(buf, bufsize,
+					 "ROW-SECURITY POLICY (ID %d OID %u)",
+					 obj->dumpId, obj->catId.oid);
+			return;
 		case DO_PRE_DATA_BOUNDARY:
 			snprintf(buf, bufsize,
 					 "PRE-DATA BOUNDARY  (ID %d)",

@@ -3282,3 +3282,19 @@ QueryRewrite(Query *parsetree)
 
 	return results;
 }
+
+/*
+ * QueryRewriteExpr
+ *
+ * This routine provides an entry point of query rewriter towards
+ * a certain expression tree with SubLink node; being added after
+ * the top level query rewrite.
+ * It primarily intends to expand views appeared in the qualifiers
+ * appended with row-level security which needs to modify query
+ * tree at head of the planner stage.
+ */
+void
+QueryRewriteExpr(Node *node, List *activeRIRs)
+{
+	fireRIRonSubLink(node, activeRIRs);
+}

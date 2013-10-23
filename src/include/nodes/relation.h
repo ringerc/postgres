@@ -98,6 +98,8 @@ typedef struct PlannerGlobal
 	Index		lastRowMarkId;	/* highest PlanRowMark ID assigned */
 
 	bool		transientPlan;	/* redo plan when TransactionXmin changes? */
+
+	Oid			planUserId;		/* User-Id to be assumed on this plan */
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -1426,6 +1428,10 @@ typedef struct AppendRelInfo
 	 */
 	Index		parent_relid;	/* RT index of append parent rel */
 	Index		child_relid;	/* RT index of append child rel */
+	Index		child_result;	/* RT index of append child rel's source,
+								 * if source of result relation is not
+								 * identical. Elsewhere, 0.
+								 */
 
 	/*
 	 * For an inheritance appendrel, the parent and child are both regular
