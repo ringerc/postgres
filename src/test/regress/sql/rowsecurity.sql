@@ -277,8 +277,78 @@ SET SESSION AUTHORIZATION rls_regress_user0;
 EXPLAIN (costs off) DELETE FROM only t1 WHERE f_leak(b);
 EXPLAIN (costs off) DELETE FROM t1 WHERE f_leak(b);
 
+
+
+-- Check refcursors returned from PL/PgSQL SECURITY DEFINER functions
+
+RESET SESSION AUTHORIZATION;
+
+CREATE OR REPLACE FUNCTION return_refcursor_assuper() RETURNS refcursor AS $$
+DECLARE
+  curs1 refcursor;
+BEGIN
+  curs1 = 'super_cursor';
+  OPEN curs1 FOR SELECT * FROM document;
+  RETURN curs1;
+END;
+$$
+LANGUAGE plpgsql
+SECURITY DEFINER;
+
+-- Run the function entirely as rls_regress_user1
+SET SESSION AUTHORIZATION rls_regress_user1;
+BEGIN;
+SELECT return_refcursor_assuper();
+-- This fetch should return the full results, even though we are now
+-- running as a user with much lower access according to the current
+-- RLS policy.
+FETCH ALL FROM "super_cursor";
+-- But this should still return the usual result set
+SELECT * FROM document;
+ROLLBACK;
+
+-- Do the same check where we return a refcursor from one RLS-affected
+-- user to another RLS-affected user.
+
+SET SESSION AUTHORIZATION rls_regress_user2;
+
+CREATE OR REPLACE FUNCTION return_refcursor_asuser2() RETURNS refcursor AS $$
+DECLARE
+  curs1 refcursor;
+BEGIN
+  curs1 = 'user2_cursor';
+  OPEN curs1 FOR SELECT * FROM document;
+  RETURN curs1;
+END;
+$$
+LANGUAGE plpgsql
+SECURITY DEFINER;
+
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+SELECT return_refcursor_asuser2();
+-- Even though we're user1, we should see only user2's results from this.
+-- This FAILS, returning user1's results.
+FETCH ALL FROM "user2_cursor";
+-- but user1's results for this
+SELECT * FROM document;
+ROLLBACK;
+
+-- Now as the superuser, see if the SECURITY DEFINER on an RLS-affected
+-- user filters the rows the superuser sees. It should, for consistency.
+
+BEGIN;
+RESET SESSION AUTHORIZATION;
+SELECT return_refcursor_asuser2();
+-- Should see user2's results, but FAILS, instead returning an empty result set (!)
+FETCH ALL FROM "user2_cursor";
+-- Should see superuser's results
+SELECT * FROM document;
+ROLLBACK;
+
 DELETE FROM only t1 WHERE f_leak(b) RETURNING oid, *, t1;
 DELETE FROM t1 WHERE f_leak(b) RETURNING oid, *, t1;
+
 
 --
 -- Test psql \dt+ command
