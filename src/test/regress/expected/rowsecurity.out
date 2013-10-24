@@ -930,20 +930,316 @@ NOTICE:  f_leak => zzzzzz
  303 | 3 | zzzzzz | (3,zzzzzz)
 (5 rows)
 
---
+----------------------------------------------------------------------
+-- Check refcursors returned from PL/PgSQL SECURITY DEFINER functions
+RESET SESSION AUTHORIZATION;
+CREATE OR REPLACE FUNCTION return_refcursor_assuper() RETURNS refcursor AS $$
+DECLARE
+  curs1 refcursor;
+BEGIN
+  curs1 = 'super_cursor';
+  OPEN curs1 FOR SELECT * FROM document;
+  RETURN curs1;
+END;
+$$
+LANGUAGE plpgsql
+SECURITY DEFINER;
+-- Run the function entirely as rls_regress_user1
+SET SESSION AUTHORIZATION rls_regress_user1;
+BEGIN;
+SELECT return_refcursor_assuper();
+ return_refcursor_assuper 
+--------------------------
+ super_cursor
+(1 row)
+
+-- This fetch should return the full results, even though we are now
+-- running as a user with much lower access according to the current
+-- RLS policy.
+FETCH ALL FROM "super_cursor";
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(8 rows)
+
+-- But this should still return the usual result set
+SELECT * FROM document;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(5 rows)
+
+ROLLBACK;
+-- Do the same check where we return a refcursor from one RLS-affected
+-- user to another RLS-affected user.
+SET SESSION AUTHORIZATION rls_regress_user2;
+CREATE OR REPLACE FUNCTION return_refcursor_asuser2() RETURNS refcursor AS $$
+DECLARE
+  curs1 refcursor;
+BEGIN
+  curs1 = 'user2_cursor';
+  OPEN curs1 FOR SELECT * FROM document;
+  RETURN curs1;
+END;
+$$
+LANGUAGE plpgsql
+SECURITY DEFINER;
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+SELECT return_refcursor_asuser2();
+ return_refcursor_asuser2 
+--------------------------
+ user2_cursor
+(1 row)
+
+-- Even though we're user1, we should see only user2's results from this.
+-- This FAILS, returning user1's results.
+FETCH ALL FROM "user2_cursor";
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(3 rows)
+
+-- but user1's results for this
+SELECT * FROM document;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(5 rows)
+
+ROLLBACK;
+-- Now as the superuser, see if the SECURITY DEFINER on an RLS-affected
+-- user filters the rows the superuser sees. It should, for consistency.
+BEGIN;
+RESET SESSION AUTHORIZATION;
+SELECT return_refcursor_asuser2();
+ return_refcursor_asuser2 
+--------------------------
+ user2_cursor
+(1 row)
+
+-- Should see user2's results, but FAILS, instead returning an empty result set (!)
+FETCH ALL FROM "user2_cursor";
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(3 rows)
+
+-- Should see superuser's results
+SELECT * FROM document;
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(8 rows)
+
+ROLLBACK;
+--------------------------------------------------------------------
+-- Tests of DECLARE and FETCH cursors during privilege
+-- transitions.
+-- 
+-- Declare as user1, switch to user2, fetch all. Returns results as user2;
+-- should be user1. FIXME.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(5 rows)
+
+ROLLBACK;
+-- If we add an ORDER BY clause on a non-indexed column to force a sort,
+-- still returns rows for user2 because execution didn't start. FIXME.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document ORDER BY cid;
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(5 rows)
+
+ROLLBACK;
+-- If we add a single row FETCH before switching to force materialization
+-- though, suddenly we see rows for user1. This is correct, just inconsistent.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document ORDER BY cid;
+FETCH 1 FROM curs;
+ did | cid | dlevel |      dauthor      |     dtitle     
+-----+-----+--------+-------------------+----------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+(1 row)
+
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(4 rows)
+
+ROLLBACK;
+-- Remove the ORDER BY, and we get rows for user2 again, because the result set
+-- isn't materialized anymore. FIXME.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+FETCH 1 FROM curs;
+ did | cid | dlevel |      dauthor      |     dtitle     
+-----+-----+--------+-------------------+----------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+(1 row)
+
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(4 rows)
+
+ROLLBACK;
+-- Perform similar tests with superuser.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+RESET SESSION AUTHORIZATION;
+-- Should return user1 rows, returns none instead (FIXME)
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+(5 rows)
+
+ROLLBACK;
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user2;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+FETCH 2 FROM curs;
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+(2 rows)
+
+RESET SESSION AUTHORIZATION;
+-- Should see user2's rows; instead sees none due to username check change (FIXME)
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(1 row)
+
+ROLLBACK;
+BEGIN;
+RESET SESSION AUTHORIZATION;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+SET SESSION AUTHORIZATION rls_regress_user1;
+-- Should return all rows and does so because it's planned as superuser before switch so rls qual not added
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(8 rows)
+
+ROLLBACK;
+BEGIN;
+RESET SESSION AUTHORIZATION;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+FETCH 3 FROM curs;
+ did | cid | dlevel |      dauthor      |       dtitle       
+-----+-----+--------+-------------------+--------------------
+   1 |  11 |      1 | rls_regress_user1 | my first novel
+   2 |  11 |      2 | rls_regress_user1 | my second novel
+   3 |  22 |      2 | rls_regress_user1 | my science fiction
+(3 rows)
+
+SET SESSION AUTHORIZATION rls_regress_user2;
+-- Still returns all rows because it's planned as superuser before switch, so rls qual not added
+FETCH ALL FROM curs;
+ did | cid | dlevel |      dauthor      |        dtitle         
+-----+-----+--------+-------------------+-----------------------
+   4 |  44 |      1 | rls_regress_user1 | my first manga
+   5 |  44 |      2 | rls_regress_user1 | my second manga
+   6 |  22 |      1 | rls_regress_user2 | great science fiction
+   7 |  33 |      2 | rls_regress_user2 | great technology book
+   8 |  44 |      1 | rls_regress_user2 | great manga
+(5 rows)
+
+ROLLBACK;
+----------------------------------------------------------------------
 -- Test psql \dt+ command
 --
 ALTER TABLE category RESET ROW SECURITY FOR ALL;  -- too long qual
+ERROR:  must be owner of relation category
 \dt+
-                                                    List of relations
-       Schema       |   Name   | Type  |       Owner       |    Size    | Description |           Row-security           
---------------------+----------+-------+-------------------+------------+-------------+----------------------------------
- rls_regress_schema | category | table | rls_regress_user0 | 16 kB      |             | 
+                                                                                List of relations
+       Schema       |   Name   | Type  |       Owner       |    Size    | Description |                                       Row-security                                       
+--------------------+----------+-------+-------------------+------------+-------------+------------------------------------------------------------------------------------------
+ rls_regress_schema | category | table | rls_regress_user0 | 16 kB      |             |                                                                                         +
+                    |          |       |                   |            |             | CASE                                                                                    +
+                    |          |       |                   |            |             |     WHEN ("current_user"() = 'rls_regress_user1'::name) THEN (cid = ANY (ARRAY[11, 33]))+
+                    |          |       |                   |            |             |     WHEN ("current_user"() = 'rls_regress_user2'::name) THEN (cid = ANY (ARRAY[22, 44]))+
+                    |          |       |                   |            |             |     ELSE false                                                                          +
+                    |          |       |                   |            |             | END
  rls_regress_schema | document | table | rls_regress_user0 | 16 kB      |             | (dauthor = "current_user"())
- rls_regress_schema | s1       | table | rls_regress_user0 | 16 kB      |             | (a IN ( SELECT v2.x             +
+ rls_regress_schema | s1       | table | rls_regress_user0 | 16 kB      |             | (a IN ( SELECT v2.x                                                                     +
                     |          |       |                   |            |             |    FROM v2))
- rls_regress_schema | s2       | table | rls_regress_user0 | 16 kB      |             | (x IN ( SELECT s1.a             +
-                    |          |       |                   |            |             |    FROM s1                      +
+ rls_regress_schema | s2       | table | rls_regress_user0 | 16 kB      |             | (x IN ( SELECT s1.a                                                                     +
+                    |          |       |                   |            |             |    FROM s1                                                                              +
                     |          |       |                   |            |             |   WHERE (s1.b ~~ '%d2%'::text)))
  rls_regress_schema | t1       | table | rls_regress_user0 | 16 kB      |             | ((a % 2) = 0)
  rls_regress_schema | t2       | table | rls_regress_user0 | 16 kB      |             | ((a % 2) = 1)
@@ -951,12 +1247,12 @@ ALTER TABLE category RESET ROW SECURITY FOR ALL;  -- too long qual
  rls_regress_schema | uaccount | table | rls_regress_user0 | 8192 bytes |             | 
 (8 rows)
 
---
+----------------------------------------------------------------------
 -- Clean up objects
 --
 RESET SESSION AUTHORIZATION;
 DROP SCHEMA rls_regress_schema CASCADE;
-NOTICE:  drop cascades to 10 other objects
+NOTICE:  drop cascades to 12 other objects
 DETAIL:  drop cascades to function f_leak(text)
 drop cascades to table uaccount
 drop cascades to table category
@@ -967,6 +1263,8 @@ drop cascades to table t3
 drop cascades to table s1
 drop cascades to table s2
 drop cascades to view v2
+drop cascades to function return_refcursor_assuper()
+drop cascades to function return_refcursor_asuser2()
 DROP USER rls_regress_user0;
 DROP USER rls_regress_user1;
 DROP USER rls_regress_user2;
