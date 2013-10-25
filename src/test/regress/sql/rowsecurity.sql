@@ -132,6 +132,11 @@ SET SESSION AUTHORIZATION rls_regress_user1;
 INSERT INTO document VALUES ( 8, 44, 1, 'rls_regress_user_1', 'my third manga' ); -- Must fail with unique violation, revealing presence of did we can't see
 SELECT * FROM document WHERE did = 8; -- and confirm we can't see it
 
+-- UNIQUE or PRIMARY KEY constraint violation DOES reveal presence of row
+SET SESSION AUTHORIZATION rls_regress_user1;
+INSERT INTO document VALUES ( 8, 44, 1, 'rls_regress_user_1', 'my third manga' ); -- Must fail with unique violation, revealing presence of did we can't see
+SELECT * FROM document WHERE did = 8; -- and confirm we can't see it
+
 -- database superuser can bypass RLS policy
 RESET SESSION AUTHORIZATION;
 SELECT * FROM document;
