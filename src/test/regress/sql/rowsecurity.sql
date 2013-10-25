@@ -120,12 +120,17 @@ ALTER TABLE category SET ROW SECURITY FOR ALL
 -- cannot delete PK referenced by invisible FK
 SET SESSION AUTHORIZATION rls_regress_user1;
 SELECT * FROM document d full outer join category c on d.cid = c.cid;
-DELETE FROM category WHERE cid = 33;    -- failed
+DELETE FROM category WHERE cid = 33;    -- fails with FK violation
 
 -- cannot insert FK referencing invisible PK
 SET SESSION AUTHORIZATION rls_regress_user2;
 SELECT * FROM document d full outer join category c on d.cid = c.cid;
-INSERT INTO document VALUES (10, 33, 1, current_user, 'hoge'); -- failed
+INSERT INTO document VALUES (10, 33, 1, current_user, 'hoge'); -- fail with FK violation
+
+-- UNIQUE or PRIMARY KEY constraint violation DOES reveal presence of row
+SET SESSION AUTHORIZATION rls_regress_user1;
+INSERT INTO document VALUES ( 8, 44, 1, 'rls_regress_user_1', 'my third manga' ); -- Must fail with unique violation, revealing presence of did we can't see
+SELECT * FROM document WHERE did = 8; -- and confirm we can't see it
 
 -- database superuser can bypass RLS policy
 RESET SESSION AUTHORIZATION;
