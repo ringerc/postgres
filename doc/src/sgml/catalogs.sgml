@@ -5145,7 +5145,7 @@
       <entry>
        Expression tree (in the form of a
        <function>nodeToString()</function> representation) for the
-       rule's qualifying condition
+       rule's qualifying condition. Expand into a normal expression with <command>SELECT pg_catalog.pg_get_expr(rs.rsecqual, c.oid) FROM pg_class c INNER JOIN pg_rowsecurity rs ON (rs.rsecrelid = c.oid) WHERE c.oid = 'tablename'::regclass;</command>.
       </entry>
      </row>
 
