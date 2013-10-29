@@ -5145,7 +5145,7 @@
       <entry><structfield>rsecrelid</structfield></entry>
       <entry><type>oid</type></entry>
       <entry><literal><link linkend="catalog-pg-class"><structname>pg_class</structname></link>.oid</literal></entry>
-      <entry>The table this row-security is for</entry>
+      <entry>The oid from pg_class of the table this row-security entry applies to.</entry>
      </row>
      <row>
       <entry><structfield>rseccmd</structfield></entry>
@@ -5157,7 +5157,9 @@
       <entry><structfield>rsecqual</structfield></entry>
       <entry><type>pg_node_tree</type></entry>
       <entry></entry>
-      <entry>An expression tree to be performed as rowl-security policy</entry>
+      <entry>An expression tree to be applied as row-security policy. You can convert this to a normal SQL expression with
+<command>SELECT pg_catalog.pg_get_expr(rs.rsecqual, c.oid) FROM pg_class c INNER JOIN pg_rowsecurity rs ON (rs.rsecrelid = c.oid) WHERE c.oid = 'tablename'::regclass;</command>
+</entry>
      </row>
     </tbody>
    </tgroup>
