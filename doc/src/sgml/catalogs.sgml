@@ -234,7 +234,7 @@
      </row>
 
      <row>
-      <entry><link linkend="catalog-pg-rowsecurity"><structname>pg_rowlevelsec</structname></link></entry>
+      <entry><link linkend="catalog-pg-rowsecurity"><structname>pg_rowsecurity</structname></link></entry>
       <entry>row-level security policy of relation</entry>
      </row>
 
@@ -5120,7 +5120,7 @@
  </sect1>
 
  <sect1 id="catalog-pg-rowsecurity">
-  <title><structname>pg_rowlevelsec</structname></title>
+  <title><structname>pg_security</structname></title>
 
   <indexterm zone="catalog-pg-rowsecurity">
    <primary>pg_rowsecurity</primary>
@@ -5164,7 +5164,7 @@
   </table>
   <note>
    <para>
-    <literal>pg_class.relhasrowlevelsec</literal>
+    <literal>pg_class.relhasrowsecurity</literal>
     must be true if a table has row-level security policy in this catalog.
    </para>
   </note>
