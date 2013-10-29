@@ -234,7 +234,7 @@
      </row>
 
      <row>
-      <entry><link linkend="catalog-pg-rowlevelsec"><structname>pg_rowlevelsec</structname></link></entry>
+      <entry><link linkend="catalog-pg-rowsecurity"><structname>pg_rowlevelsec</structname></link></entry>
       <entry>row-level security policy of relation</entry>
      </row>
 
