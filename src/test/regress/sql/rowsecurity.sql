@@ -287,8 +287,11 @@ SET SESSION AUTHORIZATION rls_regress_user0;
 EXPLAIN (costs off) DELETE FROM only t1 WHERE f_leak(b);
 EXPLAIN (costs off) DELETE FROM t1 WHERE f_leak(b);
 
+DELETE FROM only t1 WHERE f_leak(b) RETURNING oid, *, t1;
+DELETE FROM t1 WHERE f_leak(b) RETURNING oid, *, t1;
 
 
+----------------------------------------------------------------------
 -- Check refcursors returned from PL/PgSQL SECURITY DEFINER functions
 
 RESET SESSION AUTHORIZATION;
@@ -356,17 +359,92 @@ FETCH ALL FROM "user2_cursor";
 SELECT * FROM document;
 ROLLBACK;
 
-DELETE FROM only t1 WHERE f_leak(b) RETURNING oid, *, t1;
-DELETE FROM t1 WHERE f_leak(b) RETURNING oid, *, t1;
+--------------------------------------------------------------------
+-- Tests of DECLARE and FETCH cursors during privilege
+-- transitions.
+-- 
+
+-- Declare as user1, switch to user2, fetch all. Returns results as user2;
+-- should be user1. FIXME.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ROLLBACK;
+
+-- If we add an ORDER BY clause on a non-indexed column to force a sort,
+-- still returns rows for user2 because execution didn't start. FIXME.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document ORDER BY cid;
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ROLLBACK;
+
+-- If we add a single row FETCH before switching to force materialization
+-- though, suddenly we see rows for user1. This is correct, just inconsistent.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document ORDER BY cid;
+FETCH 1 FROM curs;
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ROLLBACK;
+
+-- Remove the ORDER BY, and we get rows for user2 again, because the result set
+-- isn't materialized anymore. FIXME.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+FETCH 1 FROM curs;
+SET SESSION AUTHORIZATION rls_regress_user2;
+FETCH ALL FROM curs;
+ROLLBACK;
 
 
---
+-- Perform similar tests with superuser.
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user1;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+RESET SESSION AUTHORIZATION;
+-- Should return user1 rows, returns none instead (FIXME)
+FETCH ALL FROM curs;
+ROLLBACK;
+
+BEGIN;
+SET SESSION AUTHORIZATION rls_regress_user2;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+FETCH 2 FROM curs;
+RESET SESSION AUTHORIZATION;
+-- Should see user2's rows; instead sees none due to username check change (FIXME)
+FETCH ALL FROM curs;
+ROLLBACK;
+
+BEGIN;
+RESET SESSION AUTHORIZATION;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+SET SESSION AUTHORIZATION rls_regress_user1;
+-- Should return all rows and does so because it's planned as superuser before switch so rls qual not added
+FETCH ALL FROM curs;
+ROLLBACK;
+
+BEGIN;
+RESET SESSION AUTHORIZATION;
+DECLARE curs CURSOR FOR SELECT * FROM rls_regress_schema.document;
+FETCH 3 FROM curs;
+SET SESSION AUTHORIZATION rls_regress_user2;
+-- Still returns all rows because it's planned as superuser before switch, so rls qual not added
+FETCH ALL FROM curs;
+ROLLBACK;
+
+----------------------------------------------------------------------
 -- Test psql \dt+ command
 --
 ALTER TABLE category RESET ROW SECURITY FOR ALL;  -- too long qual
 \dt+
 
---
+----------------------------------------------------------------------
 -- Clean up objects
 --
 RESET SESSION AUTHORIZATION;
