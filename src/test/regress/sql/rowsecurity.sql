@@ -132,6 +132,13 @@ SET SESSION AUTHORIZATION rls_regress_user1;
 INSERT INTO document VALUES ( 8, 44, 1, 'rls_regress_user_1', 'my third manga' ); -- Must fail with unique violation, revealing presence of did we can't see
 SELECT * FROM document WHERE did = 8; -- and confirm we can't see it
 
+-- Nonsense results produced when RLS-exempt superuser tries to insert into
+-- table with FK owned by RLS-affected user. Should not be possible for this
+-- to fail except by PK conflict, but fails with FK constraint error. FIXME.
+RESET SESSION AUTHORIZATION;
+INSERT INTO document(did,cid,dlevel,dauthor,dtitle)
+SELECT 1000, cid, dlevel, dauthor, dtitle from document where did = 8;
+
 -- UNIQUE or PRIMARY KEY constraint violation DOES reveal presence of row
 SET SESSION AUTHORIZATION rls_regress_user1;
 INSERT INTO document VALUES ( 8, 44, 1, 'rls_regress_user_1', 'my third manga' ); -- Must fail with unique violation, revealing presence of did we can't see
@@ -141,6 +148,7 @@ SELECT * FROM document WHERE did = 8; -- and confirm we can't see it
 RESET SESSION AUTHORIZATION;
 SELECT * FROM document;
 SELECT * FROM category;
+
 
 --
 -- Table inheritance and RLS policy
