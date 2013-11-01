@@ -5,3 +5,7 @@
 /tmp_check/
 /results/
 /log/
+
+# Output we should not version
+regression.diffs
+regression.out
