@@ -452,12 +452,6 @@ DROP ROLE <replaceable>name</replaceable>;
    to user-defined policies and rules.
   </para>
   <para>
-   It is reasonable to think of row security as a dynamic <literal>SECURITY
-   BARRIER</literal> <literal>WITH CHECK OPTION</literal> updateable view that
-   is wrapped around a table when the table is accessed by a non-superuser. The
-   row security condition serves as the view's <literal>WHERE</literal>
-   clause.</para>
-  <para>
    Row-security policy is set using the <literal>SET ROW SECURITY</literal>
    command of <xref linkend="SQL-ALTERTABLE"> statement to set an boolean
    expression used to filter rows. The expression may contain references to
