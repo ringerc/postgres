@@ -28,6 +28,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "nodes/print.h" /* Temporary for elog_print_display only */
 
 
 /* We use a list of these to detect recursion in RewriteQuery */
@@ -1973,7 +1974,7 @@ view_col_is_auto_updatable(RangeTblRef *rtr, TargetEntry *tle)
  * updatable.
  */
 const char *
-view_query_is_auto_updatable(Query *viewquery, bool security_barrier,
+view_query_is_auto_updatable(Query *viewquery,
 							 bool check_cols)
 {
 	RangeTblRef *rtr;
@@ -2046,14 +2047,6 @@ view_query_is_auto_updatable(Query *viewquery, bool security_barrier,
 
 	if (expression_returns_set((Node *) viewquery->targetList))
 		return gettext_noop("Views that return set-returning functions are not automatically updatable.");
-
-	/*
-	 * For now, we also don't support security-barrier views, because of the
-	 * difficulty of keeping upper-level qual expressions away from
-	 * lower-level data.  This might get relaxed in the future.
-	 */
-	if (security_barrier)
-		return gettext_noop("Security-barrier views are not automatically updatable.");
 
 	/*
 	 * The view query should select from a single base relation, which must be
@@ -2304,7 +2297,6 @@ relation_is_updatable(Oid reloid,
 		Query	   *viewquery = get_view_query(rel);
 
 		if (view_query_is_auto_updatable(viewquery,
-										 RelationIsSecurityView(rel),
 										 false) == NULL)
 		{
 			Bitmapset  *updatable_cols;
@@ -2452,7 +2444,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	RangeTblEntry *view_rte;
 	RangeTblEntry *new_rte;
 	Relation	base_rel;
-	List	   *view_targetlist;
 	ListCell   *lc;
 
 	/* The view must be updatable, else fail */
@@ -2460,7 +2451,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 
 	auto_update_detail =
 		view_query_is_auto_updatable(viewquery,
-									 RelationIsSecurityView(view),
 									 parsetree->commandType != CMD_DELETE);
 
 	if (auto_update_detail)
@@ -2590,14 +2580,41 @@ rewriteTargetView(Query *parsetree, Relation view)
 
 	/*
 	 * Create a new target RTE describing the base relation, and add it to the
-	 * outer query's rangetable.  (What's happening in the next few steps is
-	 * very much like what the planner would do to "pull up" the view into the
-	 * outer query.  Perhaps someday we should refactor things enough so that
-	 * we can share code with the planner.)
+	 * outer query's rangetable, then set it as the targetRelation for the query.
+	 * 
+	 * We don't do any pull-up here; the optimizer will do it for non-security-barrier
+	 * views later if it feels like it. The purpose of this RTE is to be the targetRelation,
+	 * and to be the vehicle for write-permission checks against this view.
 	 */
 	new_rte = (RangeTblEntry *) copyObject(base_rte);
 	parsetree->rtable = lappend(parsetree->rtable, new_rte);
 	new_rt_index = list_length(parsetree->rtable);
+	parsetree->resultRelation = new_rt_index;
+
+	/*
+	 * For UPDATE, add references to all columns of the base relation to the
+	 * expanded subquery if they weren't already present. We need all cols of
+	 * the base relation to generate the new tuple, even though they aren't
+	 * visible directly to the view user. These must not be revealed in
+	 * a RETURNING clause, and do *not* need the select permission bit on them
+	 * since the user won't ever actually see them.
+	 *
+	 * There's no need to sort these into the proper attribute ordering;
+	 * that'll be done for us later. TODO where?
+	 */
+	if (parsetree->commandType == CMD_UPDATE)
+	{
+		elog(ERROR, "UPDATE not supported yet, needs injection of ctid and all cols into view subquery");
+	}
+
+	/*
+ 	 * We need to know the ctid of the base rel for all command types, so
+	 * we need to add it to the view's select-list as a resjunk column if
+	 * it isn't already present.
+	 *
+	 * The base rel may its self be a view that doesn't have a ctid column,
+	 * though. TODO.
+ 	 */
 
 	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
@@ -2605,21 +2622,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 */
 	if (parsetree->commandType == CMD_INSERT)
 		new_rte->inh = false;
-
-	/*
-	 * Make a copy of the view's targetlist, adjusting its Vars to reference
-	 * the new target RTE, ie make their varnos be new_rt_index instead of
-	 * base_rt_index.  There can be no Vars for other rels in the tlist, so
-	 * this is sufficient to pull up the tlist expressions for use in the
-	 * outer query.  The tlist will provide the replacement expressions used
-	 * by ReplaceVarsFromTargetList below.
-	 */
-	view_targetlist = copyObject(viewquery->targetList);
-
-	ChangeVarNodes((Node *) view_targetlist,
-				   base_rt_index,
-				   new_rt_index,
-				   0);
 
 	/*
 	 * Mark the new target RTE for the permissions checks that we want to
@@ -2650,179 +2652,22 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 * that does not correspond to what happens in ordinary SELECT usage of a
 	 * view: all referenced columns must have read permission, even if
 	 * optimization finds that some of them can be discarded during query
-	 * transformation.	The flattening we're doing here is an optional
-	 * optimization, too.  (If you are unpersuaded and want to change this,
-	 * note that applying adjust_view_column_set to view_rte->selectedCols is
-	 * clearly *not* the right answer, since that neglects base-rel columns
-	 * used in the view's WHERE quals.)
+	 * transformation.
+	 *
+	 * (If you are unpersuaded and want to change this, note that applying
+	 * adjust_view_column_set to view_rte->selectedCols is clearly *not*
+	 * the right answer, since that neglects base-rel columns used in the
+	 * view's WHERE quals.)
 	 *
 	 * This step needs the modified view targetlist, so we have to do things
 	 * in this order.
 	 */
 	Assert(bms_is_empty(new_rte->modifiedCols));
 	new_rte->modifiedCols = adjust_view_column_set(view_rte->modifiedCols,
-												   view_targetlist);
+												   viewquery->targetList);
 
-	/*
-	 * For UPDATE/DELETE, rewriteTargetListUD will have added a wholerow junk
-	 * TLE for the view to the end of the targetlist, which we no longer need.
-	 * Remove it to avoid unnecessary work when we process the targetlist.
-	 * Note that when we recurse through rewriteQuery a new junk TLE will be
-	 * added to allow the executor to find the proper row in the new target
-	 * relation.  (So, if we failed to do this, we might have multiple junk
-	 * TLEs with the same name, which would be disastrous.)
-	 */
-	if (parsetree->commandType != CMD_INSERT)
-	{
-		TargetEntry *tle = (TargetEntry *) llast(parsetree->targetList);
-
-		Assert(tle->resjunk);
-		Assert(IsA(tle->expr, Var) &&
-			   ((Var *) tle->expr)->varno == parsetree->resultRelation &&
-			   ((Var *) tle->expr)->varattno == 0);
-		parsetree->targetList = list_delete_ptr(parsetree->targetList, tle);
-	}
-
-	/*
-	 * Now update all Vars in the outer query that reference the view to
-	 * reference the appropriate column of the base relation instead.
-	 */
-	parsetree = (Query *)
-		ReplaceVarsFromTargetList((Node *) parsetree,
-								  parsetree->resultRelation,
-								  0,
-								  view_rte,
-								  view_targetlist,
-								  REPLACEVARS_REPORT_ERROR,
-								  0,
-								  &parsetree->hasSubLinks);
-
-	/*
-	 * Update all other RTI references in the query that point to the view
-	 * (for example, parsetree->resultRelation itself) to point to the new
-	 * base relation instead.  Vars will not be affected since none of them
-	 * reference parsetree->resultRelation any longer.
-	 */
-	ChangeVarNodes((Node *) parsetree,
-				   parsetree->resultRelation,
-				   new_rt_index,
-				   0);
-	Assert(parsetree->resultRelation == new_rt_index);
-
-	/*
-	 * For INSERT/UPDATE we must also update resnos in the targetlist to refer
-	 * to columns of the base relation, since those indicate the target
-	 * columns to be affected.
-	 *
-	 * Note that this destroys the resno ordering of the targetlist, but that
-	 * will be fixed when we recurse through rewriteQuery, which will invoke
-	 * rewriteTargetListIU again on the updated targetlist.
-	 */
-	if (parsetree->commandType != CMD_DELETE)
-	{
-		foreach(lc, parsetree->targetList)
-		{
-			TargetEntry *tle = (TargetEntry *) lfirst(lc);
-			TargetEntry *view_tle;
-
-			if (tle->resjunk)
-				continue;
-
-			view_tle = get_tle_by_resno(view_targetlist, tle->resno);
-			if (view_tle != NULL && !view_tle->resjunk && IsA(view_tle->expr, Var))
-				tle->resno = ((Var *) view_tle->expr)->varattno;
-			else
-				elog(ERROR, "attribute number %d not found in view targetlist",
-					 tle->resno);
-		}
-	}
-
-	/*
-	 * For UPDATE/DELETE, pull up any WHERE quals from the view.  We know that
-	 * any Vars in the quals must reference the one base relation, so we need
-	 * only adjust their varnos to reference the new target (just the same as
-	 * we did with the view targetlist).
-	 *
-	 * For INSERT, the view's quals can be ignored in the main query.
-	 */
-	if (parsetree->commandType != CMD_INSERT &&
-		viewquery->jointree->quals != NULL)
-	{
-		Node	   *viewqual = (Node *) copyObject(viewquery->jointree->quals);
-
-		ChangeVarNodes(viewqual, base_rt_index, new_rt_index, 0);
-		AddQual(parsetree, (Node *) viewqual);
-	}
-
-	/*
-	 * For INSERT/UPDATE, if the view has the WITH CHECK OPTION, or any parent
-	 * view specified WITH CASCADED CHECK OPTION, add the quals from the view
-	 * to the query's withCheckOptions list.
-	 */
-	if (parsetree->commandType != CMD_DELETE)
-	{
-		bool		has_wco = RelationHasCheckOption(view);
-		bool		cascaded = RelationHasCascadedCheckOption(view);
-
-		/*
-		 * If the parent view has a cascaded check option, treat this view as
-		 * if it also had a cascaded check option.
-		 *
-		 * New WithCheckOptions are added to the start of the list, so if there
-		 * is a cascaded check option, it will be the first item in the list.
-		 */
-		if (parsetree->withCheckOptions != NIL)
-		{
-			WithCheckOption *parent_wco =
-				(WithCheckOption *) linitial(parsetree->withCheckOptions);
-
-			if (parent_wco->cascaded)
-			{
-				has_wco = true;
-				cascaded = true;
-			}
-		}
-
-		/*
-		 * Add the new WithCheckOption to the start of the list, so that
-		 * checks on inner views are run before checks on outer views, as
-		 * required by the SQL standard.
-		 *
-		 * If the new check is CASCADED, we need to add it even if this view
-		 * has no quals, since there may be quals on child views.  A LOCAL
-		 * check can be omitted if this view has no quals.
-		 */
-		if (has_wco && (cascaded || viewquery->jointree->quals != NULL))
-		{
-			WithCheckOption *wco;
-
-			wco = makeNode(WithCheckOption);
-			wco->viewname = pstrdup(RelationGetRelationName(view));
-			wco->qual = NULL;
-			wco->cascaded = cascaded;
-
-			parsetree->withCheckOptions = lcons(wco,
-												parsetree->withCheckOptions);
-
-			if (viewquery->jointree->quals != NULL)
-			{
-				wco->qual = (Node *) copyObject(viewquery->jointree->quals);
-				ChangeVarNodes(wco->qual, base_rt_index, new_rt_index, 0);
-
-				/*
-				 * Make sure that the query is marked correctly if the added
-				 * qual has sublinks.  We can skip this check if the query is
-				 * already marked, or if the command is an UPDATE, in which
-				 * case the same qual will have already been added to the
-				 * query's WHERE clause, and AddQual will have already done
-				 * this check.
-				 */
-				if (!parsetree->hasSubLinks &&
-					parsetree->commandType != CMD_UPDATE)
-					parsetree->hasSubLinks = checkExprHasSubLink(wco->qual);
-			}
-		}
-	}
+    elog_node_display(LOG, "parse_tree after upd view rewrite", parsetree,
+                      true);
 
 	return parsetree;
 }

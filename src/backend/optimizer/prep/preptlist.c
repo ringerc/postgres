@@ -58,6 +58,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	/*
 	 * Sanity check: if there is a result relation, it'd better be a real
 	 * relation not a subquery.  Else parser or rewriter messed up.
+	 * This is true even if we're updating a view/subquery; the result_relation
+	 * must still be the underlying relation RTE.
 	 */
 	if (result_relation)
 	{

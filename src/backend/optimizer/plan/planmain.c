@@ -126,6 +126,21 @@ query_planner(PlannerInfo *root, List *tlist,
 	add_base_rels_to_query(root, (Node *) parse->jointree);
 
 	/*
+	 * The top query's resultRelation RTI may not be referenced in the query
+	 * tree its self, so we need to ensure it gets cached too. Curently arises
+	 * when we're doing DML on a view, where the injected top-level RTE for the
+	 * view's base rel isn't referenced in the query tree.
+	 *
+	 * It isn't a RELOPT_BASEREL because it doesn't appear in the query
+	 * join tree, but RELOPT_DEADREL may not be quite right either. Do we
+	 * need a RELOPT_RESULTREL? FIXME?
+	 */
+	if (root->parse->resultRelation && root->simple_rel_array[root->parse->resultRelation] == NULL)
+		(void) build_simple_rel(root, root->parse->resultRelation, RELOPT_DEADREL);
+
+	Assert(root->parse->resultRelation == 0 || root->simple_rel_array[root->parse->resultRelation] != NULL);
+
+	/*
 	 * Examine the targetlist and join tree, adding entries to baserel
 	 * targetlists for all referenced Vars, and generating PlaceHolderInfo
 	 * entries for all referenced PlaceHolderVars.	Restrict and join clauses
