@@ -40,6 +40,9 @@ extern Expr *canonicalize_qual(Expr *qual);
  */
 extern List *preprocess_targetlist(PlannerInfo *root, List *tlist);
 
+extern List *expand_targetlist(List *tlist, int command_type,
+							   Index result_relation, List *range_table);
+
 extern PlanRowMark *get_plan_rowmark(List *rowmarks, Index rtindex);
 
 /*

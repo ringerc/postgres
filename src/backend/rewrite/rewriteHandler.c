@@ -2445,6 +2445,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 	RangeTblEntry *new_rte;
 	Relation	base_rel;
 	ListCell   *lc;
+	const int command_type = parsetree->commandType;
 
 	/* The view must be updatable, else fail */
 	viewquery = get_view_query(view);
@@ -2579,6 +2580,21 @@ rewriteTargetView(Query *parsetree, Relation view)
 	heap_close(base_rel, NoLock);
 
 	/*
+	 * For UPDATE, add references to all columns of the base relation to the
+	 * expanded subquery if they weren't already present. We need all cols of
+	 * the base relation to generate the new tuple, even though they aren't
+	 * visible directly to the view user. These must not be revealed in
+	 * a RETURNING clause, and do *not* need the select permission bit on them
+	 * since the user won't ever actually see them.
+	 *
+	 * There's no need to sort these into the proper attribute ordering;
+	 * that'll be done for us in the next rewrite pass.
+	 */
+	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
+		parsetree->targetList = expand_targetlist(parsetree->targetList, command_type, 
+						  						  parsetree->resultRelation, parsetree->rtable);
+
+	/*
 	 * Create a new target RTE describing the base relation, and add it to the
 	 * outer query's rangetable, then set it as the targetRelation for the query.
 	 * 
@@ -2592,29 +2608,11 @@ rewriteTargetView(Query *parsetree, Relation view)
 	parsetree->resultRelation = new_rt_index;
 
 	/*
-	 * For UPDATE, add references to all columns of the base relation to the
-	 * expanded subquery if they weren't already present. We need all cols of
-	 * the base relation to generate the new tuple, even though they aren't
-	 * visible directly to the view user. These must not be revealed in
-	 * a RETURNING clause, and do *not* need the select permission bit on them
-	 * since the user won't ever actually see them.
-	 *
-	 * There's no need to sort these into the proper attribute ordering;
-	 * that'll be done for us later. TODO where?
-	 */
-	if (parsetree->commandType == CMD_UPDATE)
-	{
-		elog(ERROR, "UPDATE not supported yet, needs injection of ctid and all cols into view subquery");
-	}
-
-	/*
- 	 * We need to know the ctid of the base rel for all command types, so
-	 * we need to add it to the view's select-list as a resjunk column if
-	 * it isn't already present.
-	 *
-	 * The base rel may its self be a view that doesn't have a ctid column,
-	 * though. TODO.
+ 	 * The targetlist of the view may be in a different order to that of the
+ 	 * underlying result rel. This must be corrected so that a view with
+ 	 * a different column order to the underlying rel works correctly.
  	 */
+	/* FIXME */
 
 	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's

@@ -35,11 +35,6 @@
 #include "parser/parse_coerce.h"
 #include "utils/rel.h"
 
-
-static List *expand_targetlist(List *tlist, int command_type,
-				  Index result_relation, List *range_table);
-
-
 /*
  * preprocess_targetlist
  *	  Driver for preprocessing the parse tree targetlist.
@@ -195,7 +190,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  *	  add targetlist entries for any missing attributes, and ensure the
  *	  non-junk attributes appear in proper field order.
  */
-static List *
+List *
 expand_targetlist(List *tlist, int command_type,
 				  Index result_relation, List *range_table)
 {
