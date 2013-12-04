@@ -1149,7 +1149,7 @@ TransactionIdIsActive(TransactionId xid)
  * GetOldestXmin() move backwards, with no consequences for data integrity.
  */
 TransactionId
-GetOldestXmin(bool allDbs, bool ignoreVacuum, bool alreadyLocked)
+GetOldestXmin(bool allDbs, bool ignoreVacuum, bool systable, bool alreadyLocked)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId result;
@@ -1177,6 +1177,13 @@ GetOldestXmin(bool allDbs, bool ignoreVacuum, bool alreadyLocked)
 		int			pgprocno = arrayP->pgprocnos[index];
 		volatile PGPROC *proc = &allProcs[pgprocno];
 		volatile PGXACT *pgxact = &allPgXact[pgprocno];
+
+		/*
+		 * Backend is doing logical decoding which manages xmin
+		 * separately, check below.
+		 */
+		if (pgxact->vacuumFlags & PROC_IN_LOGICAL_DECODING)
+			continue;
 
 		if (ignoreVacuum && (pgxact->vacuumFlags & PROC_IN_VACUUM))
 			continue;
@@ -1254,7 +1261,8 @@ GetOldestXmin(bool allDbs, bool ignoreVacuum, bool alreadyLocked)
 	 * after locks are released and defer_cleanup_age has been applied, check
 	 * whether we need to back up further to make logical decoding possible.
 	 */
-	if (TransactionIdIsValid(logical_xmin) &&
+	if (systable &&
+		TransactionIdIsValid(logical_xmin) &&
 		NormalTransactionIdPrecedes(logical_xmin, result))
 		result = logical_xmin;
 
@@ -1312,6 +1320,8 @@ GetMaxSnapshotSubxidCount(void)
  *		RecentGlobalXmin: the global xmin (oldest TransactionXmin across all
  *			running transactions, except those running LAZY VACUUM).  This is
  *			the same computation done by GetOldestXmin(true, true, ...).
+ *		RecentGlobalDataXmin: the global xmin for non-catalog tables
+ *			>= RecentGlobalXmin
  *
  * Note: this function should probably not be called with an argument that's
  * not statically allocated (see xip allocation below).
@@ -1395,6 +1405,13 @@ GetSnapshotData(Snapshot snapshot)
 			int			pgprocno = pgprocnos[index];
 			volatile PGXACT *pgxact = &allPgXact[pgprocno];
 			TransactionId xid;
+
+			/*
+			 * Backend is doing logical decoding which manages xmin
+			 * separately, check below.
+			 */
+			if (pgxact->vacuumFlags & PROC_IN_LOGICAL_DECODING)
+				continue;
 
 			/* Ignore procs running LAZY VACUUM */
 			if (pgxact->vacuumFlags & PROC_IN_VACUUM)
@@ -1527,6 +1544,10 @@ GetSnapshotData(Snapshot snapshot)
 	RecentGlobalXmin = globalxmin - vacuum_defer_cleanup_age;
 	if (!TransactionIdIsNormal(RecentGlobalXmin))
 		RecentGlobalXmin = FirstNormalTransactionId;
+
+	/* Non-catalog tables can be vacuumed if older than this xid */
+	RecentGlobalDataXmin = RecentGlobalXmin;
+
 	/*
 	 * peg the global xmin to the one required for logical decoding if required
 	 */

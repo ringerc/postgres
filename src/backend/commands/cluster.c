@@ -850,9 +850,11 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 	 * Since we're going to rewrite the whole table anyway, there's no reason
 	 * not to be aggressive about this.
 	 */
-	vacuum_set_xid_limits(0, 0, OldHeap->rd_rel->relisshared,
-						  &OldestXmin, &FreezeXid, NULL, &MultiXactCutoff,
-						  NULL);
+	vacuum_set_xid_limits(0, 0,
+						  OldHeap->rd_rel->relisshared,
+						  IsSystemRelation(OldHeap)
+						  || RelationIsAccessibleInLogicalDecoding(OldHeap),
+						  &OldestXmin, &FreezeXid, NULL, &MultiXactCutoff, NULL);
 
 	/*
 	 * FreezeXid will become the table's new relfrozenxid, and that mustn't go

@@ -26,6 +26,7 @@
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/fd.h"
 
@@ -130,7 +131,10 @@ LogicalDecodingShmemInit(void)
 	}
 }
 
-/* mark the currently used slot as unused */
+/*
+ * on_shmem_exit handler marking the current slot as inactive so it
+ * can be reused after we've exited.
+ */
 static void
 LogicalSlotKill(int code, Datum arg)
 {
@@ -138,6 +142,7 @@ LogicalSlotKill(int code, Datum arg)
 	if (MyLogicalDecodingSlot && MyLogicalDecodingSlot->active)
 	{
 		MyLogicalDecodingSlot->active = false;
+		MyPgXact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
 	}
 	MyLogicalDecodingSlot = NULL;
 }
@@ -551,7 +556,7 @@ LogicalDecodingAcquireFreeSlot(const char *name, const char *plugin)
 	 * advance above walsnd->xmin.
 	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
-	slot->effective_xmin = GetOldestXmin(true, true, true);
+	slot->effective_xmin = GetOldestXmin(true, true, true, true);
 	slot->xmin = slot->effective_xmin;
 
 	if (!TransactionIdIsValid(LogicalDecodingCtl->xmin) ||
@@ -559,7 +564,14 @@ LogicalDecodingAcquireFreeSlot(const char *name, const char *plugin)
 		LogicalDecodingCtl->xmin = slot->effective_xmin;
 	LWLockRelease(ProcArrayLock);
 
-	Assert(slot->effective_xmin <= GetOldestXmin(true, true, false));
+	/*
+	 * Now that the logical xmin has been set, we can announce
+	 * ourselves as logical decoding backend which doesn't need get
+	 * it's xmin checked.
+	 */
+	MyPgXact->vacuumFlags |= PROC_IN_LOGICAL_DECODING;
+
+	Assert(slot->effective_xmin <= GetOldestXmin(true, true, true, false));
 
 	LWLockAcquire(LogicalDecodingSlotCtlLock, LW_EXCLUSIVE);
 	CreateLogicalSlot(slot);
@@ -626,6 +638,9 @@ LogicalDecodingReAcquireSlot(const char *name)
 				 (errmsg("START_LOGICAL_REPLICATION needs to be run in the same database as INIT_LOGICAL_REPLICATION"))));
 	}
 
+	/* announce we're doing logical decoding */
+	MyPgXact->vacuumFlags |= PROC_IN_LOGICAL_DECODING;
+
 	/* Arrange to clean up at exit */
 	on_shmem_exit(LogicalSlotKill, 0);
 
@@ -652,6 +667,7 @@ LogicalDecodingReleaseSlot(void)
 	SpinLockRelease(&slot->mutex);
 
 	MyLogicalDecodingSlot = NULL;
+	MyPgXact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
 
 	SaveLogicalSlot(slot);
 

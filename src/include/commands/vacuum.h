@@ -156,7 +156,7 @@ extern void vac_update_relstats(Relation relation,
 					TransactionId frozenxid,
 					MultiXactId minmulti);
 extern void vacuum_set_xid_limits(int freeze_min_age, int freeze_table_age,
-					  bool sharedRel,
+					  bool sharedRel, bool catalogRel,
 					  TransactionId *oldestXmin,
 					  TransactionId *freezeLimit,
 					  TransactionId *xidFullScanLimit,
