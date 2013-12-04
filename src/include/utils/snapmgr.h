@@ -53,4 +53,6 @@ extern bool XactHasExportedSnapshots(void);
 extern void DeleteAllExportedSnapshotFiles(void);
 extern bool ThereAreNoPriorRegisteredSnapshots(void);
 
+extern char *ExportSnapshot(Snapshot snapshot);
+
 #endif   /* SNAPMGR_H */

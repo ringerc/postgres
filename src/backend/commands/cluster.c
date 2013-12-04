@@ -869,7 +869,7 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 	is_system_catalog = IsSystemRelation(OldHeap);
 
 	/* Initialize the rewrite operation */
-	rwstate = begin_heap_rewrite(NewHeap, OldestXmin, FreezeXid,
+	rwstate = begin_heap_rewrite(OldHeap, NewHeap, OldestXmin, FreezeXid,
 								 MultiXactCutoff, use_wal);
 
 	/*

@@ -69,7 +69,7 @@
  */
 static SnapshotData CurrentSnapshotData = {HeapTupleSatisfiesMVCC};
 static SnapshotData SecondarySnapshotData = {HeapTupleSatisfiesMVCC};
-static SnapshotData CatalogSnapshotData = {HeapTupleSatisfiesMVCC};
+SnapshotData CatalogSnapshotData = {HeapTupleSatisfiesMVCC};
 
 /* Pointers to valid snapshots */
 static Snapshot CurrentSnapshot = NULL;
@@ -796,7 +796,7 @@ AtEOXact_Snapshot(bool isCommit)
  *		Returns the token (the file name) that can be used to import this
  *		snapshot.
  */
-static char *
+char *
 ExportSnapshot(Snapshot snapshot)
 {
 	TransactionId topXid;

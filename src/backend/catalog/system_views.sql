@@ -613,6 +613,18 @@ CREATE VIEW pg_stat_replication AS
     WHERE S.usesysid = U.oid AND
             S.pid = W.pid;
 
+CREATE VIEW pg_stat_logical_decoding AS
+    SELECT
+            L.slot_name,
+            L.plugin,
+            L.datoid,
+            D.datname AS database,
+            L.active,
+            L.xmin,
+            L.restart_decoding_lsn
+    FROM pg_stat_get_logical_decoding_slots() AS L
+            LEFT JOIN pg_database D ON (L.datoid = D.oid);
+
 CREATE VIEW pg_stat_database AS
     SELECT
             D.oid AS datid,
