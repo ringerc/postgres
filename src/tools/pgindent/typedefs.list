@@ -621,6 +621,7 @@ Form_pg_ts_template
 Form_pg_type
 Form_pg_user_mapping
 FormatNode
+FreeLogicalReplicationCmd
 FromCharDateMode
 FromExpr
 FuncCall
@@ -819,6 +820,7 @@ IndxInfo
 InfoItem
 InhInfo
 InhOption
+InitLogicalReplicationCmd
 InheritableSocket
 InlineCodeBlock
 InsertStmt
@@ -1684,6 +1686,7 @@ StandardChunkHeader
 StartBlobPtr
 StartBlobsPtr
 StartDataPtr
+StartLogicalReplicationCmd
 StartReplicationCmd
 StartupPacket
 StatEntry
@@ -1907,6 +1910,7 @@ WalRcvData
 WalRcvState
 WalSnd
 WalSndCtlData
+WalSndSendData
 WalSndState
 WholeRowVarExprState
 WindowAgg

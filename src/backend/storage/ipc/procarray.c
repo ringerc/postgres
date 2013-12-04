@@ -1155,6 +1155,7 @@ GetOldestXmin(bool allDbs, bool ignoreVacuum, bool systable, bool alreadyLocked)
 	TransactionId result;
 	int			index;
 	volatile TransactionId logical_xmin = InvalidTransactionId;
+	volatile TransactionId data_xmin = InvalidTransactionId;
 
 	/* Cannot look for individual databases during recovery */
 	Assert(allDbs || !RecoveryInProgress());
@@ -1216,7 +1217,10 @@ GetOldestXmin(bool allDbs, bool ignoreVacuum, bool systable, bool alreadyLocked)
 
 	/* fetch into volatile var while ProcArrayLock is held */
 	if (max_replication_slots > 0)
+	{
 		logical_xmin = ReplicationSlotCtl->catalog_xmin;
+		data_xmin = ReplicationSlotCtl->data_xmin;
+	}
 
 	if (RecoveryInProgress())
 	{
@@ -1265,6 +1269,13 @@ GetOldestXmin(bool allDbs, bool ignoreVacuum, bool systable, bool alreadyLocked)
 		TransactionIdIsValid(logical_xmin) &&
 		NormalTransactionIdPrecedes(logical_xmin, result))
 		result = logical_xmin;
+
+	/*
+	 * Check whether there's a physical slot requiring xmin to be pegged.
+	 */
+	if (TransactionIdIsValid(data_xmin) &&
+		NormalTransactionIdPrecedes(data_xmin, result))
+		result = data_xmin;
 
 	return result;
 }
@@ -1338,6 +1349,7 @@ GetSnapshotData(Snapshot snapshot)
 	int			subcount = 0;
 	bool		suboverflowed = false;
 	volatile TransactionId logical_xmin = InvalidTransactionId;
+	volatile TransactionId data_xmin = InvalidTransactionId;
 
 	Assert(snapshot != NULL);
 
@@ -1525,7 +1537,10 @@ GetSnapshotData(Snapshot snapshot)
 
 	/* fetch into volatile var while ProcArrayLock is held */
 	if (max_replication_slots > 0)
+	{
 		logical_xmin = ReplicationSlotCtl->catalog_xmin;
+		data_xmin = ReplicationSlotCtl->data_xmin;
+	}
 
 	if (!TransactionIdIsValid(MyPgXact->xmin))
 		MyPgXact->xmin = TransactionXmin = xmin;
@@ -1544,6 +1559,14 @@ GetSnapshotData(Snapshot snapshot)
 	RecentGlobalXmin = globalxmin - vacuum_defer_cleanup_age;
 	if (!TransactionIdIsNormal(RecentGlobalXmin))
 		RecentGlobalXmin = FirstNormalTransactionId;
+
+	/*
+	 * Check whether there's a physical slot requiring xmin to be pegged for
+	 * all tables.
+	 */
+	if (TransactionIdIsValid(data_xmin) &&
+		NormalTransactionIdPrecedes(data_xmin, RecentGlobalXmin))
+		RecentGlobalDataXmin = data_xmin;
 
 	/* Non-catalog tables can be vacuumed if older than this xid */
 	RecentGlobalDataXmin = RecentGlobalXmin;

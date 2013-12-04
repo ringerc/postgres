@@ -65,7 +65,7 @@ Node *replication_parse_result;
 }
 
 /* Non-keyword tokens */
-%token <str> SCONST
+%token <str> SCONST IDENT
 %token <uintval> UCONST
 %token <recptr> RECPTR
 
@@ -73,6 +73,8 @@ Node *replication_parse_result;
 %token K_BASE_BACKUP
 %token K_IDENTIFY_SYSTEM
 %token K_START_REPLICATION
+%token K_CREATE_REPLICATION_SLOT
+%token K_DROP_REPLICATION_SLOT
 %token K_TIMELINE_HISTORY
 %token K_LABEL
 %token K_PROGRESS
@@ -80,12 +82,19 @@ Node *replication_parse_result;
 %token K_NOWAIT
 %token K_WAL
 %token K_TIMELINE
+%token K_LOGICAL
+%token K_PHYSICAL
+%token K_SLOT
 
 %type <node>	command
-%type <node>	base_backup start_replication identify_system timeline_history
+%type <node>	base_backup start_replication start_logical_replication create_replication_slot drop_replication_slot identify_system timeline_history
 %type <list>	base_backup_opt_list
 %type <defelt>	base_backup_opt
 %type <uintval>	opt_timeline
+%type <list>	plugin_options plugin_opt_list
+%type <defelt>	plugin_opt_elem
+%type <node>	plugin_opt_arg
+%type <str>		opt_slot
 %%
 
 firstcmd: command opt_semicolon
@@ -102,6 +111,9 @@ command:
 			identify_system
 			| base_backup
 			| start_replication
+			| start_logical_replication
+			| create_replication_slot
+			| drop_replication_slot
 			| timeline_history
 			;
 
@@ -158,34 +170,72 @@ base_backup_opt:
 				}
 			;
 
-/*
- * START_REPLICATION %X/%X [TIMELINE %d]
- */
-start_replication:
-			K_START_REPLICATION RECPTR opt_timeline
+/* CREATE_REPLICATION_SLOT SLOT slot PHYSICAL */
+create_replication_slot:
+			K_CREATE_REPLICATION_SLOT K_SLOT IDENT K_PHYSICAL
 				{
-					StartReplicationCmd *cmd;
-
-					cmd = makeNode(StartReplicationCmd);
-					cmd->startpoint = $2;
-					cmd->timeline = $3;
-
+					CreateReplicationSlotCmd *cmd;
+					cmd = makeNode(CreateReplicationSlotCmd);
+					cmd->kind = REPLICATION_KIND_PHYSICAL;
+					cmd->slotname = $3;
 					$$ = (Node *) cmd;
 				}
 			;
 
-opt_timeline:
-			K_TIMELINE UCONST
+/* CREATE_REPLICATION_SLOT SLOT slot LOGICAL plugin */
+create_replication_slot:
+			K_CREATE_REPLICATION_SLOT K_SLOT IDENT K_LOGICAL IDENT
 				{
-					if ($2 <= 0)
-						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
-								 (errmsg("invalid timeline %u", $2))));
-					$$ = $2;
+					CreateReplicationSlotCmd *cmd;
+					cmd = makeNode(CreateReplicationSlotCmd);
+					cmd->kind = REPLICATION_KIND_LOGICAL;
+					cmd->slotname = $3;
+					cmd->plugin = $5;
+					$$ = (Node *) cmd;
 				}
-				| /* nothing */			{ $$ = 0; }
 			;
 
+/* DROP_REPLICATION_SLOT SLOT slot */
+drop_replication_slot:
+			K_DROP_REPLICATION_SLOT K_SLOT IDENT
+				{
+					DropReplicationSlotCmd *cmd;
+					cmd = makeNode(DropReplicationSlotCmd);
+					cmd->slotname = $3;
+					$$ = (Node *) cmd;
+				}
+			;
+
+/*
+ * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %d]
+ */
+start_replication:
+			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline
+				{
+					StartReplicationCmd *cmd;
+
+					cmd = makeNode(StartReplicationCmd);
+					cmd->kind = REPLICATION_KIND_PHYSICAL;
+					cmd->slotname = $2;
+					cmd->startpoint = $4;
+					cmd->timeline = $5;
+					$$ = (Node *) cmd;
+				}
+			;
+
+/* START_REPLICATION SLOT slot LOGICAL %X/%X options */
+start_logical_replication:
+			K_START_REPLICATION K_SLOT IDENT K_LOGICAL RECPTR plugin_options
+				{
+					StartReplicationCmd *cmd;
+					cmd = makeNode(StartReplicationCmd);
+					cmd->kind = REPLICATION_KIND_LOGICAL;;
+					cmd->slotname = $3;
+					cmd->startpoint = $5;
+					cmd->options = $6;
+					$$ = (Node *) cmd;
+				}
+			;
 /*
  * TIMELINE_HISTORY %d
  */
@@ -205,6 +255,58 @@ timeline_history:
 					$$ = (Node *) cmd;
 				}
 			;
+
+
+opt_physical :	K_PHYSICAL | /* EMPTY */;
+
+
+opt_slot :	K_SLOT IDENT
+				{
+					$$ = $2;
+				}
+				| /* nothing */			{ $$ = NULL; }
+
+opt_timeline:
+			K_TIMELINE UCONST
+				{
+					if ($2 <= 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 (errmsg("invalid timeline %u", $2))));
+					$$ = $2;
+				}
+				| /* nothing */			{ $$ = 0; }
+			;
+
+
+plugin_options:
+			'(' plugin_opt_list ')'			{ $$ = $2; }
+			| /* EMPTY */					{ $$ = NIL; }
+		;
+
+plugin_opt_list:
+			plugin_opt_elem
+				{
+					$$ = list_make1($1);
+				}
+			| plugin_opt_list ',' plugin_opt_elem
+				{
+					$$ = lappend($1, $3);
+				}
+		;
+
+plugin_opt_elem:
+			IDENT plugin_opt_arg
+				{
+					$$ = makeDefElem($1, $2);
+				}
+		;
+
+plugin_opt_arg:
+			SCONST							{ $$ = (Node *) makeString($1); }
+			| /* EMPTY */					{ $$ = NULL; }
+		;
+
 %%
 
 #include "repl_scanner.c"
