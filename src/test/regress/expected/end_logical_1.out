@@ -1,0 +1,4 @@
+\copy (SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0')) TO '/tmp/testresult';
+ERROR:  replication slot usage requires max_replication_slots > 0
+SELECT drop_replication_slot('regression_slot');
+ERROR:  replication slot usage requires max_replication_slots > 0
