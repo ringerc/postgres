@@ -1137,7 +1137,7 @@ XLogWalRcvSendHSFeedback(bool immed)
 	 * everything else has been checked.
 	 */
 	if (hot_standby_feedback)
-		xmin = GetOldestXmin(true, false);
+		xmin = GetOldestXmin(true, false, false);
 	else
 		xmin = InvalidTransactionId;
 

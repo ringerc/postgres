@@ -201,7 +201,10 @@ const char *subdirs[] = {
 	"pg_replslot",
 	"pg_tblspc",
 	"pg_stat",
-	"pg_stat_tmp"
+	"pg_stat_tmp",
+	"pg_llog",
+	"pg_llog/snapshots",
+	"pg_llog/mappings"
 };
 
 

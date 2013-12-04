@@ -1750,10 +1750,22 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 		 */
 		if (!skip)
 		{
+			/*
+			 * For the benefit of logical decoding, have t_self point at the
+			 * element of the HOT chain we're currently investigating instead
+			 * of the root tuple of the HOT chain. This is important because
+			 * the *Satisfies routine for historical mvcc snapshots needs the
+			 * correct tid to decide about the visibility in some cases.
+			 */
+			ItemPointerSet(&(heapTuple->t_self), BufferGetBlockNumber(buffer), offnum);
+
 			/* If it's visible per the snapshot, we must return it */
 			valid = HeapTupleSatisfiesVisibility(heapTuple, snapshot, buffer);
 			CheckForSerializableConflictOut(valid, relation, heapTuple,
 											buffer, snapshot);
+			/* reset to original, non-redirected, tid */
+			heapTuple->t_self = *tid;
+
 			if (valid)
 			{
 				ItemPointerSetOffsetNumber(tid, offnum);
@@ -8198,6 +8210,9 @@ heap2_redo(XLogRecPtr lsn, XLogRecord *record)
 			 * Nothing to do on a real replay, only used during logical
 			 * decoding.
 			 */
+			break;
+		case XLOG_HEAP2_REWRITE:
+			heap_xlog_logical_rewrite(lsn, record);
 			break;
 		default:
 			elog(PANIC, "heap2_redo: unknown op code %u", info);

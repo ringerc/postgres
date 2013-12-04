@@ -23,6 +23,7 @@
 
 #include "access/clog.h"
 #include "access/multixact.h"
+#include "access/rewriteheap.h"
 #include "access/subtrans.h"
 #include "access/timeline.h"
 #include "access/transam.h"
@@ -39,6 +40,8 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
+#include "replication/logical.h"
+#include "replication/snapbuild.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/barrier.h"
@@ -6463,6 +6466,14 @@ StartupXLOG(void)
 	XLogCtl->ckptXidEpoch = checkPoint.nextXidEpoch;
 	XLogCtl->ckptXid = checkPoint.nextXid;
 
+
+	/*
+	 * Startup logical state, needs to be setup now so we have proper data
+	 * during restore.
+	 */
+	StartupReplicationSlots(checkPoint.redo);
+	StartupReorderBuffer();
+
 	/*
 	 * Startup MultiXact.  We need to do this early for two reasons: one
 	 * is that we might try to access multixacts when we do tuple freezing,
@@ -8480,7 +8491,7 @@ CreateCheckPoint(int flags)
 	 * StartupSUBTRANS hasn't been called yet.
 	 */
 	if (!RecoveryInProgress())
-		TruncateSUBTRANS(GetOldestXmin(true, false));
+		TruncateSUBTRANS(GetOldestXmin(true, false, false));
 
 	/* Real work is done, but log and update stats before releasing lock. */
 	LogCheckpointEnd(false);
@@ -8564,6 +8575,8 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 	CheckPointRelationMap();
+	CheckPointSnapBuild();
+	CheckpointLogicalRewriteHeap();
 	CheckPointBuffers(flags);	/* performs all required fsyncs */
 	/* We deliberately delay 2PC checkpointing as long as possible */
 	CheckPointTwoPhase(checkPointRedo);
@@ -8855,7 +8868,7 @@ CreateRestartPoint(int flags)
 	 * this because StartupSUBTRANS hasn't been called yet.
 	 */
 	if (EnableHotStandby)
-		TruncateSUBTRANS(GetOldestXmin(true, false));
+		TruncateSUBTRANS(GetOldestXmin(true, false, false));
 
 	/* Real work is done, but log and update before releasing lock. */
 	LogCheckpointEnd(true);
@@ -8882,24 +8895,38 @@ CreateRestartPoint(int flags)
 
 /*
  * Retreat *logSegNo to the last segment that we need to retain because of
- * wal_keep_segments. This is calculated by subtracting wal_keep_segments
- * from the given xlog location, recptr.
+ * either wal_keep_segments or replication slots.
+ *
+ * This is calculated by subtracting wal_keep_segments from the given xlog
+ * location, recptr and by making sure that that result is below the
+ * requirement of replication slots.
  */
 static void
 KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 {
-	XLogSegNo	segno;
-
-	if (wal_keep_segments == 0)
-		return;
+	XLogSegNo	segno, slotSegNo;
 
 	XLByteToSeg(recptr, segno);
 
-	/* avoid underflow, don't go below 1 */
-	if (segno <= wal_keep_segments)
-		segno = 1;
-	else
-		segno = segno - wal_keep_segments;
+	/* compute limit for wal_keep_segments first */
+	if (wal_keep_segments > 0)
+	{
+		/* avoid underflow, don't go below 1 */
+		if (segno <= wal_keep_segments)
+			segno = 1;
+		else
+			segno = segno - wal_keep_segments;
+	}
+
+	/* then check whether slots limit removal further */
+	if (max_replication_slots > 0 &&
+		ReplicationSlotCtl->oldest_lsn != InvalidXLogRecPtr)
+	{
+		XLByteToPrevSeg(ReplicationSlotCtl->oldest_lsn, slotSegNo);
+
+		if (slotSegNo < segno)
+			segno = slotSegNo;
+	}
 
 	/* don't delete WAL segments newer than the calculated segment */
 	if (segno < *logSegNo)

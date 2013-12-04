@@ -17,6 +17,10 @@
 #include "access/xlogdefs.h"
 #include "nodes/pg_list.h"
 
+typedef enum ReplicationKind {
+	REPLICATION_KIND_PHYSICAL,
+	REPLICATION_KIND_LOGICAL
+} ReplicationKind;
 
 /* ----------------------
  *		IDENTIFY_SYSTEM command
