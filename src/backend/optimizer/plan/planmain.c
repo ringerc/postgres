@@ -131,12 +131,13 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * when we're doing DML on a view, where the injected top-level RTE for the
 	 * view's base rel isn't referenced in the query tree.
 	 *
-	 * It isn't a RELOPT_BASEREL because it doesn't appear in the query
-	 * join tree, but RELOPT_DEADREL may not be quite right either. Do we
-	 * need a RELOPT_RESULTREL? FIXME?
+	 * It is marked RELOPT_RESULTREL because it isn't quite "dead" - it
+	 * must appear in the top level flattened range table of the plan tree
+	 * - but neither does it appear in the join tree and shouldn't be
+	 *   considered in path generation.
 	 */
 	if (root->parse->resultRelation && root->simple_rel_array[root->parse->resultRelation] == NULL)
-		(void) build_simple_rel(root, root->parse->resultRelation, RELOPT_DEADREL);
+		(void) build_simple_rel(root, root->parse->resultRelation, RELOPT_RESULTREL);
 
 	Assert(root->parse->resultRelation == 0 || root->simple_rel_array[root->parse->resultRelation] != NULL);
 

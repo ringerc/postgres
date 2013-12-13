@@ -268,6 +268,9 @@ add_rtes_to_flat_rtable(PlannerInfo *root, bool recursing)
 	 * Note: this pass over the rangetable can't be combined with the previous
 	 * one, because that would mess up the numbering of the live RTEs in the
 	 * flattened rangetable.
+	 *
+	 * This *only* scans the range-table; it won't see dead subqueries in
+	 * WHERE clauses, etc.
 	 */
 	rti = 1;
 	foreach(lc, root->parse->rtable)
@@ -279,6 +282,13 @@ add_rtes_to_flat_rtable(PlannerInfo *root, bool recursing)
 		 * pulled up into our rangetable already.  Also ignore any subquery
 		 * RTEs without matching RelOptInfos, as they likewise have been
 		 * pulled up.
+		 *
+		 * Testing simple_rel_array_size here ensures that we don't try to access
+		 * root->simple_rel_array when it isn't defined in the simple-query fast-path
+		 * where the join tree is empty - see query_planner(...) in planmain.c.
+		 * This code only ever worked without this test because we don't add dead
+		 * subqueries in WHERE/HAVING/etc to the range-table so if the join tree
+		 * was empty this condition could never be true.
 		 */
 		if (rte->rtekind == RTE_SUBQUERY && !rte->inh &&
 			rti < root->simple_rel_array_size)

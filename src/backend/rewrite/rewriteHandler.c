@@ -2608,13 +2608,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	parsetree->resultRelation = new_rt_index;
 
 	/*
- 	 * The targetlist of the view may be in a different order to that of the
- 	 * underlying result rel. This must be corrected so that a view with
- 	 * a different column order to the underlying rel works correctly.
- 	 */
-	/* FIXME */
-
-	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
 	 * inheritance flag for the base relation.
 	 */
@@ -2663,6 +2656,107 @@ rewriteTargetView(Query *parsetree, Relation view)
 	Assert(bms_is_empty(new_rte->modifiedCols));
 	new_rte->modifiedCols = adjust_view_column_set(view_rte->modifiedCols,
 												   viewquery->targetList);
+
+ 	/*
+ 	 * For INSERT/UPDATE we must also update resnos in the targetlist to refer
+ 	 * to columns of the base relation, since those indicate the target
+ 	 * columns to be affected.
+ 	 *
+ 	 * Note that this destroys the resno ordering of the targetlist, but that
+ 	 * will be fixed when we recurse through rewriteQuery, which will invoke
+ 	 * rewriteTargetListIU again on the updated targetlist.
+ 	 *
+ 	 * Failure to perform this step would cause UPDATEs or INSERTs on 
+ 	 * a view with a different column ordering to the base relation to fail.
+ 	 */
+ 	if (parsetree->commandType != CMD_DELETE)
+ 	{
+ 		foreach(lc, parsetree->targetList)
+ 		{
+ 			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+ 			TargetEntry *view_tle;
+ 
+ 			if (tle->resjunk)
+ 				continue;
+ 
+ 			view_tle = get_tle_by_resno(viewquery->targetList, tle->resno);
+ 			if (view_tle != NULL && !view_tle->resjunk && IsA(view_tle->expr, Var))
+ 				tle->resno = ((Var *) view_tle->expr)->varattno;
+ 			else
+ 				elog(ERROR, "attribute number %d not found in view targetlist",
+ 					 tle->resno);
+ 		}
+ 	}
+ 
+ 	/*
+ 	 * For INSERT/UPDATE, if the view has the WITH CHECK OPTION, or any parent
+ 	 * view specified WITH CASCADED CHECK OPTION, add the quals from the view
+ 	 * to the query's withCheckOptions list.
+ 	 */
+ 	if (parsetree->commandType != CMD_DELETE)
+ 	{
+ 		bool		has_wco = RelationHasCheckOption(view);
+ 		bool		cascaded = RelationHasCascadedCheckOption(view);
+ 
+ 		/*
+ 		 * If the parent view has a cascaded check option, treat this view as
+ 		 * if it also had a cascaded check option.
+ 		 *
+ 		 * New WithCheckOptions are added to the start of the list, so if there
+ 		 * is a cascaded check option, it will be the first item in the list.
+ 		 */
+ 		if (parsetree->withCheckOptions != NIL)
+ 		{
+ 			WithCheckOption *parent_wco =
+ 				(WithCheckOption *) linitial(parsetree->withCheckOptions);
+ 
+ 			if (parent_wco->cascaded)
+ 			{
+ 				has_wco = true;
+ 				cascaded = true;
+ 			}
+ 		}
+ 
+ 		/*
+ 		 * Add the new WithCheckOption to the start of the list, so that
+ 		 * checks on inner views are run before checks on outer views, as
+ 		 * required by the SQL standard.
+ 		 *
+ 		 * If the new check is CASCADED, we need to add it even if this view
+ 		 * has no quals, since there may be quals on child views.  A LOCAL
+ 		 * check can be omitted if this view has no quals.
+ 		 */
+ 		if (has_wco && (cascaded || viewquery->jointree->quals != NULL))
+ 		{
+ 			WithCheckOption *wco;
+ 
+ 			wco = makeNode(WithCheckOption);
+ 			wco->viewname = pstrdup(RelationGetRelationName(view));
+ 			wco->qual = NULL;
+ 			wco->cascaded = cascaded;
+ 
+ 			parsetree->withCheckOptions = lcons(wco,
+ 												parsetree->withCheckOptions);
+ 
+ 			if (viewquery->jointree->quals != NULL)
+ 			{
+ 				wco->qual = (Node *) copyObject(viewquery->jointree->quals);
+ 				ChangeVarNodes(wco->qual, base_rt_index, new_rt_index, 0);
+ 
+ 				/*
+ 				 * Make sure that the query is marked correctly if the added
+ 				 * qual has sublinks.  We can skip this check if the query is
+ 				 * already marked, or if the command is an UPDATE, in which
+ 				 * case the same qual will have already been added to the
+ 				 * query's WHERE clause, and AddQual will have already done
+ 				 * this check.
+ 				 */
+ 				if (!parsetree->hasSubLinks &&
+ 					parsetree->commandType != CMD_UPDATE)
+ 					parsetree->hasSubLinks = checkExprHasSubLink(wco->qual);
+ 			}
+ 		}
+ 	}
 
     elog_node_display(LOG, "parse_tree after upd view rewrite", parsetree,
                       true);

@@ -275,7 +275,7 @@ typedef struct PlannerInfo
  * is the joining of two or more base rels.  A joinrel is identified by
  * the set of RT indexes for its component baserels.  We create RelOptInfo
  * nodes for each baserel and joinrel, and store them in the PlannerInfo's
- * simple_rel_array and join_rel_list respectively.
+ * simple_rel_array and join_rel_list respectively. 
  *
  * Note that there is only one joinrel for any given set of component
  * baserels, no matter what order we assemble them in; so an unordered
@@ -283,9 +283,16 @@ typedef struct PlannerInfo
  *
  * We also have "other rels", which are like base rels in that they refer to
  * single RT indexes; but they are not part of the join tree, and are given
- * a different RelOptKind to identify them.  Lastly, there is a RelOptKind
+ * a different RelOptKind to identify them.  There is also a RelOptKind
  * for "dead" relations, which are base rels that we have proven we don't
  * need to join after all.
+ *
+ * A "resultrel" (RELOPT_RESULTREL) is a relation that doesn't appear in the join
+ * tree, and is used only as the target for the ModifyTable node in an
+ * INSERT/UPDATE/DELETE. This arises when we're updating a view or subquery, as
+ * the RTE for the target is buried in a subquery and the ModifyTable node
+ * needs one at the top level. The injected RTE is marked RELOPT_RESULTREL
+ * so it isn't considered in join tree sanity checking, etc.
  *
  * Currently the only kind of otherrels are those made for member relations
  * of an "append relation", that is an inheritance set or UNION ALL subquery.
@@ -404,7 +411,8 @@ typedef enum RelOptKind
 	RELOPT_BASEREL,
 	RELOPT_JOINREL,
 	RELOPT_OTHER_MEMBER_REL,
-	RELOPT_DEADREL
+	RELOPT_DEADREL,
+	RELOPT_RESULTREL
 } RelOptKind;
 
 typedef struct RelOptInfo
