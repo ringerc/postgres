@@ -2424,22 +2424,25 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 
 
 /*
- * Scan the passed view target list, whose members must consist solely of Var
- * nodes with a varno equal to the passed targetvarno.
+ * Scan the passed view target list, whose members must consist solely
+ * of Var nodes with a varno equal to the passed targetvarno, and
+ * produce a targetlist of Var nodes with the corresponding varno and
+ * varattno of the base relation 'targetvarno'.
  *
- * A mapping is built from the resno (i.e. tlist index) of the view tlist to
- * the corresponding attribute number of the base relation the varattno points
- * to.
+ * This tlist is used when remapping Vars that point to a view so they
+ * point to the base relation of the view instead. It is entirely
+ * newly allocated. The result tlist is not in resno order.
  *
  * Must not be called with a targetlist containing non-Var entries.
  */
-static void
-gen_view_base_attr_map(List *viewtlist, AttrNumber * attnomap, int targetvarno)
+static List *
+gen_view_base_attr_map(List *viewtlist, int targetvarno, int newvarno)
 {
 	ListCell 	*lc;
-	TargetEntry	*te;
-	Var			*tev;
+	TargetEntry	*te, *newte;
+	Var			*tev, *newvar;
 	int			l_viewtlist = list_length(viewtlist);
+	List 		*newtlist = NIL;
 	
 	foreach(lc, viewtlist)
 	{
@@ -2451,10 +2454,21 @@ gen_view_base_attr_map(List *viewtlist, AttrNumber * attnomap, int targetvarno)
 		tev = (Var*) te->expr;
 		Assert(tev->varno == targetvarno);
 		Assert(te->resno - 1 < l_viewtlist);
-		attnomap[te->resno - 1] = tev->varattno;
-	}
-}
 
+		/* Construct the new Var with the remapped attno and varno */
+		newvar = (Var*) palloc(sizeof(Var));
+		*newvar = *tev;
+		newvar->varno = newvarno;
+		newvar->varattno = tev->varattno;
+
+		/* and wrap it in a new tle to cons to the list */
+		newte = flatCopyTargetEntry(te);
+		newte->expr = (Expr*) newvar;
+		newtlist = lcons(newte, newtlist);
+	}
+
+	return newtlist;
+}
 
 /*
  * rewriteTargetView -
@@ -2479,9 +2493,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	RangeTblEntry *new_rte;
 	Relation	base_rel;
 	ListCell   *lc;
-	const int command_type = parsetree->commandType;
-	AttrNumber *varattno_map;
-	bool	   found_whole_row_var = false;
 
 	/* The view must be updatable, else fail */
 	viewquery = get_view_query(view);
@@ -2631,60 +2642,27 @@ rewriteTargetView(Query *parsetree, Relation view)
 
 	/*
 	 * We need to adjust any RETURNING clause entries to point to the new
-	 * target RTE instead of the old one. Otherwise expand_targetlist and
-	 * set_returning_clause_references will get confused because they'll think
-	 * they need to fix up returning-list entries that point to what they think
-	 * are non-target tables.
+	 * target RTE instead of the old one so that we see the effects of
+	 * BEFORE triggers. Varattnos must be remapped so that the new Var
+	 * points to the correct col of the base rel, since the view will
+	 * usually have a different set of columns / column order.
 	 *
-	 * The attribute numbers from the origin view may differ from those on the
-	 * base table, so we need to fix up the varattno when we change the varno. We
-	 * have to ensure it's the same column.
-	 *
-	 * Injecting a RTE for the base table *inside* the subquery won't work
-	 * because we need to refer to the resultRelation at the outer level where
-	 * we see the output of the ModifyTable node after the action of any
-	 * BEFORE triggers, etc.
-	 *
-	 * First we generate a mapping table for map_variable_attnos and then
-	 * invoke map_variable_attnos to remap the varattnos before running
-	 * ChangeVarNodes to remap the varnos.
-	 *
-	 * TODO: It would be preferable to do the two mutations in a single pass.
-	 *
-	 * The view is guaranteed not to contain cols in its tlist that aren't just
-	 * cols of the baserel, so we don't need to deal with the mess of views 
-	 * containing expressions, etc.
+	 * As part of this pass any whole-row references to the view are
+	 * expanded into ROW(...) expressions to ensure we don't expose
+	 * columns that are not visible through the view, and to make sure
+	 * the client gets the result type it expected.
 	 */
-	/* TODO - any way to avoid palloc'ing this array dynamically? */
-	varattno_map = palloc( list_length(viewquery->targetList) * sizeof(AttrNumber) );
-	gen_view_base_attr_map(viewquery->targetList, varattno_map, rtr->rtindex);
 
-	parsetree->returningList = map_variable_attnos(
+	List * remap_tlist = gen_view_base_attr_map(viewquery->targetList, rtr->rtindex, new_result_rt_index);
+
+	parsetree->returningList = ReplaceVarsFromTargetList(
 			(Node*) parsetree->returningList,
-			old_result_rt_index, 0,
-			varattno_map, list_length(viewquery->targetList),
-			&found_whole_row_var
-			);
-
-	if (found_whole_row_var)
-	{
-		/* TODO: Extend map_variable_attnos API to pass a mutator to handle whole-row vars. */
-		elog(ERROR, "RETURNING list contains a whole-row variable, which is not currently supported for updatable views");
-	}
-
-	ChangeVarNodes((Node*) parsetree->returningList,
-				   old_result_rt_index,
-				   new_result_rt_index,
-				   0);
-
-	/*
-	 * TODO: We must also ensure that these added cols don't get exposed to the user
-	 * in a RETURNING clause that refers to the whole-view tuple, by expanding
-	 * that into a ROW expression later on. (TODO)
-	 *
-	 * Find somewhere else that already does this and use the same functionality.
-	 * We shouldn't need to redo it. expand_targetlist may be a candidate.
-	 */
+			old_result_rt_index, 0 /*sublevels_up*/,
+			view_rte,
+			remap_tlist,
+			REPLACEVARS_REPORT_ERROR, 0 /*nomatch_varno, unused */,
+			NULL /* outer_hasSubLinks, unused */
+	);
 
 	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
