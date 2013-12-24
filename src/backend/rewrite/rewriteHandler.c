@@ -2424,6 +2424,39 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 
 
 /*
+ * Scan the passed view target list, whose members must consist solely of Var
+ * nodes with a varno equal to the passed targetvarno.
+ *
+ * A mapping is built from the resno (i.e. tlist index) of the view tlist to
+ * the corresponding attribute number of the base relation the varattno points
+ * to.
+ *
+ * Must not be called with a targetlist containing non-Var entries.
+ */
+static void
+gen_view_base_attr_map(List *viewtlist, AttrNumber * attnomap, int targetvarno)
+{
+	ListCell 	*lc;
+	TargetEntry	*te;
+	Var			*tev;
+	int			l_viewtlist = list_length(viewtlist);
+	
+	foreach(lc, viewtlist)
+	{
+		te = (TargetEntry*) lfirst(lc);
+		/* Could relax this in future and map only the var entries,
+		 * ignoring everything else, but currently pointless since we
+		 * are only interested in simple views. */
+		Assert(IsA(te->expr, Var));
+		tev = (Var*) te->expr;
+		Assert(tev->varno == targetvarno);
+		Assert(te->resno - 1 < l_viewtlist);
+		attnomap[te->resno - 1] = tev->varattno;
+	}
+}
+
+
+/*
  * rewriteTargetView -
  *	  Attempt to rewrite a query where the target relation is a view, so that
  *	  the view's base relation becomes the target relation.
@@ -2447,6 +2480,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 	Relation	base_rel;
 	ListCell   *lc;
 	const int command_type = parsetree->commandType;
+	AttrNumber *varattno_map;
+	bool	   found_whole_row_var = false;
 
 	/* The view must be updatable, else fail */
 	viewquery = get_view_query(view);
@@ -2609,26 +2644,47 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 * because we need to refer to the resultRelation at the outer level where
 	 * we see the output of the ModifyTable node after the action of any
 	 * BEFORE triggers, etc.
+	 *
+	 * First we generate a mapping table for map_variable_attnos and then
+	 * invoke map_variable_attnos to remap the varattnos before running
+	 * ChangeVarNodes to remap the varnos.
+	 *
+	 * TODO: It would be preferable to do the two mutations in a single pass.
+	 *
+	 * The view is guaranteed not to contain cols in its tlist that aren't just
+	 * cols of the baserel, so we don't need to deal with the mess of views 
+	 * containing expressions, etc.
 	 */
+	/* TODO - any way to avoid palloc'ing this array dynamically? */
+	varattno_map = palloc( list_length(viewquery->targetList) * sizeof(AttrNumber) );
+	gen_view_base_attr_map(viewquery->targetList, varattno_map, rtr->rtindex);
+
+	parsetree->returningList = map_variable_attnos(
+			(Node*) parsetree->returningList,
+			old_result_rt_index, 0,
+			varattno_map, list_length(viewquery->targetList),
+			&found_whole_row_var
+			);
+
+	if (found_whole_row_var)
+	{
+		/* TODO: Extend map_variable_attnos API to pass a mutator to handle whole-row vars. */
+		elog(ERROR, "RETURNING list contains a whole-row variable, which is not currently supported for updatable views");
+	}
+
 	ChangeVarNodes((Node*) parsetree->returningList,
 				   old_result_rt_index,
 				   new_result_rt_index,
 				   0);
 
 	/*
-	 * For UPDATE, add references to all columns of the base relation to the
-	 * expanded subquery if they weren't already present. We need all cols of
-	 * the base relation to generate the new tuple, even though they aren't
-	 * visible directly to the view user. These must not be revealed in
-	 * a RETURNING clause, and do *not* need the select permission bit on them
-	 * since the user won't ever actually see them.
+	 * TODO: We must also ensure that these added cols don't get exposed to the user
+	 * in a RETURNING clause that refers to the whole-view tuple, by expanding
+	 * that into a ROW expression later on. (TODO)
 	 *
-	 * There's no need to sort these into the proper attribute ordering;
-	 * that'll be done for us in the next rewrite pass.
+	 * Find somewhere else that already does this and use the same functionality.
+	 * We shouldn't need to redo it. expand_targetlist may be a candidate.
 	 */
-	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
-		parsetree->targetList = expand_targetlist(parsetree->targetList, command_type, 
-						  						  parsetree->resultRelation, parsetree->rtable);
 
 	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
@@ -2786,7 +2842,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 
 	return parsetree;
 }
-
 
 /*
  * RewriteQuery -
