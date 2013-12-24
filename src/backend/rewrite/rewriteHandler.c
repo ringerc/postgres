@@ -2439,7 +2439,8 @@ rewriteTargetView(Query *parsetree, Relation view)
 	const char *auto_update_detail;
 	RangeTblRef *rtr;
 	int			base_rt_index;
-	int			new_rt_index;
+	int			new_result_rt_index;
+	int			old_result_rt_index;
 	RangeTblEntry *base_rte;
 	RangeTblEntry *view_rte;
 	RangeTblEntry *new_rte;
@@ -2580,6 +2581,41 @@ rewriteTargetView(Query *parsetree, Relation view)
 	heap_close(base_rel, NoLock);
 
 	/*
+	 * Create a new target RTE describing the base relation, and add it to the
+	 * outer query's rangetable, then set it as the targetRelation for the query.
+	 * 
+	 * We don't do any pull-up here; the optimizer will do it for non-security-barrier
+	 * views later if it feels like it. The purpose of this RTE is to be the targetRelation,
+	 * and to be the vehicle for write-permission checks against this view.
+	 */
+	new_rte = (RangeTblEntry *) copyObject(base_rte);
+	parsetree->rtable = lappend(parsetree->rtable, new_rte);
+	new_result_rt_index = list_length(parsetree->rtable);
+	old_result_rt_index = parsetree->resultRelation;
+	parsetree->resultRelation = new_result_rt_index;
+
+	/*
+	 * We need to adjust any RETURNING clause entries to point to the new
+	 * target RTE instead of the old one. Otherwise expand_targetlist and
+	 * set_returning_clause_references will get confused because they'll think
+	 * they need to fix up returning-list entries that point to what they think
+	 * are non-target tables.
+	 *
+	 * The attribute numbers from the origin view may differ from those on the
+	 * base table, so we need to fix up the varattno when we change the varno. We
+	 * have to ensure it's the same column.
+	 *
+	 * Injecting a RTE for the base table *inside* the subquery won't work
+	 * because we need to refer to the resultRelation at the outer level where
+	 * we see the output of the ModifyTable node after the action of any
+	 * BEFORE triggers, etc.
+	 */
+	ChangeVarNodes((Node*) parsetree->returningList,
+				   old_result_rt_index,
+				   new_result_rt_index,
+				   0);
+
+	/*
 	 * For UPDATE, add references to all columns of the base relation to the
 	 * expanded subquery if they weren't already present. We need all cols of
 	 * the base relation to generate the new tuple, even though they aren't
@@ -2593,19 +2629,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
 		parsetree->targetList = expand_targetlist(parsetree->targetList, command_type, 
 						  						  parsetree->resultRelation, parsetree->rtable);
-
-	/*
-	 * Create a new target RTE describing the base relation, and add it to the
-	 * outer query's rangetable, then set it as the targetRelation for the query.
-	 * 
-	 * We don't do any pull-up here; the optimizer will do it for non-security-barrier
-	 * views later if it feels like it. The purpose of this RTE is to be the targetRelation,
-	 * and to be the vehicle for write-permission checks against this view.
-	 */
-	new_rte = (RangeTblEntry *) copyObject(base_rte);
-	parsetree->rtable = lappend(parsetree->rtable, new_rte);
-	new_rt_index = list_length(parsetree->rtable);
-	parsetree->resultRelation = new_rt_index;
 
 	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
@@ -2741,7 +2764,7 @@ rewriteTargetView(Query *parsetree, Relation view)
  			if (viewquery->jointree->quals != NULL)
  			{
  				wco->qual = (Node *) copyObject(viewquery->jointree->quals);
- 				ChangeVarNodes(wco->qual, base_rt_index, new_rt_index, 0);
+ 				ChangeVarNodes(wco->qual, base_rt_index, new_result_rt_index, 0);
  
  				/*
  				 * Make sure that the query is marked correctly if the added
