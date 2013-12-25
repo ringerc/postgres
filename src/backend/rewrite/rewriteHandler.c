@@ -2422,54 +2422,6 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 	return result;
 }
 
-
-/*
- * Scan the passed view target list, whose members must consist solely
- * of Var nodes with a varno equal to the passed targetvarno, and
- * produce a targetlist of Var nodes with the corresponding varno and
- * varattno of the base relation 'targetvarno'.
- *
- * This tlist is used when remapping Vars that point to a view so they
- * point to the base relation of the view instead. It is entirely
- * newly allocated. The result tlist is not in resno order.
- *
- * Must not be called with a targetlist containing non-Var entries.
- */
-static List *
-gen_view_base_attr_map(List *viewtlist, int targetvarno, int newvarno)
-{
-	ListCell 	*lc;
-	TargetEntry	*te, *newte;
-	Var			*tev, *newvar;
-	int			l_viewtlist = list_length(viewtlist);
-	List 		*newtlist = NIL;
-	
-	foreach(lc, viewtlist)
-	{
-		te = (TargetEntry*) lfirst(lc);
-		/* Could relax this in future and map only the var entries,
-		 * ignoring everything else, but currently pointless since we
-		 * are only interested in simple views. */
-		Assert(IsA(te->expr, Var));
-		tev = (Var*) te->expr;
-		Assert(tev->varno == targetvarno);
-		Assert(te->resno - 1 < l_viewtlist);
-
-		/* Construct the new Var with the remapped attno and varno */
-		newvar = (Var*) palloc(sizeof(Var));
-		*newvar = *tev;
-		newvar->varno = newvarno;
-		newvar->varattno = tev->varattno;
-
-		/* and wrap it in a new tle to cons to the list */
-		newte = flatCopyTargetEntry(te);
-		newte->expr = (Expr*) newvar;
-		newtlist = lcons(newte, newtlist);
-	}
-
-	return newtlist;
-}
-
 /*
  * rewriteTargetView -
  *	  Attempt to rewrite a query where the target relation is a view, so that
@@ -2493,6 +2445,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 	RangeTblEntry *new_rte;
 	Relation	base_rel;
 	ListCell   *lc;
+	List	   *view_targetlist;
 
 	/* The view must be updatable, else fail */
 	viewquery = get_view_query(view);
@@ -2641,30 +2594,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	parsetree->resultRelation = new_result_rt_index;
 
 	/*
-	 * We need to adjust any RETURNING clause entries to point to the new
-	 * target RTE instead of the old one so that we see the effects of
-	 * BEFORE triggers. Varattnos must be remapped so that the new Var
-	 * points to the correct col of the base rel, since the view will
-	 * usually have a different set of columns / column order.
-	 *
-	 * As part of this pass any whole-row references to the view are
-	 * expanded into ROW(...) expressions to ensure we don't expose
-	 * columns that are not visible through the view, and to make sure
-	 * the client gets the result type it expected.
-	 */
-
-	List * remap_tlist = gen_view_base_attr_map(viewquery->targetList, rtr->rtindex, new_result_rt_index);
-
-	parsetree->returningList = ReplaceVarsFromTargetList(
-			(Node*) parsetree->returningList,
-			old_result_rt_index, 0 /*sublevels_up*/,
-			view_rte,
-			remap_tlist,
-			REPLACEVARS_REPORT_ERROR, 0 /*nomatch_varno, unused */,
-			NULL /* outer_hasSubLinks, unused */
-	);
-
-	/*
 	 * INSERTs never inherit.  For UPDATE/DELETE, we use the view query's
 	 * inheritance flag for the base relation.
 	 */
@@ -2713,6 +2642,38 @@ rewriteTargetView(Query *parsetree, Relation view)
 	Assert(bms_is_empty(new_rte->modifiedCols));
 	new_rte->modifiedCols = adjust_view_column_set(view_rte->modifiedCols,
 												   viewquery->targetList);
+
+	/*
+	 * Make a copy of the view's targetlist, adjusting its Vars to reference
+	 * the new target RTE, ie make their varnos be new_rt_index instead of
+	 * base_rt_index.  There can be no Vars for other rels in the tlist, so
+	 * this is sufficient to pull up the tlist expressions to refer to the
+	 * new result relation. The tlist will provide the replacement expressions
+	 * used by ReplaceVarsFromTargetList below.
+	 */
+	view_targetlist = copyObject(viewquery->targetList);
+
+	ChangeVarNodes((Node *) view_targetlist,
+				   base_rt_index,
+				   new_result_rt_index,
+				   0);
+
+	/* 
+	 * Use the rewritten target list to remap the RETURNING list of the 
+	 * outer query, so references to cols in the target view become references
+	 * to cols of the new resultRelation. This is necessary to ensure that we see
+	 * the effect of BEFORE triggers by RETURNING the outputs of ModifyTuple,
+	 * instead of the outputs of the subquery that feeds tuples into ModifyTuple.
+	 */
+	 parsetree->returningList = (List *)
+		ReplaceVarsFromTargetList((Node *) parsetree->returningList,
+								  old_result_rt_index,
+								  0 /*sublevels_up*/,
+								  view_rte,
+								  view_targetlist,
+								  REPLACEVARS_REPORT_ERROR,
+								  0,
+								  &parsetree->hasSubLinks);
 
  	/*
  	 * For INSERT/UPDATE we must also update resnos in the targetlist to refer
