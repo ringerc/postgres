@@ -2644,6 +2644,26 @@ rewriteTargetView(Query *parsetree, Relation view)
 												   viewquery->targetList);
 
 	/*
+	 * For UPDATE/DELETE, rewriteTargetListUD will have added a wholerow junk
+	 * TLE for the view to the end of the targetlist, which we no longer need.
+	 * Remove it to avoid unnecessary work when we process the targetlist.
+	 * Note that when we recurse through rewriteQuery a new junk TLE will be
+	 * added to allow the executor to find the proper row in the new target
+	 * relation.  (So, if we failed to do this, we might have multiple junk
+	 * TLEs with the same name, which would be disastrous.)
+	 */
+	if (parsetree->commandType != CMD_INSERT)
+	{
+		TargetEntry *tle = (TargetEntry *) llast(parsetree->targetList);
+
+		Assert(tle->resjunk);
+		Assert(IsA(tle->expr, Var) &&
+			   ((Var *) tle->expr)->varno == old_result_rt_index &&
+			   ((Var *) tle->expr)->varattno == 0);
+		parsetree->targetList = list_delete_ptr(parsetree->targetList, tle);
+	}
+
+	/*
 	 * Make a copy of the view's targetlist, adjusting its Vars to reference
 	 * the new target RTE, ie make their varnos be new_rt_index instead of
 	 * base_rt_index.  There can be no Vars for other rels in the tlist, so
