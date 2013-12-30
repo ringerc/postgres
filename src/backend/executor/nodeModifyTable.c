@@ -305,12 +305,14 @@ ExecInsert(TupleTableSlot *slot,
  *		DELETE is like UPDATE, except that we delete the tuple and no
  *		index modifications are needed.
  *
- *		When deleting from a table, tupleid identifies the tuple to
- *		delete and oldtuple is NULL.  When deleting from a view,
- *		oldtuple is passed to the INSTEAD OF triggers and identifies
- *		what to delete, and tupleid is invalid.  When deleting from a
- *		foreign table, both tupleid and oldtuple are NULL; the FDW has
- *		to figure out which row to delete using data from the planSlot.
+ *		When deleting from a table (including the base table of a
+ *		simply updatable view), tupleid identifies the tuple to delete
+ *		and oldtuple is NULL.  When deleting from a view using a
+ *		trigger, oldtuple is passed to the INSTEAD OF triggers and
+ *		identifies what to delete, and tupleid is invalid.  When
+ *		deleting from a foreign table, both tupleid and oldtuple are
+ *		NULL; the FDW has to figure out which row to delete using data
+ *		from the planSlot.
  *
  *		Returns RETURNING result if any, otherwise NULL.
  * ----------------------------------------------------------------
