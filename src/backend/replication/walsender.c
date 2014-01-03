@@ -198,17 +198,17 @@ static void XLogSendLogical(void);
 static void WalSndDone(WalSndSendData send_data);
 static XLogRecPtr GetStandbyFlushRecPtr(void);
 static void IdentifySystem(void);
+static void CreateReplicationSlot(CreateReplicationSlotCmd *cmd);
+static void DropReplicationSlot(DropReplicationSlotCmd *cmd);
 static void StartReplication(StartReplicationCmd *cmd);
-static void InitLogicalReplication(InitLogicalReplicationCmd *cmd);
-static void StartLogicalReplication(StartLogicalReplicationCmd *cmd);
-static void FreeLogicalReplication(FreeLogicalReplicationCmd *cmd);
+static void StartLogicalReplication(StartReplicationCmd *cmd);
 static void ProcessStandbyMessage(void);
 static void ProcessStandbyReplyMessage(void);
 static void ProcessStandbyHSFeedbackMessage(void);
 static void ProcessRepliesIfAny(void);
 static void WalSndKeepalive(bool requestReply);
-static void WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid);
-static void WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid);
+static void WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write);
+static void WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write);
 static void XLogRead(char *buf, XLogRecPtr startptr, Size count);
 
 
@@ -368,7 +368,7 @@ IdentifySystem(void)
 	}
 	else
 	{
-		pq_sendint(&buf, -1, 4);    /* col4 len */
+		pq_sendint(&buf, -1, 4);    /* col4 len, NULL */
 	}
 
 	pq_endmessage(&buf);
@@ -484,6 +484,9 @@ StartReplication(StartReplicationCmd *cmd)
 	 * difficult for there to be WAL data that we can still see that was
 	 * written at wal_level='minimal'.
 	 */
+
+	if (cmd->slotname)
+		ReplicationSlotAcquire(cmd->slotname);
 
 	/*
 	 * Select the timeline. If it was given explicitly by the client, use
@@ -629,6 +632,9 @@ StartReplication(StartReplicationCmd *cmd)
 		Assert(streamingDoneSending && streamingDoneReceiving);
 	}
 
+	if (cmd->slotname)
+		ReplicationSlotRelease();
+
 	/*
 	 * Copy is finished now. Send a single-row result set indicating the next
 	 * timeline.
@@ -716,84 +722,59 @@ replay_read_page(XLogReaderState* state, XLogRecPtr targetPagePtr, int reqLen,
  * start sending changes from.
  */
 static void
-InitLogicalReplication(InitLogicalReplicationCmd *cmd)
+CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 {
 	const char *slot_name;
 	StringInfoData buf;
 	char		xpos[MAXFNAMELEN];
 	const char *snapshot_name = NULL;
-	LogicalDecodingContext *ctx;
-	XLogRecPtr startptr;
 
-	CheckLogicalDecodingRequirements();
-
-	Assert(!MyLogicalDecodingSlot);
-
-	/* XXX apply sanity checking to slot name? */
-	LogicalDecodingAcquireFreeSlot(cmd->name, cmd->plugin);
-
-	Assert(MyLogicalDecodingSlot);
-
-	decoding_ctx = AllocSetContextCreate(TopMemoryContext,
-										 "decoding context",
-										 ALLOCSET_DEFAULT_MINSIZE,
-										 ALLOCSET_DEFAULT_INITSIZE,
-										 ALLOCSET_DEFAULT_MAXSIZE);
-	old_decoding_ctx = MemoryContextSwitchTo(decoding_ctx);
+	Assert(!MyReplicationSlot);
 
 	/* setup state for XLogReadPage */
 	sendTimeLineIsHistoric = false;
 	sendTimeLine = ThisTimeLineID;
 
+	if (cmd->kind == REPLICATION_KIND_LOGICAL)
+		CheckLogicalDecodingRequirements();
+
+	ReplicationSlotCreate(cmd->slotname, cmd->kind == REPLICATION_KIND_LOGICAL);
+
 	initStringInfo(&output_message);
-	ctx = CreateLogicalDecodingContext(MyLogicalDecodingSlot, true, InvalidXLogRecPtr,
-									   NIL,	replay_read_page,
-									   WalSndPrepareWrite, WalSndWriteData);
 
-	MemoryContextSwitchTo(old_decoding_ctx);
-
-	startptr = MyLogicalDecodingSlot->restart_decoding;
-
-	elog(LOG, "Initiating logical rep from %X/%X",
-		 (uint32)(startptr >> 32), (uint32)startptr);
-
-	for (;;)
+	if (cmd->kind == REPLICATION_KIND_LOGICAL)
 	{
-		XLogRecord *record;
-		XLogRecordBuffer buf;
-		char *err = NULL;
 
-		/* the read_page callback waits for new WAL */
-		record = XLogReadRecord(ctx->reader, startptr, &err);
-		/* xlog record was invalid */
-		if (err)
-			elog(ERROR, "%s", err);
-
-		/* read up from last position next time round */
-		startptr = InvalidXLogRecPtr;
-
-		Assert(record);
-
-		buf.origptr = ctx->reader->ReadRecPtr;
-		buf.endptr = ctx->reader->EndRecPtr;
-		buf.record = *record;
-		buf.record_data = XLogRecGetData(record);
-		DecodeRecordIntoReorderBuffer(ctx, &buf);
-
-		/* only continue till we found a consistent spot */
-		if (LogicalDecodingContextReady(ctx))
+		PG_TRY();
 		{
+			LogicalDecodingContext *ctx;
+
+			ctx = CreateDecodingContext(
+				true, cmd->plugin, InvalidXLogRecPtr, NIL,
+				replay_read_page, WalSndPrepareWrite, WalSndWriteData);
+
+			/* build initial snapshot, might take a while */
+			DecodingContextFindStartpoint(ctx);
+
 			/* export plain, importable, snapshot to the user */
 			snapshot_name = SnapBuildExportSnapshot(ctx->snapshot_builder);
-			break;
+
+			/* don't need the decoding context anymore */
+			FreeDecodingContext(ctx);
 		}
+		PG_CATCH();
+		{
+			ReplicationSlotRelease();
+			ReplicationSlotDrop(cmd->slotname);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 
-	MyLogicalDecodingSlot->confirmed_flush = ctx->reader->EndRecPtr;
-	slot_name = NameStr(MyLogicalDecodingSlot->name);
+	slot_name = NameStr(MyReplicationSlot->name);
 	snprintf(xpos, sizeof(xpos), "%X/%X",
-			 (uint32) (MyLogicalDecodingSlot->confirmed_flush >> 32),
-			 (uint32) MyLogicalDecodingSlot->confirmed_flush);
+			 (uint32) (MyReplicationSlot->confirmed_flush >> 32),
+			 (uint32) MyReplicationSlot->confirmed_flush);
 
 	pq_beginmessage(&buf, 'T');
 	pq_sendint(&buf, 4, 2);		/* 4 fields */
@@ -840,7 +821,7 @@ InitLogicalReplication(InitLogicalReplicationCmd *cmd)
 	pq_beginmessage(&buf, 'D');
 	pq_sendint(&buf, 4, 2);		/* # of columns */
 
-	/* replication_id */
+	/* slot_name */
 	pq_sendint(&buf, strlen(slot_name), 4); /* col1 len */
 	pq_sendbytes(&buf, slot_name, strlen(slot_name));
 
@@ -849,21 +830,29 @@ InitLogicalReplication(InitLogicalReplicationCmd *cmd)
 	pq_sendbytes(&buf, xpos, strlen(xpos));
 
 	/* snapshot name */
-	pq_sendint(&buf, strlen(snapshot_name), 4); /* col3 len */
-	pq_sendbytes(&buf, snapshot_name, strlen(snapshot_name));
+	if (snapshot_name != NULL)
+	{
+		pq_sendint(&buf, strlen(snapshot_name), 4); /* col3 len */
+		pq_sendbytes(&buf, snapshot_name, strlen(snapshot_name));
+	}
+	else
+		pq_sendint(&buf, -1, 4);    /* col3 len, NULL */
 
 	/* plugin */
-	pq_sendint(&buf, strlen(cmd->plugin), 4); /* col4 len */
-	pq_sendbytes(&buf, cmd->plugin, strlen(cmd->plugin));
+	if (cmd->plugin != NULL)
+	{
+		pq_sendint(&buf, strlen(cmd->plugin), 4); /* col4 len */
+		pq_sendbytes(&buf, cmd->plugin, strlen(cmd->plugin));
+	}
+	else
+		pq_sendint(&buf, -1, 4);    /* col4 len, NULL */
 
 	pq_endmessage(&buf);
-
-	FreeLogicalDecodingContext(ctx);
 
 	/*
 	 * release active status again, START_LOGICAL_REPLICATION will reacquire it
 	 */
-	LogicalDecodingReleaseSlot();
+	ReplicationSlotRelease();
 }
 
 /*
@@ -871,7 +860,7 @@ InitLogicalReplication(InitLogicalReplicationCmd *cmd)
  * WalSndLoop).
  */
 static void
-StartLogicalReplication(StartLogicalReplicationCmd *cmd)
+StartLogicalReplication(StartReplicationCmd *cmd)
 {
 	StringInfoData buf;
 	XLogRecPtr confirmed_flush;
@@ -882,9 +871,9 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 	/* make sure that our requirements are still fulfilled */
 	CheckLogicalDecodingRequirements();
 
-	Assert(!MyLogicalDecodingSlot);
+	Assert(!MyReplicationSlot);
 
-	LogicalDecodingReAcquireSlot(cmd->name);
+	ReplicationSlotAcquire(cmd->slotname);
 
 	if (am_cascading_walsender && !RecoveryInProgress())
 	{
@@ -906,21 +895,21 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 	sendTimeLineIsHistoric = false;
 	sendTimeLine = ThisTimeLineID;
 
-	confirmed_flush = MyLogicalDecodingSlot->confirmed_flush;
+	confirmed_flush = MyReplicationSlot->confirmed_flush;
 
 	Assert(confirmed_flush != InvalidXLogRecPtr);
 
 	/* continue from last position */
 	if (cmd->startpoint == InvalidXLogRecPtr)
-		cmd->startpoint = MyLogicalDecodingSlot->confirmed_flush;
-	else if (cmd->startpoint < MyLogicalDecodingSlot->confirmed_flush)
+		cmd->startpoint = MyReplicationSlot->confirmed_flush;
+	else if (cmd->startpoint < MyReplicationSlot->confirmed_flush)
 	{
 		/*
 		 * It might seem like we should error out in this case, but it's
 		 * pretty common for a client to acknowledge a LSN it doesn't have to
 		 * do anything for.
 		 */
-		cmd->startpoint = MyLogicalDecodingSlot->confirmed_flush;
+		cmd->startpoint = MyReplicationSlot->confirmed_flush;
 		elog(LOG, "cannot stream from %X/%X, minimum is %X/%X, forwarding",
 			 (uint32)(cmd->startpoint >> 32), (uint32)cmd->startpoint,
 			 (uint32)(confirmed_flush >> 32), (uint32)confirmed_flush);
@@ -930,8 +919,8 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 	 * Initialize position to the last ack'ed one, then the xlog records begin
 	 * to be shipped from that position.
 	 */
-	logical_decoding_ctx = CreateLogicalDecodingContext(
-		MyLogicalDecodingSlot, false, cmd->startpoint, cmd->options,
+	logical_decoding_ctx = CreateDecodingContext(
+		false, NULL, cmd->startpoint, cmd->options,
 		replay_read_page, WalSndPrepareWrite, WalSndWriteData);
 
 	/*
@@ -939,7 +928,7 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 	 * cmd->startpoint, but we use it to know where to read xlog in the main
 	 * loop...
 	 */
-	sentPtr = MyLogicalDecodingSlot->restart_decoding;
+	sentPtr = MyReplicationSlot->restart_decoding;
 	logical_startptr = sentPtr;
 
 	/* Also update the start position status in shared memory */
@@ -948,7 +937,7 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 		volatile WalSnd *walsnd = MyWalSnd;
 
 		SpinLockAcquire(&walsnd->mutex);
-		walsnd->sentPtr = MyLogicalDecodingSlot->restart_decoding;
+		walsnd->sentPtr = MyReplicationSlot->restart_decoding;
 		SpinLockRelease(&walsnd->mutex);
 	}
 
@@ -963,8 +952,8 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
 	/* Main loop of walsender */
 	WalSndLoop(XLogSendLogical);
 
-	FreeLogicalDecodingContext(logical_decoding_ctx);
-	LogicalDecodingReleaseSlot();
+	FreeDecodingContext(logical_decoding_ctx);
+	ReplicationSlotRelease();
 
 	replication_active = false;
 	if (walsender_ready_to_stop)
@@ -979,11 +968,11 @@ StartLogicalReplication(StartLogicalReplicationCmd *cmd)
  * Free permanent state by a now inactive but defined logical slot.
  */
 static void
-FreeLogicalReplication(FreeLogicalReplicationCmd *cmd)
+DropReplicationSlot(DropReplicationSlotCmd *cmd)
 {
-	CheckLogicalDecodingRequirements();
-	LogicalDecodingFreeSlot(cmd->name);
-	EndCommand("FREE_LOGICAL_REPLICATION", DestRemote);
+	/* no need to check decoding requirements here */;
+	ReplicationSlotDrop(cmd->slotname);
+	EndCommand("DROP_REPLICATION_SLOT", DestRemote);
 }
 
 /*
@@ -995,9 +984,11 @@ FreeLogicalReplication(FreeLogicalReplicationCmd *cmd)
  * with the data.
  */
 static void
-WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid)
+WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write)
 {
-	AssertVariableIsOfType(&WalSndPrepareWrite, LogicalOutputPluginWriterPrepareWrite);
+	/* can't have sync rep confused by sending the same LSN several times */
+	if (!last_write)
+		lsn = InvalidXLogRecPtr;
 
 	resetStringInfo(ctx->out);
 
@@ -1017,10 +1008,8 @@ WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xi
  * during that.
  */
 static void
-WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid)
+WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write)
 {
-	AssertVariableIsOfType(&WalSndWriteData, LogicalOutputPluginWriterWrite);
-
 	/* output previously gathered data in a CopyData packet */
 	pq_putmessage_noblock('d', ctx->out->data, ctx->out->len);
 
@@ -1263,21 +1252,23 @@ exec_replication_command(const char *cmd_string)
 			IdentifySystem();
 			break;
 
+		case T_CreateReplicationSlotCmd:
+			CreateReplicationSlot((CreateReplicationSlotCmd *) cmd_node);
+			break;
+
+		case T_DropReplicationSlotCmd:
+			DropReplicationSlot((DropReplicationSlotCmd *) cmd_node);
+			break;
+
 		case T_StartReplicationCmd:
-			StartReplication((StartReplicationCmd *) cmd_node);
-			break;
-
-		case T_InitLogicalReplicationCmd:
-			InitLogicalReplication((InitLogicalReplicationCmd *) cmd_node);
-			break;
-
-		case T_StartLogicalReplicationCmd:
-			StartLogicalReplication((StartLogicalReplicationCmd *) cmd_node);
-			break;
-
-		case T_FreeLogicalReplicationCmd:
-			FreeLogicalReplication((FreeLogicalReplicationCmd *) cmd_node);
-			break;
+			{
+				StartReplicationCmd *cmd = (StartReplicationCmd *) cmd_node;
+				if (cmd->kind == REPLICATION_KIND_PHYSICAL)
+					StartReplication(cmd);
+				else
+					StartLogicalReplication(cmd);
+				break;
+			}
 
 		case T_BaseBackupCmd:
 			SendBaseBackup((BaseBackupCmd *) cmd_node);
@@ -1445,6 +1436,26 @@ ProcessStandbyMessage(void)
 	}
 }
 
+static void
+PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
+{
+	bool changed = false;
+	/* use volatile pointer to prevent code rearrangement */
+	volatile ReplicationSlot *slot = MyReplicationSlot;
+
+	Assert(lsn != InvalidXLogRecPtr);
+	SpinLockAcquire(&slot->mutex);
+	if (slot->restart_decoding != lsn)
+	{
+		changed = true;
+		slot->restart_decoding = lsn;
+	}
+	SpinLockRelease(&slot->mutex);
+
+	if (changed)
+		ReplicationSlotsComputeRequiredLSN();
+}
+
 /*
  * Regular reply from standby advising of WAL positions on standby server.
  */
@@ -1488,14 +1499,19 @@ ProcessStandbyReplyMessage(void)
 		SpinLockRelease(&walsnd->mutex);
 	}
 
+	if (!am_cascading_walsender)
+		SyncRepReleaseWaiters();
+
 	/*
 	 * Advance our local xmin horizon when the client confirmed a flush.
 	 */
-	if (MyLogicalDecodingSlot && flushPtr != InvalidXLogRecPtr)
-		LogicalConfirmReceivedLocation(flushPtr);
-
-	if (!am_cascading_walsender)
-		SyncRepReleaseWaiters();
+	if (MyReplicationSlot && flushPtr != InvalidXLogRecPtr)
+	{
+		if (MyReplicationSlot->database != InvalidOid)
+			LogicalConfirmReceivedLocation(flushPtr);
+		else
+			PhysicalConfirmReceivedLocation(flushPtr);
+	}
 }
 
 /*
@@ -1525,6 +1541,8 @@ ProcessStandbyHSFeedbackMessage(void)
 	if (!TransactionIdIsNormal(feedbackXmin))
 	{
 		MyPgXact->xmin = InvalidTransactionId;
+		if (MyReplicationSlot != NULL)
+			MyReplicationSlot->data_xmin = InvalidTransactionId;
 		return;
 	}
 
@@ -1573,7 +1591,10 @@ ProcessStandbyHSFeedbackMessage(void)
 	 * safe, and if we're moving it backwards, well, the data is at risk
 	 * already since a VACUUM could have just finished calling GetOldestXmin.)
 	 */
-	MyPgXact->xmin = feedbackXmin;
+	if (MyReplicationSlot != NULL) /* XXX: persistency configurable? */
+		MyReplicationSlot->data_xmin = feedbackXmin;
+	else
+		MyPgXact->xmin = feedbackXmin;
 }
 
 /* Main loop of walsender process that streams the WAL over Copy messages. */
@@ -2286,16 +2307,9 @@ XLogSendLogical(void)
 
 	if (record != NULL)
 	{
-		XLogRecordBuffer buf;
-
-		buf.origptr = logical_decoding_ctx->reader->ReadRecPtr;
-		buf.endptr = logical_decoding_ctx->reader->EndRecPtr;
-		buf.record = *record;
-		buf.record_data = XLogRecGetData(record);
-
 		old_decoding_ctx = MemoryContextSwitchTo(decoding_ctx);
 
-		DecodeRecordIntoReorderBuffer(logical_decoding_ctx, &buf);
+		DecodeRecordIntoReorderBuffer(logical_decoding_ctx, record);
 
 		MemoryContextSwitchTo(old_decoding_ctx);
 

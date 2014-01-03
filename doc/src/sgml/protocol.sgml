@@ -1414,15 +1414,15 @@ The commands accepted in walsender mode are:
   </varlistentry>
 
   <varlistentry>
-    <term>START_REPLICATION <replaceable class="parameter">XXX/XXX</> TIMELINE <replaceable class="parameter">tli</></term>
+    <term>START_REPLICATION [SLOT <replaceable class="parameter">slotname</>] [PYHSICAL] <replaceable class="parameter">XXX/XXX</> TIMELINE <replaceable class="parameter">tli</></term>
     <listitem>
      <para>
       Instructs server to start streaming WAL, starting at
       WAL position <replaceable class="parameter">XXX/XXX</> on timeline
-      <replaceable class="parameter">tli</>.
-      The server can reply with an error, e.g. if the requested section of WAL
-      has already been recycled. On success, server responds with a
-      CopyBothResponse message, and then starts to stream WAL to the frontend.
+      <replaceable class="parameter">tli</>. The server can reply with an
+      error, e.g. if the requested section of WAL has already been
+      recycled. On success, server responds with a CopyBothResponse message,
+      and then starts to stream WAL to the frontend.
      </para>
 
      <para>
@@ -1454,6 +1454,12 @@ The commands accepted in walsender mode are:
       an ErrorResponse message if it encounters a failure after beginning
       to stream.)  The payload of each CopyData message from server to the
       client contains a message of one of the following formats:
+     </para>
+
+     <para>
+      If a slot <replaceable class="parameter">slotname</> is provided, it
+      will be acquired while START_REPLICATION is in progress and it will
+      prevent required resources from being removed from the server.
      </para>
 
      <para>
@@ -1731,6 +1737,21 @@ The commands accepted in walsender mode are:
      </para>
     </listitem>
   </varlistentry>
+
+  <varlistentry>
+    <term>START_REPLICATION SLOT <replaceable class="parameter">slotname</>] LOGICAL <replaceable class="parameter">XXX/XXX</></term>
+    <listitem>
+     <para>
+      Instructs server to start streaming WAL, starting at
+      WAL position <replaceable class="parameter">XXX/XXX</> on timeline
+      <replaceable class="parameter">tli</>. The server can reply with an
+      error, e.g. if the requested section of WAL has already been
+      recycled. On success, server responds with a CopyBothResponse message,
+      and then starts to stream WAL to the frontend.
+     </para>
+    </listitem>
+  </varlistentry>
+
 
   <varlistentry>
     <term>BASE_BACKUP [<literal>LABEL</literal> <replaceable>'label'</replaceable>] [<literal>PROGRESS</literal>] [<literal>FAST</literal>] [<literal>WAL</literal>] [<literal>NOWAIT</literal>]</term>

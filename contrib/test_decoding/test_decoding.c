@@ -33,7 +33,8 @@
 
 PG_MODULE_MAGIC;
 
-void		_PG_init(void);
+extern void		_PG_init(void);
+extern void		_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
 typedef struct
 {
@@ -43,29 +44,42 @@ typedef struct
 } TestDecodingData;
 
 /* These must be available to pg_dlsym() */
-extern void pg_decode_init(LogicalDecodingContext *ctx, bool is_init);
-extern void pg_decode_cleanup(LogicalDecodingContext *ctx);
-extern void pg_decode_begin_txn(LogicalDecodingContext *ctx,
+static void pg_decode_startup(LogicalDecodingContext *ctx, bool is_init);
+static void pg_decode_shutdown(LogicalDecodingContext *ctx);
+static void pg_decode_begin_txn(LogicalDecodingContext *ctx,
 					ReorderBufferTXN *txn);
-extern void pg_decode_commit_txn(LogicalDecodingContext *ctx,
+static void pg_decode_commit_txn(LogicalDecodingContext *ctx,
 					 ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
-extern void pg_decode_change(LogicalDecodingContext *ctx,
+static void pg_decode_change(LogicalDecodingContext *ctx,
 				 ReorderBufferTXN *txn, Relation rel,
 				 ReorderBufferChange *change);
 
 void
 _PG_init(void)
 {
+	/* other plugins can perform things here */
 }
 
-/* initialize this plugin */
+/* specify output plugin callbacks */
 void
-pg_decode_init(LogicalDecodingContext *ctx, bool is_init)
+_PG_output_plugin_init(OutputPluginCallbacks *cb)
+{
+	AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
+
+	cb->startup_cb = pg_decode_startup;
+	cb->begin_cb = pg_decode_begin_txn;
+	cb->change_cb = pg_decode_change;
+	cb->commit_cb = pg_decode_commit_txn;
+	cb->shutdown_cb = pg_decode_shutdown;
+}
+
+
+/* initialize this plugin */
+static void
+pg_decode_startup(LogicalDecodingContext *ctx, bool is_init)
 {
 	ListCell   *option;
 	TestDecodingData *data;
-
-	AssertVariableIsOfType(&pg_decode_init, LogicalDecodeInitCB);
 
 	data = palloc(sizeof(TestDecodingData));
 	data->context = AllocSetContextCreate(TopMemoryContext,
@@ -117,43 +131,37 @@ pg_decode_init(LogicalDecodingContext *ctx, bool is_init)
 }
 
 /* cleanup this plugin's resources */
-void
-pg_decode_cleanup(LogicalDecodingContext *ctx)
+static void
+pg_decode_shutdown(LogicalDecodingContext *ctx)
 {
 	TestDecodingData *data = ctx->output_plugin_private;
-
-	AssertVariableIsOfType(&pg_decode_cleanup, LogicalDecodeCleanupCB);
 
 	/* cleanup our own resources via memory context reset */
 	MemoryContextDelete(data->context);
 }
 
 /* BEGIN callback */
-void
+static void
 pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
 	TestDecodingData *data = ctx->output_plugin_private;
 
-	AssertVariableIsOfType(&pg_decode_begin_txn, LogicalDecodeBeginCB);
-
-	ctx->prepare_write(ctx, txn->end_lsn, txn->xid);
+	OutputPluginPrepareWrite(ctx, true);
 	if (data->include_xids)
 		appendStringInfo(ctx->out, "BEGIN %u", txn->xid);
 	else
 		appendStringInfoString(ctx->out, "BEGIN");
-	ctx->write(ctx, txn->end_lsn, txn->xid);
+	OutputPluginWrite(ctx, true);
 }
 
 /* COMMIT callback */
-void
+static void
 pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					 XLogRecPtr commit_lsn)
 {
 	TestDecodingData *data = ctx->output_plugin_private;
 
-	AssertVariableIsOfType(&pg_decode_commit_txn, LogicalDecodeCommitCB);
-
-	ctx->prepare_write(ctx, txn->end_lsn, txn->xid);
+	OutputPluginPrepareWrite(ctx, true);
 	if (data->include_xids)
 		appendStringInfo(ctx->out, "COMMIT %u", txn->xid);
 	else
@@ -163,7 +171,7 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		appendStringInfo(ctx->out, " (at %s)",
 						 timestamptz_to_str(txn->commit_time));
 
-	ctx->write(ctx, txn->end_lsn, txn->xid);
+	OutputPluginWrite(ctx, true);
 }
 
 /* print the tuple 'tuple' into the StringInfo s */
@@ -260,7 +268,7 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 /*
  * callback for individual changed tuples
  */
-void
+static void
 pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				 Relation relation, ReorderBufferChange *change)
 {
@@ -269,8 +277,6 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	TupleDesc	tupdesc;
 	MemoryContext old;
 
-	AssertVariableIsOfType(&pg_decode_change, LogicalDecodeChangeCB);
-
 	data = ctx->output_plugin_private;
 	class_form = RelationGetForm(relation);
 	tupdesc = RelationGetDescr(relation);
@@ -278,7 +284,7 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	/* Avoid leaking memory by using and resetting our own context */
 	old = MemoryContextSwitchTo(data->context);
 
-	ctx->prepare_write(ctx, change->lsn, txn->xid);
+	OutputPluginPrepareWrite(ctx, true);
 
 	appendStringInfoString(ctx->out, "table \"");
 	appendStringInfoString(ctx->out, NameStr(class_form->relname));
@@ -330,5 +336,5 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(data->context);
 
-	ctx->write(ctx, change->lsn, txn->xid);
+	OutputPluginWrite(ctx, true);
 }

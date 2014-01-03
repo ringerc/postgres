@@ -17,6 +17,10 @@
 #include "access/xlogdefs.h"
 #include "nodes/pg_list.h"
 
+typedef enum ReplicationKind {
+	REPLICATION_KIND_PHYSICAL,
+	REPLICATION_KIND_LOGICAL
+} ReplicationKind;
 
 /* ----------------------
  *		IDENTIFY_SYSTEM command
@@ -40,51 +44,42 @@ typedef struct BaseBackupCmd
 
 
 /* ----------------------
+ *		CREATE_REPLICATION_SLOT command
+ * ----------------------
+ */
+typedef struct CreateReplicationSlotCmd
+{
+	NodeTag		type;
+	char       *slotname;
+	ReplicationKind kind;
+	char       *plugin;
+} CreateReplicationSlotCmd;
+
+
+/* ----------------------
+ *		DROP_REPLICATION_SLOT command
+ * ----------------------
+ */
+typedef struct DropReplicationSlotCmd
+{
+	NodeTag		type;
+	char       *slotname;
+} DropReplicationSlotCmd;
+
+
+/* ----------------------
  *		START_REPLICATION command
  * ----------------------
  */
 typedef struct StartReplicationCmd
 {
 	NodeTag		type;
+	ReplicationKind kind;
+	char	   *slotname;
 	TimeLineID	timeline;
 	XLogRecPtr	startpoint;
-} StartReplicationCmd;
-
-
-/* ----------------------
- *		INIT_LOGICAL_REPLICATION command
- * ----------------------
- */
-typedef struct InitLogicalReplicationCmd
-{
-	NodeTag		type;
-	char       *name;
-	char       *plugin;
-} InitLogicalReplicationCmd;
-
-
-/* ----------------------
- *		START_LOGICAL_REPLICATION command
- * ----------------------
- */
-typedef struct StartLogicalReplicationCmd
-{
-	NodeTag		type;
-	char       *name;
-	XLogRecPtr	startpoint;
 	List       *options;
-} StartLogicalReplicationCmd;
-
-/* ----------------------
- *		FREE_LOGICAL_REPLICATION command
- * ----------------------
- */
-typedef struct FreeLogicalReplicationCmd
-{
-	NodeTag		type;
-	char       *name;
-} FreeLogicalReplicationCmd;
-
+} StartReplicationCmd;
 
 /* ----------------------
  *		TIMELINE_HISTORY command

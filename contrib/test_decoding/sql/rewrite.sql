@@ -1,13 +1,13 @@
-CREATE EXTENSION test_logical_decoding;
+CREATE EXTENSION test_decoding;
 -- predictability
 SET synchronous_commit = on;
 
 DROP TABLE IF EXISTS replication_example;
 
-SELECT 'init' FROM init_logical_replication('regression_slot', 'test_decoding');
+SELECT 'init' FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
 CREATE TABLE replication_example(id SERIAL PRIMARY KEY, somedata int, text varchar(120));
 INSERT INTO replication_example(somedata) VALUES (1);
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 BEGIN;
 INSERT INTO replication_example(somedata) VALUES (2);
@@ -57,7 +57,8 @@ COMMIT;
 -- make old files go away
 CHECKPOINT;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
-SELECT stop_logical_replication('regression_slot');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+SELECT drop_replication_slot('regression_slot');
 
 DROP TABLE IF EXISTS replication_example;
+DROP EXTENSION test_decoding;

@@ -1367,6 +1367,17 @@ pg_prepared_xacts| SELECT p.transaction,
    FROM ((pg_prepared_xact() p(transaction, gid, prepared, ownerid, dbid)
    LEFT JOIN pg_authid u ON ((p.ownerid = u.oid)))
    LEFT JOIN pg_database d ON ((p.dbid = d.oid)));
+pg_replication_slots| SELECT l.slot_name,
+    l.plugin,
+    l.slottype,
+    l.datoid,
+    d.datname AS database,
+    l.active,
+    l.catalog_xmin,
+    l.data_xmin,
+    l.restart_decoding_lsn
+   FROM (pg_get_replication_slots() l(slot_name, plugin, slottype, datoid, active, catalog_xmin, data_xmin, restart_decoding_lsn)
+   LEFT JOIN pg_database d ON ((l.datoid = d.oid)));
 pg_roles| SELECT pg_authid.rolname,
     pg_authid.rolsuper,
     pg_authid.rolinherit,
@@ -1679,15 +1690,6 @@ pg_stat_database_conflicts| SELECT d.oid AS datid,
     pg_stat_get_db_conflict_bufferpin(d.oid) AS confl_bufferpin,
     pg_stat_get_db_conflict_startup_deadlock(d.oid) AS confl_deadlock
    FROM pg_database d;
-pg_stat_logical_decoding| SELECT l.slot_name,
-    l.plugin,
-    l.datoid,
-    d.datname AS database,
-    l.active,
-    l.xmin,
-    l.restart_decoding_lsn
-   FROM (pg_stat_get_logical_decoding_slots() l(slot_name, plugin, datoid, active, xmin, restart_decoding_lsn)
-   LEFT JOIN pg_database d ON ((l.datoid = d.oid)));
 pg_stat_replication| SELECT s.pid,
     s.usesysid,
     u.rolname AS usename,

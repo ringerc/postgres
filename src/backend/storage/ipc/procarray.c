@@ -1215,8 +1215,8 @@ GetOldestXmin(bool allDbs, bool ignoreVacuum, bool systable, bool alreadyLocked)
 	}
 
 	/* fetch into volatile var while ProcArrayLock is held */
-	if (max_logical_slots > 0)
-		logical_xmin = LogicalDecodingCtl->xmin;
+	if (max_replication_slots > 0)
+		logical_xmin = ReplicationSlotCtl->catalog_xmin;
 
 	if (RecoveryInProgress())
 	{
@@ -1524,8 +1524,8 @@ GetSnapshotData(Snapshot snapshot)
 
 
 	/* fetch into volatile var while ProcArrayLock is held */
-	if (max_logical_slots > 0)
-		logical_xmin = LogicalDecodingCtl->xmin;
+	if (max_replication_slots > 0)
+		logical_xmin = ReplicationSlotCtl->catalog_xmin;
 
 	if (!TransactionIdIsValid(MyPgXact->xmin))
 		MyPgXact->xmin = TransactionXmin = xmin;

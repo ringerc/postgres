@@ -67,34 +67,40 @@ static void DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tup);
  * context.
  */
 void
-DecodeRecordIntoReorderBuffer(LogicalDecodingContext *ctx,
-							  XLogRecordBuffer *buf)
+DecodeRecordIntoReorderBuffer(LogicalDecodingContext *ctx, XLogRecord *record)
 {
+	XLogRecordBuffer buf;
+
+	buf.origptr = ctx->reader->ReadRecPtr;
+	buf.endptr = ctx->reader->EndRecPtr;
+	buf.record = *record;
+	buf.record_data = XLogRecGetData(record);
+
 	/* cast so we get a warning when new rmgrs are added */
-	switch ((RmgrIds) buf->record.xl_rmid)
+	switch ((RmgrIds) buf.record.xl_rmid)
 	{
 		/*
 		 * Rmgrs we care about for logical decoding. Add new rmgrs in
 		 * rmgrlist.h's order.
 		 */
 		case RM_XLOG_ID:
-			DecodeXLogOp(ctx, buf);
+			DecodeXLogOp(ctx, &buf);
 			break;
 
 		case RM_XACT_ID:
-			DecodeXactOp(ctx, buf);
+			DecodeXactOp(ctx, &buf);
 			break;
 
 		case RM_STANDBY_ID:
-			DecodeStandbyOp(ctx, buf);
+			DecodeStandbyOp(ctx, &buf);
 			break;
 
 		case RM_HEAP2_ID:
-			DecodeHeap2Op(ctx, buf);
+			DecodeHeap2Op(ctx, &buf);
 			break;
 
 		case RM_HEAP_ID:
-			DecodeHeapOp(ctx, buf);
+			DecodeHeapOp(ctx, &buf);
 			break;
 
 		/*
@@ -116,7 +122,7 @@ DecodeRecordIntoReorderBuffer(LogicalDecodingContext *ctx,
 		case RM_SPGIST_ID:
 			break;
 		case RM_NEXT_ID:
-			elog(ERROR, "unexpected RM_NEXT_ID rmgr_id: %u", (RmgrIds) buf->record.xl_rmid);
+			elog(ERROR, "unexpected RM_NEXT_ID rmgr_id: %u", (RmgrIds) buf.record.xl_rmid);
 	}
 }
 
@@ -359,7 +365,7 @@ DecodeHeap2Op(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		 * Everything else here is just low level physical stuff we're
 		 * not interested in.
 		 */
-		case XLOG_HEAP2_FREEZE:
+		case XLOG_HEAP2_FREEZE_PAGE:
 		case XLOG_HEAP2_CLEAN:
 		case XLOG_HEAP2_CLEANUP_INFO:
 		case XLOG_HEAP2_VISIBLE:

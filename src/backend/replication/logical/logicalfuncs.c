@@ -2,7 +2,7 @@
  *
  * logicalfuncs.c
  *
- *	   Support functions for using xlog decoding
+ *	   Support functions for using changeset extraction
  *
  *
  * Copyright (c) 2012-2013, PostgreSQL Global Development Group
@@ -19,16 +19,74 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+
+#include "catalog/pg_type.h"
+
+#include "nodes/makefuncs.h"
+
+#include "utils/array.h"
 #include "utils/builtins.h"
-#include "storage/fd.h"
+#include "utils/inval.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/logicalfuncs.h"
 
-Datum		init_logical_replication(PG_FUNCTION_ARGS);
-Datum		stop_logical_replication(PG_FUNCTION_ARGS);
-Datum		pg_stat_get_logical_decoding_slots(PG_FUNCTION_ARGS);
+#include "storage/fd.h"
+
+/* private date for writing out data */
+typedef struct DecodingOutputState {
+	Tuplestorestate *tupstore;
+	TupleDesc tupdesc;
+} DecodingOutputState;
+
+Datum		create_decoding_replication_slot(PG_FUNCTION_ARGS);
+Datum		create_physical_replication_slot(PG_FUNCTION_ARGS);
+Datum		drop_replication_slot(PG_FUNCTION_ARGS);
+Datum		decoding_slot_get_changes(PG_FUNCTION_ARGS);
+Datum		decoding_slot_get_binary_changes(PG_FUNCTION_ARGS);
+Datum		decoding_slot_peek_changes(PG_FUNCTION_ARGS);
+Datum		decoding_slot_peek_binary_changes(PG_FUNCTION_ARGS);
+
+static void
+LogicalOutputPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
+						  bool last_write)
+{
+	resetStringInfo(ctx->out);
+}
+
+static void
+LogicalOutputWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
+				   bool last_write)
+{
+	Datum		values[3];
+	bool		nulls[3];
+	char		buf[60];
+	DecodingOutputState *p;
+
+	/* SQL Datums can only be of a limited length... */
+	if (ctx->out->len > MaxAllocSize - VARHDRSZ)
+		elog(ERROR, "too much output for sql interface");
+
+	p = (DecodingOutputState *) ctx->output_writer_private;
+
+	sprintf(buf, "%X/%X", (uint32) (lsn >> 32), (uint32) lsn);
+
+	memset(nulls, 0, sizeof(nulls));
+	values[0] = CStringGetTextDatum(buf);
+	values[1] = TransactionIdGetDatum(xid);
+	/*
+	 * XXX: maybe we ought to assert ctx->out is in database encoding when
+	 * we're writing textual output.
+	 */
+	/* ick, but cstring_to_text_with_len works for bytea perfectly fine */
+	values[2] = PointerGetDatum(
+		cstring_to_text_with_len(ctx->out->data, ctx->out->len));
+
+	tuplestore_putvalues(p->tupstore, p->tupdesc, values, nulls);
+}
 
 /* FIXME: duplicate code with pg_xlogdump, similar to walsender.c */
 static void
@@ -181,13 +239,16 @@ logical_read_local_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 }
 
 static void
-DummyWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid)
+check_permissions(void)
 {
-	elog(ERROR, "init_logical_replication shouldn't be writing anything");
+	if (!superuser() && !has_rolreplication(GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("must be superuser or replication role to use changeset extraction"))));
 }
 
 Datum
-init_logical_replication(PG_FUNCTION_ARGS)
+create_decoding_replication_slot(PG_FUNCTION_ARGS)
 {
 	Name		name = PG_GETARG_NAME(0);
 	Name		plugin = PG_GETARG_NAME(1);
@@ -203,77 +264,49 @@ init_logical_replication(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
+	check_permissions();
+
+	CheckLogicalDecodingRequirements();
+	Assert(!MyReplicationSlot);
+
 	/*
 	 * Acquire a logical decoding slot, this will check for conflicting
 	 * names.
 	 */
-	CheckLogicalDecodingRequirements();
-	LogicalDecodingAcquireFreeSlot(NameStr(*name), NameStr(*plugin));
-
-	elog(LOG, "starting to decode from %X/%X",
-		 (uint32)(MyLogicalDecodingSlot->restart_decoding >> 32),
-		 (uint32)MyLogicalDecodingSlot->restart_decoding);
+	ReplicationSlotCreate(NameStr(*name), true);
 
 	/* make sure we don't end up with an unreleased slot */
 	PG_TRY();
 	{
 		LogicalDecodingContext *ctx = NULL;
-		XLogRecPtr	startptr;
 
 		/*
 		 * Create logical decoding context, to build the initial snapshot.
 		 */
-		ctx = CreateLogicalDecodingContext(MyLogicalDecodingSlot, true,
-										   InvalidXLogRecPtr, NIL,
-										   logical_read_local_xlog_page,
-										   DummyWrite, DummyWrite);
+		ctx = CreateDecodingContext(
+			true, NameStr(*plugin), InvalidXLogRecPtr, NIL,
+			logical_read_local_xlog_page, NULL, NULL);
 
-		/* setup from where to read xlog */
-		startptr = ctx->slot->restart_decoding;
-
-		/* Wait for a consistent starting point */
-		for (;;)
-		{
-			XLogRecord *record;
-			XLogRecordBuffer buf;
-			char	   *err = NULL;
-
-			/* the read_page callback waits for new WAL */
-			record = XLogReadRecord(ctx->reader, startptr, &err);
-			if (err)
-				elog(ERROR, "%s", err);
-
-			Assert(record);
-
-			startptr = InvalidXLogRecPtr;
-
-			buf.origptr = ctx->reader->ReadRecPtr;
-			buf.record = *record;
-			buf.record_data = XLogRecGetData(record);
-			DecodeRecordIntoReorderBuffer(ctx, &buf);
-
-			/* only continue till we found a consistent spot */
-			if (LogicalDecodingContextReady(ctx))
-				break;
-		}
+		/* build initial snapshot, might take a while */
+		DecodingContextFindStartpoint(ctx);
 
 		/* Extract the values we want */
-		MyLogicalDecodingSlot->confirmed_flush = ctx->reader->EndRecPtr;
 		snprintf(xpos, sizeof(xpos), "%X/%X",
-				 (uint32) (MyLogicalDecodingSlot->confirmed_flush >> 32),
-				 (uint32) MyLogicalDecodingSlot->confirmed_flush);
+				 (uint32) (MyReplicationSlot->confirmed_flush >> 32),
+				 (uint32) MyReplicationSlot->confirmed_flush);
 
 		/* don't need the decoding context anymore */
-		FreeLogicalDecodingContext(ctx);
+		FreeDecodingContext(ctx);
 	}
 	PG_CATCH();
 	{
-		LogicalDecodingReleaseSlot();
+		ReplicationSlotRelease();
+		ReplicationSlotDrop(NameStr(*name));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	values[0] = CStringGetTextDatum(NameStr(MyLogicalDecodingSlot->name));
+	values[0] = CStringGetTextDatum(NameStr(MyReplicationSlot->name));
 	values[1] = CStringGetTextDatum(xpos);
 
 	memset(nulls, 0, sizeof(nulls));
@@ -281,35 +314,67 @@ init_logical_replication(PG_FUNCTION_ARGS)
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	result = HeapTupleGetDatum(tuple);
 
-	LogicalDecodingReleaseSlot();
+	ReplicationSlotRelease();
 
 	PG_RETURN_DATUM(result);
 }
 
 Datum
-stop_logical_replication(PG_FUNCTION_ARGS)
+create_physical_replication_slot(PG_FUNCTION_ARGS)
+{
+	Name		name = PG_GETARG_NAME(0);
+	Datum		values[2];
+	bool		nulls[2];
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum		result;
+
+	check_permissions();
+
+	CheckSlotRequirements();
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	/*
+	 * Acquire a logical decoding slot, this will check for conflicting
+	 * names.
+	 */
+	ReplicationSlotCreate(NameStr(*name), false);
+
+	values[0] = CStringGetTextDatum(NameStr(MyReplicationSlot->name));
+
+	nulls[0] = false;
+	nulls[0] = true;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+
+	ReplicationSlotRelease();
+
+	PG_RETURN_DATUM(result);
+}
+
+static Datum
+decoding_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm)
 {
 	Name		name = PG_GETARG_NAME(0);
 
-	CheckLogicalDecodingRequirements();
-	LogicalDecodingFreeSlot(NameStr(*name));
-
-	PG_RETURN_INT32(0);
-}
-
-/*
- * Return one row for each logical decoding slot currently in use.
- */
-Datum
-pg_stat_get_logical_decoding_slots(PG_FUNCTION_ARGS)
-{
-#define PG_STAT_GET_LOGICAL_DECODING_SLOTS_COLS 6
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
-	int			i;
+
+	XLogRecPtr	now;
+	XLogRecPtr	startptr;
+	XLogRecPtr	rp;
+
+	LogicalDecodingContext *ctx;
+
+	ResourceOwner old_resowner = CurrentResourceOwner;
+	ArrayType  *arr;
+	Size		ndim;
+	List	   *options = NIL;
+	DecodingOutputState *p;
 
 	/* check to see if caller supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -319,69 +384,212 @@ pg_stat_get_logical_decoding_slots(PG_FUNCTION_ARGS)
 	if (!(rsinfo->allowedModes & SFRM_Materialize))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not " \
-						"allowed in this context")));
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* state to write output to */
+	p = palloc(sizeof(DecodingOutputState));
 
 	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+	if (get_call_result_type(fcinfo, NULL, &p->tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
+
+	check_permissions();
+
+	CheckLogicalDecodingRequirements();
+
+	arr = PG_GETARG_ARRAYTYPE_P(2);
+	ndim = ARR_NDIM(arr);
 
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
 
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	if (ndim > 1)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("start_logical_replication only accept one dimension of arguments")));
+	}
+	else if (array_contains_nulls(arr))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			  errmsg("start_logical_replication expects NOT NULL options")));
+	}
+	else if (ndim == 1)
+	{
+		int			nelems;
+		Datum	   *datum_opts;
+		int			i;
+
+		Assert(ARR_ELEMTYPE(arr) == TEXTOID);
+
+		deconstruct_array(arr, TEXTOID, -1, false, 'i',
+						  &datum_opts, NULL, &nelems);
+
+		if (nelems % 2 != 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("options need to be specified pairwise")));
+		}
+
+		for (i = 0; i < nelems; i += 2)
+		{
+			char	   *name = TextDatumGetCString(datum_opts[i]);
+			char	   *opt = TextDatumGetCString(datum_opts[i + 1]);
+
+			options = lappend(options, makeDefElem(name, (Node *) makeString(opt)));
+		}
+	}
+
+	p->tupstore = tuplestore_begin_heap(true, false, work_mem);
 	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
+	rsinfo->setResult = p->tupstore;
+	rsinfo->setDesc = p->tupdesc;
 
 	MemoryContextSwitchTo(oldcontext);
 
-	for (i = 0; i < max_logical_slots; i++)
+	/*
+	 * XXX: It's impolite to ignore our argument and keep decoding until the
+	 * current position.
+	 */
+	if (!RecoveryInProgress())
+		now = GetFlushRecPtr();
+	else
+		now = GetXLogReplayRecPtr(NULL);
+
+	CheckLogicalDecodingRequirements();
+	ReplicationSlotAcquire(NameStr(*name));
+
+	PG_TRY();
 	{
-		LogicalDecodingSlot *slot = &LogicalDecodingCtl->logical_slots[i];
-		Datum		values[PG_STAT_GET_LOGICAL_DECODING_SLOTS_COLS];
-		bool		nulls[PG_STAT_GET_LOGICAL_DECODING_SLOTS_COLS];
-		char		location[MAXFNAMELEN];
-		const char *slot_name;
-		const char *plugin;
-		TransactionId xmin;
-		XLogRecPtr	last_req;
-		bool		active;
-		Oid			database;
+		ctx = CreateDecodingContext(false,
+									NULL,
+									MyReplicationSlot->confirmed_flush,
+									options,
+									logical_read_local_xlog_page,
+									LogicalOutputPrepareWrite,
+									LogicalOutputWrite);
 
-		SpinLockAcquire(&slot->mutex);
-		if (!slot->in_use)
+		ctx->output_writer_private = p;
+
+		startptr = MyReplicationSlot->restart_decoding;
+
+		elog(LOG, "Starting logical replication from %X/%X to %X/%X, previously flushed %X/%X",
+			 (uint32) (MyReplicationSlot->restart_decoding >> 32),
+			 (uint32) MyReplicationSlot->restart_decoding,
+			 (uint32) (MyReplicationSlot->confirmed_flush >> 32),
+			 (uint32) MyReplicationSlot->confirmed_flush,
+			 (uint32) (now >> 32), (uint32) now);
+
+		CurrentResourceOwner = ResourceOwnerCreate(CurrentResourceOwner, "logical decoding");
+
+		/* invalidate non-timetravel entries */
+		InvalidateSystemCaches();
+
+		while ((startptr != InvalidXLogRecPtr && startptr < now) ||
+			   (ctx->reader->EndRecPtr && ctx->reader->EndRecPtr < now))
 		{
-			SpinLockRelease(&slot->mutex);
-			continue;
+			XLogRecord *record;
+			char	   *errm = NULL;
+
+			record = XLogReadRecord(ctx->reader, startptr, &errm);
+			if (errm)
+				elog(ERROR, "%s", errm);
+
+			startptr = InvalidXLogRecPtr;
+
+			/*
+			 * The {begin_txn,change,commit_txn}_wrapper callbacks above will
+			 * store the description into our tuplestore.
+			 */
+			if (record != NULL)
+				DecodeRecordIntoReorderBuffer(ctx, record);
 		}
-		else
-		{
-			xmin = slot->xmin;
-			active = slot->active;
-			database = slot->database;
-			last_req = slot->restart_decoding;
-			slot_name = pstrdup(NameStr(slot->name));
-			plugin = pstrdup(NameStr(slot->plugin));
-		}
-		SpinLockRelease(&slot->mutex);
 
-		memset(nulls, 0, sizeof(nulls));
+		/*
+		 * If everything went well, we can perform orderly cleanup, otherwise
+		 * memory context cleanup has to do all the chin-ups. Will call the
+		 * "cleanup_slot" callback.
+		 */
+		FreeDecodingContext(ctx);
+	}
+	PG_CATCH();
+	{
+		ReplicationSlotRelease();
 
-		snprintf(location, sizeof(location), "%X/%X",
-				 (uint32) (last_req >> 32), (uint32) last_req);
+		/*
+		 * clear timetravel entries: XXX allowed in aborted TXN?
+		 */
+		InvalidateSystemCaches();
 
-		values[0] = CStringGetTextDatum(slot_name);
-		values[1] = CStringGetTextDatum(plugin);
-		values[2] = database;
-		values[3] = BoolGetDatum(active);
-		values[4] = TransactionIdGetDatum(xmin);
-		values[5] = CStringGetTextDatum(location);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	rp = ctx->reader->EndRecPtr;
+	if (rp >= now)
+	{
+		elog(DEBUG1, "Reached endpoint (wanted: %X/%X, got: %X/%X)",
+			 (uint32) (now >> 32), (uint32) now,
+			 (uint32) (rp >> 32), (uint32) rp);
 	}
 
 	tuplestore_donestoring(tupstore);
 
+	CurrentResourceOwner = old_resowner;
+
+	/*
+	 * Next time, start where we left off. (Hunting things, the family
+	 * business..)
+	 */
+	if (ctx->reader->EndRecPtr != InvalidXLogRecPtr && confirm)
+		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+
+	ReplicationSlotRelease();
+	InvalidateSystemCaches();
+
 	return (Datum) 0;
+}
+
+Datum
+decoding_slot_get_changes(PG_FUNCTION_ARGS)
+{
+	Datum ret = decoding_slot_get_changes_guts(fcinfo, true);
+	return ret;
+}
+
+Datum
+decoding_slot_peek_changes(PG_FUNCTION_ARGS)
+{
+	Datum ret = decoding_slot_get_changes_guts(fcinfo, false);
+	return ret;
+}
+
+Datum
+decoding_slot_get_binary_changes(PG_FUNCTION_ARGS)
+{
+	Datum ret = decoding_slot_get_changes_guts(fcinfo, true);
+	return ret;
+}
+
+Datum
+decoding_slot_peek_binary_changes(PG_FUNCTION_ARGS)
+{
+	Datum ret = decoding_slot_get_changes_guts(fcinfo, false);
+	return ret;
+}
+
+Datum
+drop_replication_slot(PG_FUNCTION_ARGS)
+{
+	Name		name = PG_GETARG_NAME(0);
+
+	check_permissions();
+
+	CheckSlotRequirements();
+
+	ReplicationSlotDrop(NameStr(*name));
+
+	PG_RETURN_INT32(0);
 }

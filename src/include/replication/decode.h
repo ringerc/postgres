@@ -15,6 +15,6 @@
 #include "replication/logical.h"
 
 void DecodeRecordIntoReorderBuffer(LogicalDecodingContext *ctx,
-							  XLogRecordBuffer *buf);
+							  XLogRecord *record);
 
 #endif

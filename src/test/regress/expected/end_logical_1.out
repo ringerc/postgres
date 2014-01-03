@@ -1,7 +1,4 @@
-\copy (SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0')) TO '/tmp/testresult';
-ERROR:  function start_logical_replication(unknown, unknown, unknown, unknown) does not exist
-LINE 1: COPY  ( SELECT data FROM start_logical_replication ( 'regres...
-                                 ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-SELECT stop_logical_replication('regression_slot');
-ERROR:  logical decoding requires wal_level=logical
+\copy (SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0')) TO '/tmp/testresult';
+ERROR:  replication slot usage requires max_replication_slots > 0
+SELECT drop_replication_slot('regression_slot');
+ERROR:  replication slot usage requires max_replication_slots > 0

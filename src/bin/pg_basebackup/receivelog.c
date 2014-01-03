@@ -320,7 +320,7 @@ sendFeedback(PGconn *conn, XLogRecPtr blockpos, int64 now, bool replyRequested)
 	len += 1;
 	fe_sendint64(blockpos, &replybuf[len]);		/* write */
 	len += 8;
-	fe_sendint64(InvalidXLogRecPtr, &replybuf[len]);		/* flush */
+	fe_sendint64(blockpos, &replybuf[len]);		/* flush */
 	len += 8;
 	fe_sendint64(InvalidXLogRecPtr, &replybuf[len]);		/* apply */
 	len += 8;
@@ -410,6 +410,7 @@ ReceiveXlogStream(PGconn *conn, XLogRecPtr startpos, uint32 timeline,
 				  int standby_message_timeout, char *partial_suffix)
 {
 	char		query[128];
+	char		slot[128];
 	PGresult   *res;
 	XLogRecPtr	stoppos;
 
@@ -419,6 +420,11 @@ ReceiveXlogStream(PGconn *conn, XLogRecPtr startpos, uint32 timeline,
 	 */
 	if (!CheckServerVersionForStreaming(conn))
 		return false;
+
+	if (replication_slot != NULL)
+		sprintf(slot, "SLOT \"%s\"", replication_slot);
+	else
+		slot[0] = 0;
 
 	if (sysidentifier != NULL)
 	{
@@ -505,7 +511,8 @@ ReceiveXlogStream(PGconn *conn, XLogRecPtr startpos, uint32 timeline,
 			return true;
 
 		/* Initiate the replication stream at specified location */
-		snprintf(query, sizeof(query), "START_REPLICATION %X/%X TIMELINE %u",
+		snprintf(query, sizeof(query), "START_REPLICATION %s %X/%X TIMELINE %u",
+				 slot,
 				 (uint32) (startpos >> 32), (uint32) startpos,
 				 timeline);
 		res = PQexec(conn, query);

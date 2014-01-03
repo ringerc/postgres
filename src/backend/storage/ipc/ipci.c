@@ -27,7 +27,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
-#include "replication/logical.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
@@ -127,7 +127,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, ProcSignalShmemSize());
 		size = add_size(size, CheckpointerShmemSize());
 		size = add_size(size, AutoVacuumShmemSize());
-		size = add_size(size, LogicalDecodingShmemSize());
+		size = add_size(size, ReplicationSlotsShmemSize());
 		size = add_size(size, WalSndShmemSize());
 		size = add_size(size, WalRcvShmemSize());
 		size = add_size(size, BTreeShmemSize());
@@ -234,7 +234,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	ProcSignalShmemInit();
 	CheckpointerShmemInit();
 	AutoVacuumShmemInit();
-	LogicalDecodingShmemInit();
+	ReplicationSlotsShmemInit();
 	WalSndShmemInit();
 	WalRcvShmemInit();
 

@@ -36,9 +36,9 @@ static int		noloop = 0;
 static int		standby_message_timeout = 10 * 1000;		/* 10 sec = default */
 static const char *slot = NULL;
 static XLogRecPtr startpos = InvalidXLogRecPtr;
-static bool 	do_init_slot = false;
-static bool 	do_start_slot = false;
-static bool 	do_stop_slot = false;
+static bool		do_init_slot = false;
+static bool		do_start_slot = false;
+static bool		do_stop_slot = false;
 
 /* filled pairwise with option, value. value may be NULL */
 static char	  **options;
@@ -169,7 +169,7 @@ StreamLog(void)
 				slot);
 
 	/* Initiate the replication stream at specified location */
-	written = snprintf(query, sizeof(query), "START_LOGICAL_REPLICATION \"%s\" %X/%X",
+	written = snprintf(query, sizeof(query), "START_REPLICATION SLOT \"%s\" LOGICAL %X/%X",
 			 slot, (uint32) (startpos >> 32), (uint32) startpos);
 
 	/*
@@ -684,7 +684,7 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (!do_stop_slot && outfile == NULL)
+	if (do_start_slot && outfile == NULL)
 	{
 		fprintf(stderr, _("%s: no target file specified\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
@@ -774,7 +774,7 @@ main(int argc, char **argv)
 					_("%s: freeing replication slot \"%s\"\n"),
 					progname, slot);
 
-		snprintf(query, sizeof(query), "FREE_LOGICAL_REPLICATION \"%s\"",
+		snprintf(query, sizeof(query), "DROP_REPLICATION_SLOT SLOT \"%s\"",
 				 slot);
 		res = PQexec(conn, query);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -808,7 +808,7 @@ main(int argc, char **argv)
 					_("%s: initializing replication slot \"%s\"\n"),
 					progname, slot);
 
-		snprintf(query, sizeof(query), "INIT_LOGICAL_REPLICATION \"%s\" \"%s\"",
+		snprintf(query, sizeof(query), "CREATE_REPLICATION_SLOT SLOT \"%s\" LOGICAL \"%s\"",
 				 slot, plugin);
 
 		res = PQexec(conn, query);

@@ -15,7 +15,4 @@ extern int logical_read_local_xlog_page(XLogReaderState *state,
 							 XLogRecPtr targetPagePtr,
 							 int reqLen, XLogRecPtr targetRecPtr,
 							 char *cur_page, TimeLineID *pageTLI);
-
-extern Datum pg_stat_get_logical_decoding_slots(PG_FUNCTION_ARGS);
-
 #endif

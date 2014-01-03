@@ -6471,7 +6471,9 @@ StartupXLOG(void)
 	 * Startup logical state, needs to be setup now so we have proper data
 	 * during restore.
 	 */
-	StartupLogicalDecoding(checkPoint.redo);
+	StartupReplicationSlots(checkPoint.redo);
+	StartupReorderBuffer();
+
 
 	/*
 	 * Startup MultiXact.  We need to do this early for two reasons: one
@@ -8894,24 +8896,38 @@ CreateRestartPoint(int flags)
 
 /*
  * Retreat *logSegNo to the last segment that we need to retain because of
- * wal_keep_segments. This is calculated by subtracting wal_keep_segments
- * from the given xlog location, recptr.
+ * either wal_keep_segments or replication slots.
+ *
+ * This is calculated by subtracting wal_keep_segments from the given xlog
+ * location, recptr and by making sure that that result is below the
+ * requirement of replication slots.
  */
 static void
 KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 {
-	XLogSegNo	segno;
+	XLogSegNo	segno, slotSegNo;
 
-	if (wal_keep_segments == 0)
-		return;
+	/* compute limit for wal_keep_segments first */
+	if (wal_keep_segments > 0)
+	{
+		XLByteToSeg(recptr, segno);
 
-	XLByteToSeg(recptr, segno);
+		/* avoid underflow, don't go below 1 */
+		if (segno <= wal_keep_segments)
+			segno = 1;
+		else
+			segno = segno - wal_keep_segments;
+	}
 
-	/* avoid underflow, don't go below 1 */
-	if (segno <= wal_keep_segments)
-		segno = 1;
-	else
-		segno = segno - wal_keep_segments;
+	/* then check whether slots limit removal further */
+	if (max_replication_slots > 0 &&
+		ReplicationSlotCtl->oldest_lsn != InvalidXLogRecPtr)
+	{
+		XLByteToPrevSeg(ReplicationSlotCtl->oldest_lsn, slotSegNo);
+
+		if (slotSegNo < segno)
+			segno = slotSegNo;
+	}
 
 	/* don't delete WAL segments newer than the calculated segment */
 	if (segno < *logSegNo)

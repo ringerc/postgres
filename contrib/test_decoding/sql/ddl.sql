@@ -1,30 +1,31 @@
-CREATE EXTENSION test_logical_decoding;
+CREATE EXTENSION test_decoding;
 -- predictability
 SET synchronous_commit = on;
 
-SELECT 'init' FROM init_logical_replication('regression_slot', 'test_decoding');
+SELECT 'init' FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
 -- fail because of an already existing slot
-SELECT 'init' FROM init_logical_replication('regression_slot', 'test_decoding');
+SELECT 'init' FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
 
 -- fail twice because of an invalid parameter values
-SELECT 'init' FROM start_logical_replication('regression_slot', 'now', 'include-xids', 'frakbar');
-SELECT 'init' FROM start_logical_replication('regression_slot', 'now', 'nonexistant-option', 'frakbar');
-SELECT 'init' FROM start_logical_replication('regression_slot', 'now', 'include-xids', 'frakbar');
+SELECT 'init' FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', 'frakbar');
+SELECT 'init' FROM decoding_slot_get_changes('regression_slot', 'now', 'nonexistant-option', 'frakbar');
+SELECT 'init' FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', 'frakbar');
 
 
 -- succeed once
-SELECT stop_logical_replication('regression_slot');
+SELECT drop_replication_slot('regression_slot');
 -- fail
-SELECT stop_logical_replication('regression_slot');
+SELECT drop_replication_slot('regression_slot');
 
 
-SELECT 'init' FROM init_logical_replication('regression_slot', 'test_decoding');
+SELECT 'init' FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
 
 /* check whether status function reports us, only reproduceable columns */
-SELECT slot_name, plugin, active,
-    xmin::xid IS NOT NULL,
-    pg_xlog_location_diff(restart_decoding_lsn, '0/01000000') > 0
-FROM pg_stat_logical_decoding;
+SELECT slot_name, plugin, slottype, active,
+    NOT catalog_xmin::xid = 0 AS catalog_xmin_set,
+    data_xmin::xid = 0 AS data_xmin_not_set,
+    pg_xlog_location_diff(restart_decoding_lsn, '0/01000000') > 0 AS some_wal
+FROM pg_replication_slots;
 
 /*
  * Check that changes are handled correctly when interleaved with ddl
@@ -58,11 +59,11 @@ ALTER TABLE replication_example RENAME COLUMN text TO somenum;
 INSERT INTO replication_example(somedata, somenum) VALUES (4, 1);
 
 -- collect all changes
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 ALTER TABLE replication_example ALTER COLUMN somenum TYPE int4 USING (somenum::int4);
 -- throw away changes, they contain oids
-SELECT count(data) FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT count(data) FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 INSERT INTO replication_example(somedata, somenum) VALUES (5, 1);
 
@@ -76,21 +77,21 @@ INSERT INTO replication_example(somedata, somenum, zaphod1) VALUES (6, 4, 2);
 COMMIT;
 
 -- show changes
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 -- hide changes bc of oid visible in full table rewrites
 CREATE TABLE tr_unique(id2 serial unique NOT NULL, data int);
 INSERT INTO tr_unique(data) VALUES(10);
 ALTER TABLE tr_unique RENAME TO tr_pkey;
 ALTER TABLE tr_pkey ADD COLUMN id serial primary key;
-SELECT count(data) FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT count(data) FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 INSERT INTO tr_pkey(data) VALUES(1);
 --show deletion with primary key
 DELETE FROM tr_pkey;
 
 /* display results */
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 /*
  * check that disk spooling works
@@ -104,7 +105,7 @@ COMMIT;
 
 /* display results, but hide most of the output */
 SELECT count(*), min(data), max(data)
-FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0')
+FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0')
 GROUP BY substring(data, 1, 24)
 ORDER BY 1;
 
@@ -132,7 +133,7 @@ INSERT INTO tr_sub(path) VALUES ('1-top-2-#1');
 RELEASE SAVEPOINT b;
 COMMIT;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 -- check that we handle xlog assignments correctly
 BEGIN;
@@ -161,7 +162,7 @@ RELEASE SAVEPOINT subtop;
 INSERT INTO tr_sub(path) VALUES ('2-top-#1');
 COMMIT;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 -- make sure rollbacked subtransactions aren't decoded
 BEGIN;
@@ -174,7 +175,7 @@ ROLLBACK TO SAVEPOINT b;
 INSERT INTO tr_sub(path) VALUES ('3-top-2-#2');
 COMMIT;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 -- test whether a known, but not yet logged toplevel xact, followed by a
 -- subxact commit is handled correctly
@@ -185,7 +186,7 @@ INSERT INTO tr_sub(path) VALUES ('4-top-1-#1');
 RELEASE SAVEPOINT a;
 COMMIT;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 
 /*
@@ -225,7 +226,7 @@ ALTER TABLE replication_metadata SET (user_catalog_table = false);
 INSERT INTO replication_metadata(relation, options)
 VALUES ('zaphod', NULL);
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 /*
  * check whether we handle updates/deletes correct with & without a pkey
@@ -300,7 +301,7 @@ UPDATE toasttable
     SET toasted_col1 = (SELECT string_agg(g.i::text, '') FROM generate_series(1, 2000) g(i))
 WHERE id = 1;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 INSERT INTO toasttable(toasted_col1) SELECT string_agg(g.i::text, '') FROM generate_series(1, 2000) g(i);
 
@@ -312,11 +313,13 @@ WHERE id = 1;
 -- make sure we decode correctly even if the toast table is gone
 DROP TABLE toasttable;
 
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
 
 -- done, free logical replication slot
-SELECT data FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
-SELECT stop_logical_replication('regression_slot');
+SELECT data FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+SELECT drop_replication_slot('regression_slot');
 
 /* check that we aren't visible anymore now */
 SELECT * FROM pg_stat_logical_decoding;
+
+DROP EXTENSION test_decoding;

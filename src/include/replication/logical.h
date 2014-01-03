@@ -9,121 +9,37 @@
 #ifndef LOGICAL_H
 #define LOGICAL_H
 
+#include "replication/slot.h"
+
 #include "access/xlog.h"
 #include "access/xlogreader.h"
 #include "replication/output_plugin.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 
-/*
- * Shared memory state of a single logical decoding slot
- */
-typedef struct LogicalDecodingSlot
-{
-	/* lock, on same cacheline as effective_xmin */
-	slock_t		mutex;
-
-	/* on-disk xmin, updated first */
-	TransactionId xmin;
-
-	/* in-memory xmin, updated after syncing to disk */
-	TransactionId effective_xmin;
-
-	/* is this slot defined */
-	bool		in_use;
-
-	/* is somebody streaming out changes for this slot */
-	bool		active;
-
-	/* ----
-	 * If we shutdown, crash, whatever where do we have to restart decoding
-	 * from to
-	 * a) find a valid & ready snapshot
-	 * b) the complete content for all in-progress xacts
-	 * ----
-	 */
-	XLogRecPtr	restart_decoding;
-
-	/*
-	 * Last location we know the client has confirmed to have safely received
-	 * data to. No earlier data can be decoded after a restart/crash.
-	 */
-	XLogRecPtr	confirmed_flush;
-
-	/* ----
-	 * When the client has confirmed flushes >= candidate_xmin_after we can
-	 * a) advance the pegged xmin
-	 * b) advance restart_decoding_from so we have to read/keep less WAL
-	 * ----
-	 */
-	TransactionId candidate_xmin;
-	XLogRecPtr	candidate_xmin_lsn;
-	XLogRecPtr	candidate_restart_valid;
-	XLogRecPtr	candidate_restart_decoding;
-
-	/* database the slot is active on */
-	Oid			database;
-
-	/* slot identifier */
-	NameData	name;
-
-	/* plugin name */
-	NameData	plugin;
-} LogicalDecodingSlot;
-
-/*
- * Shared memory control area for all of logical decoding
- */
-typedef struct LogicalDecodingCtlData
-{
-	/*
-	 * Xmin across all logical slots.
-	 *
-	 * Protected by ProcArrayLock.
-	 */
-	TransactionId xmin;
-
-	LogicalDecodingSlot logical_slots[FLEXIBLE_ARRAY_MEMBER];
-} LogicalDecodingCtlData;
-
-/*
- * Pointers to shared memory
- */
-extern LogicalDecodingCtlData *LogicalDecodingCtl;
-extern LogicalDecodingSlot *MyLogicalDecodingSlot;
 
 struct LogicalDecodingContext;
+
+
 
 typedef void (*LogicalOutputPluginWriterWrite) (
 										   struct LogicalDecodingContext *lr,
 															XLogRecPtr Ptr,
-															TransactionId xid
+															TransactionId xid,
+															bool last_write
 );
 
 typedef LogicalOutputPluginWriterWrite LogicalOutputPluginWriterPrepareWrite;
 
-/*
- * Output plugin callbacks
- */
-typedef struct OutputPluginCallbacks
-{
-	LogicalDecodeInitCB init_cb;
-	LogicalDecodeBeginCB begin_cb;
-	LogicalDecodeChangeCB change_cb;
-	LogicalDecodeCommitCB commit_cb;
-	LogicalDecodeCleanupCB cleanup_cb;
-} OutputPluginCallbacks;
-
 typedef struct LogicalDecodingContext
 {
+	/* infrastructure pieces */
 	struct XLogReaderState *reader;
-	struct LogicalDecodingSlot *slot;
+	struct ReplicationSlot *slot;
 	struct ReorderBuffer *reorder;
 	struct SnapBuild *snapshot_builder;
 
 	struct OutputPluginCallbacks callbacks;
-
-	bool		stop_after_consistent;
 
 	/*
 	 * User specified options
@@ -142,11 +58,6 @@ typedef struct LogicalDecodingContext
 	StringInfo	out;
 
 	/*
-	 * Private data pointer for the creator of the logical decoding context.
-	 */
-	void	   *owner_private;
-
-	/*
 	 * Private data pointer of the output plugin.
 	 */
 	void	   *output_plugin_private;
@@ -155,21 +66,18 @@ typedef struct LogicalDecodingContext
 	 * Private data pointer for the data writer.
 	 */
 	void	   *output_writer_private;
+
+	/*
+	 * State for writing output.
+	 */
+	bool accept_writes;
+	bool prepared_write;
+	XLogRecPtr write_location;
+	TransactionId write_xid;
 } LogicalDecodingContext;
 
-/* GUCs */
-extern PGDLLIMPORT int max_logical_slots;
-
-extern Size LogicalDecodingShmemSize(void);
-extern void LogicalDecodingShmemInit(void);
-
-extern void LogicalDecodingAcquireFreeSlot(const char *name, const char *plugin);
-extern void LogicalDecodingReleaseSlot(void);
-extern void LogicalDecodingReAcquireSlot(const char *name);
-extern void LogicalDecodingFreeSlot(const char *name);
 extern bool LogicalDecodingCountDBSlots(Oid dboid, int *nslots, int *nactive);
 
-extern void ComputeLogicalXmin(void);
 extern XLogRecPtr ComputeLogicalRestartLSN(void);
 
 /* change logical xmin */
@@ -182,17 +90,15 @@ extern void LogicalConfirmReceivedLocation(XLogRecPtr lsn);
 
 extern void CheckLogicalDecodingRequirements(void);
 
-extern void StartupLogicalDecoding(XLogRecPtr checkPointRedo);
-
-extern LogicalDecodingContext *CreateLogicalDecodingContext(
-							 LogicalDecodingSlot *slot,
-							 bool is_init,
+extern LogicalDecodingContext *CreateDecodingContext(
+							 bool is_init, char *plugin,
 							 XLogRecPtr	start_lsn,
 							 List *output_plugin_options,
 							 XLogPageReadCB read_page,
 						 LogicalOutputPluginWriterPrepareWrite prepare_write,
 							 LogicalOutputPluginWriterWrite do_write);
-extern bool LogicalDecodingContextReady(LogicalDecodingContext *ctx);
-extern void FreeLogicalDecodingContext(LogicalDecodingContext *ctx);
+extern void DecodingContextFindStartpoint(LogicalDecodingContext *ctx);
+extern bool DecodingContextReady(LogicalDecodingContext *ctx);
+extern void FreeDecodingContext(LogicalDecodingContext *ctx);
 
 #endif

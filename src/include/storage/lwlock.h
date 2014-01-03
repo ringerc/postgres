@@ -82,7 +82,7 @@ typedef enum LWLockId
 	BackgroundWorkerLock,
 	DynamicSharedMemoryControlLock,
 	AutoFileLock,
-	LogicalDecodingSlotCtlLock,
+	ReplicationSlotCtlLock,
 	/* Individual lock IDs end here */
 	FirstBufMappingLock,
 	FirstLockMgrLock = FirstBufMappingLock + NUM_BUFFER_PARTITIONS,

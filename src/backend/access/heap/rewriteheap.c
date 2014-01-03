@@ -117,6 +117,7 @@
 #include "catalog/catalog.h"
 
 #include "replication/logical.h"
+#include "replication/slot.h"
 
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
@@ -810,11 +811,11 @@ logical_begin_heap_rewrite(RewriteState state)
 	if (!state->rs_logical_rewrite)
 		return;
 
-	Assert(LogicalDecodingCtl != NULL);
+	Assert(ReplicationSlotCtl != NULL);
 
 	/* we assume reading this is atomic */
 	logical_xmin =
-		((volatile LogicalDecodingCtlData*) LogicalDecodingCtl)->xmin;
+		((volatile ReplicationSlotCtlData*) ReplicationSlotCtl)->catalog_xmin;
 
 	/*
 	 * If there are no logical slots in progress we don't need to do anything,

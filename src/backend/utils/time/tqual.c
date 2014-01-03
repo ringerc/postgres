@@ -1592,7 +1592,7 @@ HeapTupleSatisfiesMVCCDuringDecoding(HeapTuple htup, Snapshot snapshot,
 	Assert(htup->t_tableOid != InvalidOid);
 
 	/* inserting transaction aborted */
-	if (tuple->t_infomask & HEAP_XMIN_INVALID)
+	if (HeapTupleHeaderXminInvalid(tuple))
 	{
 		Assert(!TransactionIdDidCommit(xmin));
 		return false;
@@ -1624,11 +1624,11 @@ HeapTupleSatisfiesMVCCDuringDecoding(HeapTuple htup, Snapshot snapshot,
 	/* committed before our xmin horizon. Do a normal visibility check. */
 	else if (TransactionIdPrecedes(xmin, snapshot->xmin))
 	{
-		Assert(!(tuple->t_infomask & HEAP_XMIN_COMMITTED &&
+		Assert(!(HeapTupleHeaderXminCommitted(tuple) &&
 				 !TransactionIdDidCommit(xmin)));
 
 		/* check for hint bit first, consult clog afterwards */
-		if (!(tuple->t_infomask & HEAP_XMIN_COMMITTED) &&
+		if (!HeapTupleHeaderXminCommitted(tuple) &&
 			!TransactionIdDidCommit(xmin))
 			return false;
 	}

@@ -1,8 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * reorderbuffer.c
- *
- * PostgreSQL logical replay buffer management
+ *	  PostgreSQL logical replay buffer management
  *
  *
  * Copyright (c) 2012-2013, PostgreSQL Global Development Group
@@ -62,9 +61,10 @@
 
 #include "lib/binaryheap.h"
 
-#include "replication/reorderbuffer.h"
-#include "replication/snapbuild.h" /* just for SnapBuildSnapDecRefcount */
 #include "replication/logical.h"
+#include "replication/reorderbuffer.h"
+#include "replication/slot.h"
+#include "replication/snapbuild.h" /* just for SnapBuildSnapDecRefcount */
 
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
@@ -895,7 +895,7 @@ ReorderBufferRestoreCleanup(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		XLogSegNoOffsetToRecPtr(cur, 0, recptr);
 
 		sprintf(path, "pg_llog/%s/xid-%u-lsn-%X-%X.snap",
-				NameStr(MyLogicalDecodingSlot->name), txn->xid,
+				NameStr(MyReplicationSlot->name), txn->xid,
 				(uint32) (recptr >> 32), (uint32) recptr);
 		if (unlink(path) != 0 && errno != ENOENT)
 			ereport(ERROR,
@@ -1966,7 +1966,7 @@ ReorderBufferSerializeTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 			 * so each LSN only maps to a specific WAL record.
 			 */
 			sprintf(path, "pg_llog/%s/xid-%u-lsn-%X-%X.snap",
-					NameStr(MyLogicalDecodingSlot->name), txn->xid,
+					NameStr(MyReplicationSlot->name), txn->xid,
 					(uint32) (recptr >> 32), (uint32) recptr);
 
 			/* open segment, create it if necessary */
@@ -2051,7 +2051,7 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			 * so each LSN only maps to a specific WAL record.
 			 */
 			sprintf(path, "pg_llog/%s/xid-%u-lsn-%X-%X.snap",
-					NameStr(MyLogicalDecodingSlot->name), txn->xid,
+					NameStr(MyReplicationSlot->name), txn->xid,
 					(uint32) (recptr >> 32), (uint32) recptr);
 
 			*fd = OpenTransientFile(path, O_RDONLY | PG_BINARY, 0);
@@ -2218,7 +2218,7 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
  * recreated when the respective slots are reused.
  */
 void
-ReorderBufferStartup(void)
+StartupReorderBuffer(void)
 {
 	DIR		   *logical_dir;
 	struct dirent *logical_de;
@@ -2252,6 +2252,7 @@ ReorderBufferStartup(void)
 				strcmp(spill_de->d_name, "..") == 0)
 				continue;
 
+			/* only look at names that can be ours */
 			if (strncmp(spill_de->d_name, "xid", 3) == 0)
 			{
 				sprintf(path, "pg_llog/%s/%s", logical_de->d_name,
@@ -2263,7 +2264,6 @@ ReorderBufferStartup(void)
 						  errmsg("could not remove xid data file \"%s\": %m",
 								 path)));
 			}
-			/* XXX: WARN? */
 		}
 		FreeDir(spill_dir);
 	}

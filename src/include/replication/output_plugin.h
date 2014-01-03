@@ -12,6 +12,13 @@
 #include "replication/reorderbuffer.h"
 
 struct LogicalDecodingContext;
+struct OutputPluginCallbacks;
+
+/*
+ * Type of the shared library symbol _PG_output_plugin_init that is looked up
+ * when loading an output plugin shared library.
+ */
+typedef void (*LogicalOutputPluginInit)(struct OutputPluginCallbacks *cb);
 
 /*
  * Callback that gets called in a user-defined plugin. ctx->private_data can
@@ -19,18 +26,15 @@ struct LogicalDecodingContext;
  *
  * "is_init" will be set to "true" if the decoding slot just got defined. When
  * the same slot is used from there one, it will be "false".
- *
- * Gets looked up via the library symbol pg_decode_init.
  */
-typedef void (*LogicalDecodeInitCB) (
+typedef void (*LogicalDecodeStartupCB) (
 										  struct LogicalDecodingContext *ctx,
 												 bool is_init
 );
 
 /*
- * Callback called for every BEGIN of a successful transaction.
- *
- * Gets looked up via the library symbol pg_decode_begin_txn.
+ * Callback called for every (explicit or implicit) BEGIN of a successful
+ * transaction.
  */
 typedef void (*LogicalDecodeBeginCB) (
 											 struct LogicalDecodingContext *,
@@ -38,8 +42,6 @@ typedef void (*LogicalDecodeBeginCB) (
 
 /*
  * Callback for every individual change in a successful transaction.
- *
- * Gets looked up via the library symbol pg_decode_change.
  */
 typedef void (*LogicalDecodeChangeCB) (
 											 struct LogicalDecodingContext *,
@@ -49,9 +51,7 @@ typedef void (*LogicalDecodeChangeCB) (
 );
 
 /*
- * Called for every COMMIT of a successful transaction.
- *
- * Gets looked up via the library symbol pg_decode_commit_txn.
+ * Called for every (explicit or implicit) COMMIT of a successful transaction.
  */
 typedef void (*LogicalDecodeCommitCB) (
 											 struct LogicalDecodingContext *,
@@ -59,12 +59,25 @@ typedef void (*LogicalDecodeCommitCB) (
 												   XLogRecPtr commit_lsn);
 
 /*
- * Called to cleanup the state of an output plugin.
- *
- * Gets looked up via the library symbol pg_decode_cleanup.
+ * Called to shutdown an output plugin.
  */
-typedef void (*LogicalDecodeCleanupCB) (
+typedef void (*LogicalDecodeShutdownCB) (
 											  struct LogicalDecodingContext *
 );
+
+/*
+ * Output plugin callbacks
+ */
+typedef struct OutputPluginCallbacks
+{
+	LogicalDecodeStartupCB startup_cb;
+	LogicalDecodeBeginCB begin_cb;
+	LogicalDecodeChangeCB change_cb;
+	LogicalDecodeCommitCB commit_cb;
+	LogicalDecodeShutdownCB shutdown_cb;
+} OutputPluginCallbacks;
+
+void OutputPluginPrepareWrite(struct LogicalDecodingContext *ctx, bool last_write);
+void OutputPluginWrite(struct LogicalDecodingContext *ctx, bool last_write);
 
 #endif   /* OUTPUT_PLUGIN_H */

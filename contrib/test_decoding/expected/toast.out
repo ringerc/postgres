@@ -1,8 +1,9 @@
+CREATE EXTENSION test_decoding;
 -- predictability
 SET synchronous_commit = on;
 DROP TABLE IF EXISTS xpto;
 NOTICE:  table "xpto" does not exist, skipping
-SELECT 'init' FROM init_logical_replication('regression_slot', 'test_decoding');
+SELECT 'init' FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
  ?column? 
 ----------
  init
@@ -45,7 +46,7 @@ UPDATE toasted_key SET toasted_col2 = toasted_col1;
 -- test update of a toasted key, changing it
 UPDATE toasted_key SET toasted_key = toasted_key || '1';
 DELETE FROM toasted_key;
-SELECT substr(data, 1, 200) FROM start_logical_replication('regression_slot', 'now', 'include-xids', '0');
+SELECT substr(data, 1, 200) FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
                                                                                                   substr                                                                                                  
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  BEGIN
@@ -85,9 +86,10 @@ SELECT substr(data, 1, 200) FROM start_logical_replication('regression_slot', 'n
  COMMIT
 (35 rows)
 
-SELECT stop_logical_replication('regression_slot');
- stop_logical_replication 
---------------------------
-                        0
+SELECT drop_replication_slot('regression_slot');
+ drop_replication_slot 
+-----------------------
+                     0
 (1 row)
 
+DROP EXTENSION test_decoding;

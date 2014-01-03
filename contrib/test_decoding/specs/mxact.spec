@@ -1,22 +1,22 @@
 setup
 {
     DROP TABLE IF EXISTS do_write;
-    DROP EXTENSION IF EXISTS test_logical_decoding;
-    CREATE EXTENSION test_logical_decoding;
+    DROP EXTENSION IF EXISTS test_decoding;
+    CREATE EXTENSION test_decoding;
     CREATE TABLE do_write(id serial primary key);
 }
 
 teardown
 {
     DROP TABLE IF EXISTS do_write;
-    DROP EXTENSION test_logical_decoding;
-    SELECT 'stop' FROM stop_logical_replication('isolation_slot');
+    DROP EXTENSION test_decoding;
+    SELECT 'stop' FROM drop_replication_slot('isolation_slot');
 }
 
 session "s0"
 setup { SET synchronous_commit=on; }
-step "s0init" {SELECT 'init' FROM init_logical_replication('isolation_slot', 'test_decoding');}
-step "s0start" {SELECT data FROM start_logical_replication('isolation_slot', 'now', 'include-xids', 'false');}
+step "s0init" {SELECT 'init' FROM create_decoding_replication_slot('isolation_slot', 'test_decoding');}
+step "s0start" {SELECT data FROM decoding_slot_get_changes('isolation_slot', 'now', 'include-xids', 'false');}
 step "s0alter" {ALTER TABLE do_write ADD column ts timestamptz; }
 step "s0w" { INSERT INTO do_write DEFAULT VALUES; }
 

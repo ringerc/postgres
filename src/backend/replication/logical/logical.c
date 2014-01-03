@@ -2,7 +2,7 @@
  *
  * logical.c
  *
- *	   Logical decoding shared memory management
+ *	   Logical decoding infrastructure
  *
  *
  * Copyright (c) 2012-2013, PostgreSQL Global Development Group
@@ -17,14 +17,16 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include "access/transam.h"
-
 #include "fmgr.h"
 #include "miscadmin.h"
 
+#include "access/transam.h"
+
+#include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
+
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -32,120 +34,6 @@
 
 #include "utils/memutils.h"
 #include "utils/syscache.h"
-
-/*
- * logical decoding on-disk data structures.
- */
-typedef struct LogicalDecodingSlotOnDisk
-{
-	/* first part of this struct needs to be version independent */
-
-	/* data not covered by checksum */
-	uint32		magic;
-	pg_crc32	checksum;
-
-	/* data covered by checksum */
-	uint32		version;
-	uint32		length;
-
-	/* data with potentially evolving format */
-	LogicalDecodingSlot slot;
-} LogicalDecodingSlotOnDisk;
-
-/* size of the part of the slot that is version independent */
-#define LogicalDecodingSlotOnDiskConstantSize \
-	offsetof(LogicalDecodingSlotOnDisk, slot)
-/* size of the slots that is not version indepenent */
-#define LogicalDecodingSlotOnDiskDynamicSize \
-	sizeof(LogicalDecodingSlotOnDisk) - LogicalDecodingSlotOnDiskConstantSize
-
-#define LOGICAL_MAGIC	0x1051CA1		/* format identifier */
-#define LOGICAL_VERSION	1				/* version for new files */
-
-/* Control array for logical decoding */
-LogicalDecodingCtlData *LogicalDecodingCtl = NULL;
-
-/* My slot for logical rep in the shared memory array */
-LogicalDecodingSlot *MyLogicalDecodingSlot = NULL;
-
-/* user settable parameters */
-int			max_logical_slots = 0;		/* the maximum number of logical slots */
-
-static void LogicalSlotKill(int code, Datum arg);
-
-/* persistency functions */
-static void RestoreLogicalSlot(const char *name);
-static void CreateLogicalSlot(LogicalDecodingSlot *slot);
-static void SaveLogicalSlot(LogicalDecodingSlot *slot);
-static void SaveLogicalSlotInternal(LogicalDecodingSlot *slot, const char *path);
-static void DeleteLogicalSlot(LogicalDecodingSlot *slot);
-
-
-/* Report shared-memory space needed by LogicalDecodingShmemInit */
-Size
-LogicalDecodingShmemSize(void)
-{
-	Size		size = 0;
-
-	if (max_logical_slots == 0)
-		return size;
-
-	size = offsetof(LogicalDecodingCtlData, logical_slots);
-	size = add_size(size,
-					mul_size(max_logical_slots, sizeof(LogicalDecodingSlot)));
-
-	return size;
-}
-
-/* Allocate and initialize walsender-related shared memory */
-void
-LogicalDecodingShmemInit(void)
-{
-	bool		found;
-
-	if (max_logical_slots == 0)
-		return;
-
-	LogicalDecodingCtl = (LogicalDecodingCtlData *)
-		ShmemInitStruct("Logical Decoding Ctl", LogicalDecodingShmemSize(),
-						&found);
-
-	if (!found)
-	{
-		int			i;
-
-		/* First time through, so initialize */
-		MemSet(LogicalDecodingCtl, 0, LogicalDecodingShmemSize());
-
-		LogicalDecodingCtl->xmin = InvalidTransactionId;
-
-		for (i = 0; i < max_logical_slots; i++)
-		{
-			LogicalDecodingSlot *slot =
-			&LogicalDecodingCtl->logical_slots[i];
-
-			slot->xmin = InvalidTransactionId;
-			slot->effective_xmin = InvalidTransactionId;
-			SpinLockInit(&slot->mutex);
-		}
-	}
-}
-
-/*
- * on_shmem_exit handler marking the current slot as inactive so it
- * can be reused after we've exited.
- */
-static void
-LogicalSlotKill(int code, Datum arg)
-{
-	/* LOCK? */
-	if (MyLogicalDecodingSlot && MyLogicalDecodingSlot->active)
-	{
-		MyLogicalDecodingSlot->active = false;
-		MyPgXact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
-	}
-	MyLogicalDecodingSlot = NULL;
-}
 
 /*
  * Set the xmin required for decoding snapshots for the specific decoding
@@ -156,15 +44,15 @@ IncreaseLogicalXminForSlot(XLogRecPtr lsn, TransactionId xmin)
 {
 	bool	updated_xmin = false;
 
-	Assert(MyLogicalDecodingSlot != NULL);
+	Assert(MyReplicationSlot != NULL);
 
-	SpinLockAcquire(&MyLogicalDecodingSlot->mutex);
+	SpinLockAcquire(&MyReplicationSlot->mutex);
 
 	/*
 	 * don't overwrite if we already have a newer xmin. This can
 	 * happen if we restart decoding in a slot.
 	 */
-	if (TransactionIdPrecedesOrEquals(xmin, MyLogicalDecodingSlot->xmin))
+	if (TransactionIdPrecedesOrEquals(xmin, MyReplicationSlot->catalog_xmin))
 	{
 	}
 	/*
@@ -172,10 +60,10 @@ IncreaseLogicalXminForSlot(XLogRecPtr lsn, TransactionId xmin)
 	 * can mark this as accepted. This can happen if we restart
 	 * decoding in a slot.
 	 */
-	else if (lsn <= MyLogicalDecodingSlot->confirmed_flush)
+	else if (lsn <= MyReplicationSlot->confirmed_flush)
 	{
-		MyLogicalDecodingSlot->candidate_xmin = xmin;
-		MyLogicalDecodingSlot->candidate_xmin_lsn = lsn;
+		MyReplicationSlot->candidate_catalog_xmin = xmin;
+		MyReplicationSlot->candidate_xmin_lsn = lsn;
 
 		/* our candidate can directly be used */
 		updated_xmin = true;
@@ -184,18 +72,18 @@ IncreaseLogicalXminForSlot(XLogRecPtr lsn, TransactionId xmin)
 	 * Only increase if the previous values have been applied, otherwise we
 	 * might never end up updating if the receiver acks too slowly.
 	 */
-	else if (MyLogicalDecodingSlot->candidate_xmin_lsn == InvalidXLogRecPtr)
+	else if (MyReplicationSlot->candidate_xmin_lsn == InvalidXLogRecPtr)
 	{
-		MyLogicalDecodingSlot->candidate_xmin = xmin;
-		MyLogicalDecodingSlot->candidate_xmin_lsn = lsn;
+		MyReplicationSlot->candidate_catalog_xmin = xmin;
+		MyReplicationSlot->candidate_xmin_lsn = lsn;
 		elog(DEBUG1, "got new xmin %u at %X/%X", xmin,
 			 (uint32) (lsn >> 32), (uint32) lsn);
 	}
-	SpinLockRelease(&MyLogicalDecodingSlot->mutex);
+	SpinLockRelease(&MyReplicationSlot->mutex);
 
 	/* candidate already valid with the current flush position, apply */
 	if (updated_xmin)
-		LogicalConfirmReceivedLocation(MyLogicalDecodingSlot->confirmed_flush);
+		LogicalConfirmReceivedLocation(MyReplicationSlot->confirmed_flush);
 }
 
 /*
@@ -208,24 +96,24 @@ IncreaseRestartDecodingForSlot(XLogRecPtr current_lsn, XLogRecPtr restart_lsn)
 {
 	bool	updated_lsn = false;
 
-	Assert(MyLogicalDecodingSlot != NULL);
+	Assert(MyReplicationSlot != NULL);
 	Assert(restart_lsn != InvalidXLogRecPtr);
 	Assert(current_lsn != InvalidXLogRecPtr);
 
-	SpinLockAcquire(&MyLogicalDecodingSlot->mutex);
+	SpinLockAcquire(&MyReplicationSlot->mutex);
 
 	/* don't overwrite if have a newer restart lsn*/
-	if (restart_lsn <= MyLogicalDecodingSlot->restart_decoding)
+	if (restart_lsn <= MyReplicationSlot->restart_decoding)
 	{
 	}
 	/*
 	 * We might have already flushed far enough to directly accept this lsn, in
 	 * this case there is no need to check for existing candidate LSNs
 	 */
-	else if (current_lsn <= MyLogicalDecodingSlot->confirmed_flush)
+	else if (current_lsn <= MyReplicationSlot->confirmed_flush)
 	{
-		MyLogicalDecodingSlot->candidate_restart_valid = current_lsn;
-		MyLogicalDecodingSlot->candidate_restart_decoding = restart_lsn;
+		MyReplicationSlot->candidate_restart_valid = current_lsn;
+		MyReplicationSlot->candidate_restart_decoding = restart_lsn;
 
 		/* our candidate can directly be used */
 		updated_lsn = true;
@@ -235,10 +123,10 @@ IncreaseRestartDecodingForSlot(XLogRecPtr current_lsn, XLogRecPtr restart_lsn)
 	 * might never end up updating if the receiver acks too slowly. A missed
 	 * value here will just cause some extra effort after reconnecting.
 	 */
-	if (MyLogicalDecodingSlot->candidate_restart_valid == InvalidXLogRecPtr)
+	if (MyReplicationSlot->candidate_restart_valid == InvalidXLogRecPtr)
 	{
-		MyLogicalDecodingSlot->candidate_restart_valid = current_lsn;
-		MyLogicalDecodingSlot->candidate_restart_decoding = restart_lsn;
+		MyReplicationSlot->candidate_restart_valid = current_lsn;
+		MyReplicationSlot->candidate_restart_decoding = restart_lsn;
 
 		elog(DEBUG1, "got new restart lsn %X/%X at %X/%X",
 			 (uint32) (restart_lsn >> 32), (uint32) restart_lsn,
@@ -249,19 +137,19 @@ IncreaseRestartDecodingForSlot(XLogRecPtr current_lsn, XLogRecPtr restart_lsn)
 		elog(DEBUG1, "failed to increase restart lsn: proposed %X/%X, after %X/%X, current candidate %X/%X, current after %X/%X, flushed up to %X/%X",
 			 (uint32) (restart_lsn >> 32), (uint32) restart_lsn,
 			 (uint32) (current_lsn >> 32), (uint32) current_lsn,
-			 (uint32) (MyLogicalDecodingSlot->candidate_restart_decoding >> 32),
-			 (uint32) MyLogicalDecodingSlot->candidate_restart_decoding,
-			 (uint32) (MyLogicalDecodingSlot->candidate_restart_valid >> 32),
-			 (uint32) MyLogicalDecodingSlot->candidate_restart_valid,
-			 (uint32) (MyLogicalDecodingSlot->confirmed_flush >> 32),
-			 (uint32) MyLogicalDecodingSlot->confirmed_flush
+			 (uint32) (MyReplicationSlot->candidate_restart_decoding >> 32),
+			 (uint32) MyReplicationSlot->candidate_restart_decoding,
+			 (uint32) (MyReplicationSlot->candidate_restart_valid >> 32),
+			 (uint32) MyReplicationSlot->candidate_restart_valid,
+			 (uint32) (MyReplicationSlot->confirmed_flush >> 32),
+			 (uint32) MyReplicationSlot->confirmed_flush
 			);
 	}
-	SpinLockRelease(&MyLogicalDecodingSlot->mutex);
+	SpinLockRelease(&MyReplicationSlot->mutex);
 
 	/* candidates are already valid with the current flush position, apply */
 	if (updated_lsn)
-		LogicalConfirmReceivedLocation(MyLogicalDecodingSlot->confirmed_flush);
+		LogicalConfirmReceivedLocation(MyReplicationSlot->confirmed_flush);
 }
 
 void
@@ -270,14 +158,14 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 	Assert(lsn != InvalidXLogRecPtr);
 
 	/* Do an unlocked check for candidate_lsn first. */
-	if (MyLogicalDecodingSlot->candidate_xmin_lsn != InvalidXLogRecPtr ||
-		MyLogicalDecodingSlot->candidate_restart_valid != InvalidXLogRecPtr)
+	if (MyReplicationSlot->candidate_xmin_lsn != InvalidXLogRecPtr ||
+		MyReplicationSlot->candidate_restart_valid != InvalidXLogRecPtr)
 	{
 		bool		updated_xmin = false;
 		bool		updated_restart = false;
 
 		/* use volatile pointer to prevent code rearrangement */
-		volatile LogicalDecodingSlot *slot = MyLogicalDecodingSlot;
+		volatile ReplicationSlot *slot = MyReplicationSlot;
 
 		SpinLockAcquire(&slot->mutex);
 
@@ -296,11 +184,11 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 			 * ->effective_xmin once the new state is fsynced to disk. After a
 			 * crash ->effective_xmin is set to ->xmin.
 			 */
-			if (TransactionIdIsValid(slot->candidate_xmin) &&
-				slot->xmin != slot->candidate_xmin)
+			if (TransactionIdIsValid(slot->candidate_catalog_xmin) &&
+				slot->catalog_xmin != slot->candidate_catalog_xmin)
 			{
-				slot->xmin = slot->candidate_xmin;
-				slot->candidate_xmin = InvalidTransactionId;
+				slot->catalog_xmin = slot->candidate_catalog_xmin;
+				slot->candidate_catalog_xmin = InvalidTransactionId;
 				slot->candidate_xmin_lsn = InvalidXLogRecPtr;
 				updated_xmin = true;
 			}
@@ -323,7 +211,7 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 		if (updated_xmin || updated_restart)
 		{
 			/* cast away volatile, thats ok. */
-			SaveLogicalSlot((LogicalDecodingSlot *) slot);
+			ReplicationSlotSave();
 			elog(DEBUG1, "updated xmin: %u restart: %u", updated_xmin, updated_restart);
 		}
 		/*
@@ -333,56 +221,20 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 		if (updated_xmin)
 		{
 			SpinLockAcquire(&slot->mutex);
-			slot->effective_xmin = slot->xmin;
+			slot->effective_catalog_xmin = slot->catalog_xmin;
 			SpinLockRelease(&slot->mutex);
 
-			ComputeLogicalXmin();
+			ReplicationSlotsComputeRequiredXmin();
 		}
 	}
 	else
 	{
-		volatile LogicalDecodingSlot *slot = MyLogicalDecodingSlot;
+		volatile ReplicationSlot *slot = MyReplicationSlot;
 
 		SpinLockAcquire(&slot->mutex);
 		slot->confirmed_flush = lsn;
 		SpinLockRelease(&slot->mutex);
 	}
-}
-
-/*
- * Compute the xmin between all of the decoding slots and store it in
- * WalSndCtlData.
- */
-void
-ComputeLogicalXmin(void)
-{
-	int			i;
-	TransactionId xmin = InvalidTransactionId;
-	LogicalDecodingSlot *slot;
-
-	Assert(LogicalDecodingCtl);
-
-	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-
-	for (i = 0; i < max_logical_slots; i++)
-	{
-		slot = &LogicalDecodingCtl->logical_slots[i];
-
-		SpinLockAcquire(&slot->mutex);
-		if (slot->in_use &&
-			TransactionIdIsValid(slot->effective_xmin) && (
-											   !TransactionIdIsValid(xmin) ||
-						   TransactionIdPrecedes(slot->effective_xmin, xmin))
-			)
-		{
-			xmin = slot->effective_xmin;
-		}
-		SpinLockRelease(&slot->mutex);
-	}
-	LogicalDecodingCtl->xmin = xmin;
-	LWLockRelease(ProcArrayLock);
-
-	elog(DEBUG1, "computed new global xmin for decoding: %u", xmin);
 }
 
 /*
@@ -397,17 +249,19 @@ XLogRecPtr ComputeLogicalRestartLSN(void)
 	XLogRecPtr	result = InvalidXLogRecPtr;
 	int			i;
 
-	if (max_logical_slots <= 0)
+	if (max_replication_slots <= 0)
 		return InvalidXLogRecPtr;
 
-	LWLockAcquire(LogicalDecodingSlotCtlLock, LW_SHARED);
+	LWLockAcquire(ReplicationSlotCtlLock, LW_SHARED);
 
-	for (i = 0; i < max_logical_slots; i++)
+	for (i = 0; i < max_replication_slots; i++)
 	{
-		volatile LogicalDecodingSlot *s = &LogicalDecodingCtl->logical_slots[i];
+		volatile ReplicationSlot *s;
 		XLogRecPtr		restart_decoding;
 
-		/* cannot change while LogicalDecodingSlotCtlLock is held */
+		s = &ReplicationSlotCtl->replication_slots[i];
+
+		/* cannot change while ReplicationSlotCtlLock is held */
 		if (!s->in_use)
 			continue;
 
@@ -421,7 +275,7 @@ XLogRecPtr ComputeLogicalRestartLSN(void)
 			result = restart_decoding;
 	}
 
-	LWLockRelease(LogicalDecodingSlotCtlLock);
+	LWLockRelease(ReplicationSlotCtlLock);
 
 	return result;
 }
@@ -433,6 +287,8 @@ XLogRecPtr ComputeLogicalRestartLSN(void)
 void
 CheckLogicalDecodingRequirements(void)
 {
+	CheckSlotRequirements();
+
 	if (wal_level < WAL_LEVEL_LOGICAL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -442,303 +298,6 @@ CheckLogicalDecodingRequirements(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("logical decoding requires to be connected to a database")));
-
-	if (max_logical_slots == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 (errmsg("logical decoding requires needs max_logical_slots > 0"))));
-}
-
-/*
- * Search for a free slot, mark it as used and acquire a valid xmin horizon
- * value.
- */
-void
-LogicalDecodingAcquireFreeSlot(const char *name, const char *plugin)
-{
-	LogicalDecodingSlot *slot;
-	bool		name_in_use;
-	int			i;
-
-	Assert(!MyLogicalDecodingSlot);
-
-	CheckLogicalDecodingRequirements();
-
-	LWLockAcquire(LogicalDecodingSlotCtlLock, LW_EXCLUSIVE);
-
-	/* First, make sure the requested name is not in use. */
-
-	name_in_use = false;
-	for (i = 0; i < max_logical_slots && !name_in_use; i++)
-	{
-		LogicalDecodingSlot *s = &LogicalDecodingCtl->logical_slots[i];
-
-		SpinLockAcquire(&s->mutex);
-		if (s->in_use && strcmp(name, NameStr(s->name)) == 0)
-			name_in_use = true;
-		SpinLockRelease(&s->mutex);
-	}
-
-	if (name_in_use)
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("There already is a logical slot named \"%s\"", name)));
-
-	/* Find the first available (not in_use (=> not active)) slot. */
-
-	slot = NULL;
-	for (i = 0; i < max_logical_slots; i++)
-	{
-		LogicalDecodingSlot *s = &LogicalDecodingCtl->logical_slots[i];
-
-		SpinLockAcquire(&s->mutex);
-		if (!s->in_use)
-		{
-			Assert(!s->active);
-			/* NOT releasing the lock yet */
-			slot = s;
-			break;
-		}
-		SpinLockRelease(&s->mutex);
-	}
-
-	LWLockRelease(LogicalDecodingSlotCtlLock);
-
-	if (!slot)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("couldn't find free logical slot. free one or increase max_logical_slots")));
-
-	MyLogicalDecodingSlot = slot;
-
-	/* Lets start with enough information if we can */
-	if (!RecoveryInProgress())
-	{
-		XLogRecPtr flushptr;
-
-		/* start at current insert position*/
-		slot->restart_decoding = GetXLogInsertRecPtr();
-
-		/* make sure we have enough information to start */
-		flushptr = LogStandbySnapshot();
-
-		/* and make sure it's fsynced to disk */
-		XLogFlush(flushptr);
-	}
-	else
-		slot->restart_decoding = GetRedoRecPtr();
-
-	slot->in_use = true;
-	slot->active = true;
-	slot->database = MyDatabaseId;
-	/* XXX: do we want to use truncate identifier instead? */
-	strncpy(NameStr(slot->plugin), plugin, NAMEDATALEN);
-	NameStr(slot->plugin)[NAMEDATALEN - 1] = '\0';
-	strncpy(NameStr(slot->name), name, NAMEDATALEN);
-	NameStr(slot->name)[NAMEDATALEN - 1] = '\0';
-
-	/* Arrange to clean up at exit/error */
-	on_shmem_exit(LogicalSlotKill, 0);
-
-	/* release slot so it can be examined by others */
-	SpinLockRelease(&slot->mutex);
-
-	/* XXX: verify that the specified plugin is valid */
-
-	/*
-	 * Acquire the current global xmin value and directly set the logical xmin
-	 * before releasing the lock if necessary. We do this so wal decoding is
-	 * guaranteed to have all catalog rows produced by xacts with an xid >
-	 * walsnd->xmin available.
-	 *
-	 * We can't use ComputeLogicalXmin here as that acquires ProcArrayLock
-	 * separately which would open a short window for the global xmin to
-	 * advance above walsnd->xmin.
-	 */
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
-	slot->effective_xmin = GetOldestXmin(true, true, true, true);
-	slot->xmin = slot->effective_xmin;
-
-	if (!TransactionIdIsValid(LogicalDecodingCtl->xmin) ||
-		NormalTransactionIdPrecedes(slot->effective_xmin, LogicalDecodingCtl->xmin))
-		LogicalDecodingCtl->xmin = slot->effective_xmin;
-	LWLockRelease(ProcArrayLock);
-
-	/*
-	 * Now that the logical xmin has been set, we can announce
-	 * ourselves as logical decoding backend which doesn't need get
-	 * it's xmin checked.
-	 */
-	MyPgXact->vacuumFlags |= PROC_IN_LOGICAL_DECODING;
-
-	Assert(slot->effective_xmin <= GetOldestXmin(true, true, true, false));
-
-	LWLockAcquire(LogicalDecodingSlotCtlLock, LW_EXCLUSIVE);
-	CreateLogicalSlot(slot);
-	LWLockRelease(LogicalDecodingSlotCtlLock);
-}
-
-/*
- * Find an previously initiated slot and mark it as used again.
- */
-void
-LogicalDecodingReAcquireSlot(const char *name)
-{
-	LogicalDecodingSlot *slot;
-	int			i;
-
-	CheckLogicalDecodingRequirements();
-
-	Assert(!MyLogicalDecodingSlot);
-
-	for (i = 0; i < max_logical_slots; i++)
-	{
-		slot = &LogicalDecodingCtl->logical_slots[i];
-
-		SpinLockAcquire(&slot->mutex);
-		if (slot->in_use && strcmp(name, NameStr(slot->name)) == 0)
-		{
-			MyLogicalDecodingSlot = slot;
-			/* NOT releasing the lock yet */
-			break;
-		}
-		SpinLockRelease(&slot->mutex);
-	}
-
-	if (!MyLogicalDecodingSlot)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("couldn't find logical slot \"%s\"", name)));
-
-	slot = MyLogicalDecodingSlot;
-
-	if (slot->active)
-	{
-		SpinLockRelease(&slot->mutex);
-		MyLogicalDecodingSlot = NULL;
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("slot already active")));
-	}
-
-	slot->active = true;
-	/* now that we've marked it as active, we release our lock */
-	SpinLockRelease(&slot->mutex);
-
-	/* Don't let the user switch the database... */
-	if (slot->database != MyDatabaseId)
-	{
-		SpinLockAcquire(&slot->mutex);
-		slot->active = false;
-		MyLogicalDecodingSlot = NULL;
-		SpinLockRelease(&slot->mutex);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 (errmsg("START_LOGICAL_REPLICATION needs to be run in the same database as INIT_LOGICAL_REPLICATION"))));
-	}
-
-	/* announce we're doing logical decoding */
-	MyPgXact->vacuumFlags |= PROC_IN_LOGICAL_DECODING;
-
-	/* Arrange to clean up at exit */
-	on_shmem_exit(LogicalSlotKill, 0);
-
-	SaveLogicalSlot(slot);
-}
-
-/*
-  * Temporarily remove a logical decoding slot, this or another backend can
-  * reacquire it later.
- */
-void
-LogicalDecodingReleaseSlot(void)
-{
-	LogicalDecodingSlot *slot;
-
-	CheckLogicalDecodingRequirements();
-
-	slot = MyLogicalDecodingSlot;
-
-	Assert(slot != NULL && slot->active);
-
-	SpinLockAcquire(&slot->mutex);
-	slot->active = false;
-	SpinLockRelease(&slot->mutex);
-
-	MyLogicalDecodingSlot = NULL;
-	MyPgXact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
-
-	SaveLogicalSlot(slot);
-
-	cancel_shmem_exit(LogicalSlotKill, 0);
-}
-
-/*
- * Permanently remove a logical decoding slot.
- */
-void
-LogicalDecodingFreeSlot(const char *name)
-{
-	LogicalDecodingSlot *slot = NULL;
-	int			i;
-
-	CheckLogicalDecodingRequirements();
-
-	for (i = 0; i < max_logical_slots; i++)
-	{
-		slot = &LogicalDecodingCtl->logical_slots[i];
-
-		SpinLockAcquire(&slot->mutex);
-		if (slot->in_use && strcmp(name, NameStr(slot->name)) == 0)
-		{
-			/* NOT releasing the lock yet */
-			break;
-		}
-		SpinLockRelease(&slot->mutex);
-		slot = NULL;
-	}
-
-	if (!slot)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("couldn't find logical slot \"%s\"", name)));
-
-	if (slot->active)
-	{
-		SpinLockRelease(&slot->mutex);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("cannot free active logical slot \"%s\"", name)));
-	}
-
-	/*
-	 * Mark it as as active, so nobody can claim this slot while we are
-	 * working on it. We don't want to hold the spinlock while doing stuff
-	 * like fsyncing the state file to disk.
-	 */
-	slot->active = true;
-
-	SpinLockRelease(&slot->mutex);
-
-	/*
-	 * Start critical section, we can't to be interrupted while on-disk/memory
-	 * state aren't coherent.
-	 */
-	START_CRIT_SECTION();
-
-	DeleteLogicalSlot(slot);
-
-	/* ok, everything gone, after a crash we now wouldn't restore this slot */
-	SpinLockAcquire(&slot->mutex);
-	slot->active = false;
-	slot->in_use = false;
-	SpinLockRelease(&slot->mutex);
-
-	END_CRIT_SECTION();
-
-	/* slot is dead and doesn't nail the xmin anymore */
-	ComputeLogicalXmin();
 }
 
 /*
@@ -755,15 +314,17 @@ LogicalDecodingCountDBSlots(Oid dboid, int *nslots, int *nactive)
 
 	*nslots = *nactive = 0;
 
-	if (max_logical_slots <= 0)
+	if (max_replication_slots <= 0)
 		return false;
 
-	LWLockAcquire(LogicalDecodingSlotCtlLock, LW_SHARED);
-	for (i = 0; i < max_logical_slots; i++)
+	LWLockAcquire(ReplicationSlotCtlLock, LW_SHARED);
+	for (i = 0; i < max_replication_slots; i++)
 	{
-		volatile LogicalDecodingSlot *s = &LogicalDecodingCtl->logical_slots[i];
+		volatile ReplicationSlot *s;
 
-		/* cannot change while LogicalDecodingSlotCtlLock is held */
+		s = &ReplicationSlotCtl->replication_slots[i];
+
+		/* cannot change while ReplicationSlotCtlLock is held */
 		if (!s->in_use)
 			continue;
 
@@ -778,413 +339,32 @@ LogicalDecodingCountDBSlots(Oid dboid, int *nslots, int *nactive)
 			(*nactive)++;
 		SpinLockRelease(&s->mutex);
 	}
-	LWLockRelease(LogicalDecodingSlotCtlLock);
+	LWLockRelease(ReplicationSlotCtlLock);
 
 	if (*nslots > 0)
 		return true;
 	return false;
 }
 
-/*
- * Load logical slots from disk into memory at server startup. This needs to be
- * run before we start crash recovery.
- */
-void
-StartupLogicalDecoding(XLogRecPtr checkPointRedo)
-{
-	DIR		   *logical_dir;
-	struct dirent *logical_de;
-
-	ereport(DEBUG1,
-			(errmsg("starting up logical decoding from %X/%X",
-					(uint32) (checkPointRedo >> 32), (uint32) checkPointRedo)));
-
-	/* restore all slots */
-	logical_dir = AllocateDir("pg_llog");
-	while ((logical_de = ReadDir(logical_dir, "pg_llog")) != NULL)
-	{
-		if (strcmp(logical_de->d_name, ".") == 0 ||
-			strcmp(logical_de->d_name, "..") == 0)
-			continue;
-
-		/* one of our own directories */
-		if (strcmp(logical_de->d_name, "snapshots") == 0 ||
-			strcmp(logical_de->d_name, "mappings") == 0)
-			continue;
-
-		/* we crashed while a slot was being setup or deleted, clean up */
-		if (strcmp(logical_de->d_name, "new") == 0 ||
-			strcmp(logical_de->d_name, "old") == 0)
-		{
-			char		path[MAXPGPATH];
-
-			sprintf(path, "pg_llog/%s", logical_de->d_name);
-
-			if (!rmtree(path, true))
-			{
-				FreeDir(logical_dir);
-				ereport(PANIC,
-						(errcode_for_file_access(),
-						 errmsg("could not remove directory \"%s\": %m",
-								path)));
-			}
-			continue;
-		}
-		/* XXX: check for a filename pattern and skip? */
-		RestoreLogicalSlot(logical_de->d_name);
-	}
-	FreeDir(logical_dir);
-
-	/* currently no slots exist , we're done. */
-	if (max_logical_slots <= 0)
-		return;
-
-	/* Now that we have recovered all the data, compute logical xmin */
-	ComputeLogicalXmin();
-
-	ReorderBufferStartup();
-}
-
-/* ----
- * Manipulation of ondisk state of logical slots
- * ----
- */
-static void
-CreateLogicalSlot(LogicalDecodingSlot *slot)
-{
-	char		tmppath[MAXPGPATH];
-	char		path[MAXPGPATH];
-
-	START_CRIT_SECTION();
-
-	sprintf(tmppath, "pg_llog/new");
-	sprintf(path, "pg_llog/%s", NameStr(slot->name));
-
-	if (mkdir(tmppath, S_IRWXU) < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not create directory \"%s\": %m",
-						tmppath)));
-
-	fsync_fname(tmppath, true);
-
-	SaveLogicalSlotInternal(slot, tmppath);
-
-	if (rename(tmppath, path) != 0)
-	{
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not rename logical checkpoint from \"%s\" to \"%s\": %m",
-						tmppath, path)));
-	}
-
-	fsync_fname(path, true);
-
-	END_CRIT_SECTION();
-}
-
-static void
-SaveLogicalSlot(LogicalDecodingSlot *slot)
-{
-	char		path[MAXPGPATH];
-
-	sprintf(path, "pg_llog/%s", NameStr(slot->name));
-	SaveLogicalSlotInternal(slot, path);
-}
-
-/*
- * Shared functionality between saving and creating a logical slot.
- */
-static void
-SaveLogicalSlotInternal(LogicalDecodingSlot *slot, const char *dir)
-{
-	char		tmppath[MAXPGPATH];
-	char		path[MAXPGPATH];
-	int			fd;
-	LogicalDecodingSlotOnDisk cp;
-
-	/* silence valgrind :( */
-	memset(&cp, 0, sizeof(LogicalDecodingSlotOnDisk));
-
-	sprintf(tmppath, "%s/state.tmp", dir);
-	sprintf(path, "%s/state", dir);
-
-	START_CRIT_SECTION();
-
-	fd = OpenTransientFile(tmppath,
-						   O_CREAT | O_EXCL | O_WRONLY | PG_BINARY,
-						   S_IRUSR | S_IWUSR);
-	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not create logical checkpoint file \"%s\": %m",
-						tmppath)));
-
-	cp.magic = LOGICAL_MAGIC;
-	INIT_CRC32(cp.checksum);
-	cp.version = 1;
-	cp.length = LogicalDecodingSlotOnDiskDynamicSize;
-
-	SpinLockAcquire(&slot->mutex);
-
-	cp.slot.xmin = slot->xmin;
-	cp.slot.effective_xmin = slot->effective_xmin;
-
-	strcpy(NameStr(cp.slot.name), NameStr(slot->name));
-	strcpy(NameStr(cp.slot.plugin), NameStr(slot->plugin));
-
-	cp.slot.database = slot->database;
-	cp.slot.confirmed_flush = slot->confirmed_flush;
-	cp.slot.restart_decoding = slot->restart_decoding;
-	cp.slot.candidate_xmin = InvalidTransactionId;
-	cp.slot.candidate_xmin_lsn = InvalidXLogRecPtr;
-	cp.slot.candidate_restart_decoding = InvalidXLogRecPtr;
-	cp.slot.candidate_restart_valid = InvalidXLogRecPtr;
-	cp.slot.in_use = slot->in_use;
-	cp.slot.active = false;
-
-	SpinLockRelease(&slot->mutex);
-
-	COMP_CRC32(cp.checksum,
-			   (char *)(&cp) + LogicalDecodingSlotOnDiskConstantSize,
-			   LogicalDecodingSlotOnDiskDynamicSize);
-
-	if ((write(fd, &cp, sizeof(cp))) != sizeof(cp))
-	{
-		CloseTransientFile(fd);
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not write logical checkpoint file \"%s\": %m",
-						tmppath)));
-	}
-
-	/* fsync the file */
-	if (pg_fsync(fd) != 0)
-	{
-		CloseTransientFile(fd);
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync logical checkpoint \"%s\": %m",
-						tmppath)));
-	}
-
-	CloseTransientFile(fd);
-
-	/* rename to permanent file, fsync file and directory */
-	if (rename(tmppath, path) != 0)
-	{
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not rename logical checkpoint from \"%s\" to \"%s\": %m",
-						tmppath, path)));
-	}
-
-	fsync_fname((char *) dir, true);
-	fsync_fname(path, false);
-
-	END_CRIT_SECTION();
-}
-
-
-static void
-DeleteLogicalSlot(LogicalDecodingSlot *slot)
-{
-	char		path[MAXPGPATH];
-	char		tmppath[] = "pg_llog/old";
-
-	START_CRIT_SECTION();
-
-	sprintf(path, "pg_llog/%s", NameStr(slot->name));
-
-	if (rename(path, tmppath) != 0)
-	{
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not rename logical checkpoint from \"%s\" to \"%s\": %m",
-						path, tmppath)));
-	}
-
-	/* make sure no partial state is visible after a crash */
-	fsync_fname(tmppath, true);
-	fsync_fname("pg_llog", true);
-
-	if (!rmtree(tmppath, true))
-	{
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not remove directory \"%s\": %m",
-						tmppath)));
-	}
-
-	END_CRIT_SECTION();
-}
-
-/*
- * Load a single ondisk slot into memory.
- */
-static void
-RestoreLogicalSlot(const char *name)
-{
-	LogicalDecodingSlotOnDisk cp;
-	int			i;
-	char		path[MAXPGPATH];
-	int			fd;
-	bool		restored = false;
-	int			readBytes;
-	pg_crc32	checksum;
-
-	START_CRIT_SECTION();
-
-	/* delete temp file if it exists */
-	sprintf(path, "pg_llog/%s/state.tmp", name);
-	if (unlink(path) < 0 && errno != ENOENT)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("failed while unlinking %s: %m", path)));
-
-	sprintf(path, "pg_llog/%s/state", name);
-
-	elog(DEBUG1, "restoring logical slot from %s", path);
-
-	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY, 0);
-
-	/*
-	 * We do not need to handle this as we are rename()ing the directory into
-	 * place only after we fsync()ed the state file.
-	 */
-	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not open state file %s", path)));
-
-	/* read part of statefile that's guaranteed to be version independent */
-	readBytes = read(fd, &cp, LogicalDecodingSlotOnDiskConstantSize);
-	if (readBytes != LogicalDecodingSlotOnDiskConstantSize)
-	{
-		int			saved_errno = errno;
-
-		CloseTransientFile(fd);
-		errno = saved_errno;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not read logical checkpoint file \"%s\":read %d of %u",
-						path, readBytes,
-						(uint32) LogicalDecodingSlotOnDiskConstantSize)));
-	}
-
-	/* verify magic */
-	if (cp.magic != LOGICAL_MAGIC)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("Logical checkpoint has wrong magic %u instead of %u",
-						cp.magic, LOGICAL_MAGIC)));
-	/* verify version */
-	if (cp.version != LOGICAL_VERSION)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("Logical checkpoint has unsupported version %u",
-						cp.version)));
-
-	/* boundary check on length */
-	if (cp.length != LogicalDecodingSlotOnDiskDynamicSize)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("Logical checkpoint has corrupted length %u",
-						cp.length)));
-
-	/* Now that we know the size, read the entire file */
-	readBytes = read(fd,
-					 (char *)&cp + LogicalDecodingSlotOnDiskConstantSize,
-					 cp.length);
-	if (readBytes != cp.length)
-	{
-		int			saved_errno = errno;
-
-		CloseTransientFile(fd);
-		errno = saved_errno;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not read logical checkpoint file \"%s\":read %d of %u",
-						path, readBytes, cp.length)));
-	}
-
-	CloseTransientFile(fd);
-
-	/* now verify the CRC32 */
-	INIT_CRC32(checksum);
-	COMP_CRC32(checksum,
-			   (char *)&cp + LogicalDecodingSlotOnDiskConstantSize,
-			   LogicalDecodingSlotOnDiskDynamicSize);
-
-	if (!EQ_CRC32(checksum, cp.checksum))
-		ereport(PANIC,
-				(errmsg("logical checksum file %s: checksum mismatch, is %u, should be %u",
-						path, checksum, cp.checksum)));
-
-	/* nothing can be active yet, don't lock anything */
-	for (i = 0; i < max_logical_slots; i++)
-	{
-		LogicalDecodingSlot *slot;
-
-		slot = &LogicalDecodingCtl->logical_slots[i];
-
-		if (slot->in_use)
-			continue;
-
-		slot->xmin = cp.slot.xmin;
-		/*
-		 * after a crash, always use xmin, not effective_xmin, the
-		 * slot obviously survived
-		 */
-		slot->effective_xmin = cp.slot.xmin;
-		strcpy(NameStr(slot->name), NameStr(cp.slot.name));
-		strcpy(NameStr(slot->plugin), NameStr(cp.slot.plugin));
-		slot->database = cp.slot.database;
-		slot->restart_decoding = cp.slot.restart_decoding;
-		slot->confirmed_flush = cp.slot.confirmed_flush;
-		/* ignore previous values */
-		slot->candidate_xmin = InvalidTransactionId;
-		slot->candidate_xmin_lsn = InvalidXLogRecPtr;
-		slot->candidate_restart_decoding = InvalidXLogRecPtr;
-		slot->candidate_restart_valid = InvalidXLogRecPtr;
-		slot->in_use = true;
-		slot->active = false;
-		restored = true;
-		break;
-	}
-
-	if (!restored)
-		ereport(PANIC,
-				(errmsg("too many logical slots active before shutdown, increase max_logical_slots and try again")));
-
-	END_CRIT_SECTION();
-}
-
-
 static void
 LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin)
 {
-	/* lookup symbols in the shared libarary */
+	LogicalOutputPluginInit plugin_init;
 
-	/* optional */
-	callbacks->init_cb = (LogicalDecodeInitCB)
-		load_external_function(plugin, "pg_decode_init", false, NULL);
+	plugin_init = (LogicalOutputPluginInit)
+		load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
 
-	/* required */
-	callbacks->begin_cb = (LogicalDecodeBeginCB)
-		load_external_function(plugin, "pg_decode_begin_txn", true, NULL);
+	if (plugin_init == NULL)
+		elog(ERROR, "output plugins have to declare the _PG_output_plugin_init symbol");
 
-	/* required */
-	callbacks->change_cb = (LogicalDecodeChangeCB)
-		load_external_function(plugin, "pg_decode_change", true, NULL);
+	plugin_init(callbacks);
 
-	/* required */
-	callbacks->commit_cb = (LogicalDecodeCommitCB)
-		load_external_function(plugin, "pg_decode_commit_txn", true, NULL);
-
-	/* optional */
-	callbacks->cleanup_cb = (LogicalDecodeCleanupCB)
-		load_external_function(plugin, "pg_decode_cleanup", false, NULL);
+	if (callbacks->begin_cb == NULL)
+		elog(ERROR, "output plugins have to register a begin callback");
+	if (callbacks->change_cb == NULL)
+		elog(ERROR, "output plugins have to register a change callback");
+	if (callbacks->commit_cb == NULL)
+		elog(ERROR, "output plugins have to register a commit callback");
 }
 
 /*
@@ -1210,42 +390,48 @@ output_plugin_error_callback(void *arg)
 }
 
 static void
-init_slot_wrapper(LogicalDecodingContext *ctx, bool is_init)
+startup_slot_wrapper(LogicalDecodingContext *ctx, bool is_init)
 {
 	LogicalErrorCallbackState state;
 	ErrorContextCallback errcallback;
 
 	/* Push callback + info on the error context stack */
 	state.ctx = ctx;
-	state.callback = "pg_decode_init";
+	state.callback = "pg_decode_startup";
 	errcallback.callback = output_plugin_error_callback;
 	errcallback.arg = (void *) &state;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	/* set output state */
+	ctx->accept_writes = false;
+
 	/* do the actual work: call callback */
-	ctx->callbacks.init_cb(ctx, is_init);
+	ctx->callbacks.startup_cb(ctx, is_init);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
 }
 
 static void
-cleanup_slot_wrapper(LogicalDecodingContext *ctx)
+shutdown_slot_wrapper(LogicalDecodingContext *ctx)
 {
 	LogicalErrorCallbackState state;
 	ErrorContextCallback errcallback;
 
 	/* Push callback + info on the error context stack */
 	state.ctx = ctx;
-	state.callback = "pg_decode_cleanup";
+	state.callback = "pg_decode_shutdown";
 	errcallback.callback = output_plugin_error_callback;
 	errcallback.arg = (void *) &state;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	/* set output state */
+	ctx->accept_writes = false;
+
 	/* do the actual work: call callback */
-	ctx->callbacks.cleanup_cb(ctx);
+	ctx->callbacks.shutdown_cb(ctx);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
@@ -1271,6 +457,11 @@ begin_txn_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn)
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = txn->xid;
+	ctx->write_location = txn->first_lsn;
+
 	/* do the actual work: call callback */
 	ctx->callbacks.begin_cb(ctx, txn);
 
@@ -1292,6 +483,11 @@ commit_txn_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn, XLogRecPtr commi
 	errcallback.arg = (void *) &state;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
+
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = txn->xid;
+	ctx->write_location = txn->end_lsn;
 
 	/* do the actual work: call callback */
 	ctx->callbacks.commit_cb(ctx, txn, commit_lsn);
@@ -1316,45 +512,179 @@ change_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = txn->xid;
+	ctx->write_location = txn->end_lsn;
+
 	ctx->callbacks.change_cb(ctx, txn, relation, change);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
 }
 
+void
+DecodingContextFindStartpoint(LogicalDecodingContext *ctx)
+{
+	XLogRecPtr	startptr;
+
+	/* setup from where to read xlog */
+	startptr = ctx->slot->restart_decoding;
+
+	elog(LOG, "starting to decode from %X/%X",
+		 (uint32)(ctx->slot->restart_decoding >> 32),
+		 (uint32)ctx->slot->restart_decoding);
+
+	/* Wait for a consistent starting point */
+	for (;;)
+	{
+		XLogRecord *record;
+		char	   *err = NULL;
+
+		/* the read_page callback waits for new WAL */
+		record = XLogReadRecord(ctx->reader, startptr, &err);
+		if (err)
+			elog(ERROR, "%s", err);
+
+		Assert(record);
+
+		startptr = InvalidXLogRecPtr;
+
+		DecodeRecordIntoReorderBuffer(ctx, record);
+
+		/* only continue till we found a consistent spot */
+		if (DecodingContextReady(ctx))
+			break;
+	}
+
+	ctx->slot->confirmed_flush = ctx->reader->EndRecPtr;
+}
+
+void
+OutputPluginPrepareWrite(struct LogicalDecodingContext *ctx, bool last_write)
+{
+	if (!ctx->accept_writes)
+		elog(ERROR, "writes are only accepted in commit, begin and change callbacks");
+
+	ctx->prepare_write(ctx, ctx->write_location, ctx->write_xid, last_write);
+	ctx->prepared_write = true;
+}
+
+void
+OutputPluginWrite(struct LogicalDecodingContext *ctx, bool last_write)
+{
+	if (!ctx->prepared_write)
+		elog(ERROR, "OutputPluginPrepareWrite needs to be called before OutputPluginWrite");
+
+	ctx->write(ctx, ctx->write_location, ctx->write_xid, last_write);
+	ctx->prepared_write = false;
+}
+
 LogicalDecodingContext *
-CreateLogicalDecodingContext(LogicalDecodingSlot *slot,
-							 bool is_init,
-							 XLogRecPtr	start_lsn,
-							 List *output_plugin_options,
-							 XLogPageReadCB read_page,
-						 LogicalOutputPluginWriterPrepareWrite prepare_write,
-							 LogicalOutputPluginWriterWrite do_write)
+CreateDecodingContext(bool is_init,
+					  char *plugin,
+					  XLogRecPtr	start_lsn,
+					  List *output_plugin_options,
+					  XLogPageReadCB read_page,
+					  LogicalOutputPluginWriterPrepareWrite prepare_write,
+					  LogicalOutputPluginWriterWrite do_write)
 {
 	MemoryContext context;
 	MemoryContext old_context;
 	TransactionId xmin_horizon;
 	LogicalDecodingContext *ctx;
+	ReplicationSlot *slot;
+
+	if (MyReplicationSlot == NULL)
+		elog(ERROR, "need a current slot");
+
+	if (is_init && start_lsn != InvalidXLogRecPtr)
+		elog(ERROR, "Cannot INIT_LOGICAL_REPLICATION at a specified LSN");
+
+	if (is_init && plugin == NULL)
+		elog(ERROR, "Cannot INIT_LOGICAL_REPLICATION without a specified plugin");
+
+	if (MyReplicationSlot->database == InvalidOid)
+		elog(ERROR, "slots for changeset extraction need to be database specific");
+
+	if (MyReplicationSlot->database != MyDatabaseId)
+		elog(ERROR, "slot for the wrong database");
+
+	/* shorter lines... */
+	slot = MyReplicationSlot;
 
 	context = AllocSetContextCreate(TopMemoryContext,
-									"ReorderBuffer",
+									"Changeset Extraction Context",
 									ALLOCSET_DEFAULT_MINSIZE,
 									ALLOCSET_DEFAULT_INITSIZE,
 									ALLOCSET_DEFAULT_MAXSIZE);
 	old_context = MemoryContextSwitchTo(context);
 	ctx = palloc0(sizeof(LogicalDecodingContext));
 
-
-	/* load output plugins first, so we detect a wrong output plugin early */
-	LoadOutputPlugin(&ctx->callbacks, NameStr(slot->plugin));
-
-	if (is_init && start_lsn != InvalidXLogRecPtr)
-		elog(ERROR, "Cannot INIT_LOGICAL_REPLICATION at a specified LSN");
-
+	/* If we're initializing a new slot, there's a bit more to do */
 	if (is_init)
-		xmin_horizon = slot->xmin;
+	{
+		/* register output plugin name with slot */
+		strncpy(NameStr(MyReplicationSlot->plugin), plugin,
+				NAMEDATALEN);
+		NameStr(MyReplicationSlot->plugin)[NAMEDATALEN - 1] = '\0';
+
+		/*
+		 * Lets start with enough information if we can, so log a standby
+		 * snapshot and start decoding at exactl that position.
+		 */
+		if (!RecoveryInProgress())
+		{
+			XLogRecPtr flushptr;
+
+			/* start at current insert position*/
+			slot->restart_decoding = GetXLogInsertRecPtr();
+
+			/* make sure we have enough information to start */
+			flushptr = LogStandbySnapshot();
+
+			/* and make sure it's fsynced to disk */
+			XLogFlush(flushptr);
+		}
+		else
+			slot->restart_decoding = GetRedoRecPtr();
+
+		/*
+		 * Acquire the current global xmin value and directly set the logical
+		 * xmin before releasing the lock if necessary. We do this so wal
+		 * decoding is guaranteed to have all catalog rows produced by xacts
+		 * with an xid > walsnd->xmin available.
+		 *
+		 * We can't use ReplicationSlotComputeXmin here as that acquires
+		 * ProcArrayLock separately which would open a short window for the
+		 * global xmin to advance above our xmin.
+		 */
+		LWLockAcquire(ProcArrayLock, LW_SHARED);
+		slot->effective_catalog_xmin = GetOldestXmin(true, true, true, true);
+		slot->catalog_xmin = slot->effective_catalog_xmin;
+
+		if (!TransactionIdIsValid(ReplicationSlotCtl->catalog_xmin) ||
+			NormalTransactionIdPrecedes(slot->effective_catalog_xmin,
+										ReplicationSlotCtl->catalog_xmin))
+			ReplicationSlotCtl->catalog_xmin = slot->effective_catalog_xmin;
+		LWLockRelease(ProcArrayLock);
+
+		Assert(slot->effective_catalog_xmin <= GetOldestXmin(true, true, true, false));
+
+		xmin_horizon = slot->catalog_xmin;
+	}
 	else
 		xmin_horizon = InvalidTransactionId;
+
+	/* load output plugins, so we detect a wrong output plugin now. */
+	LoadOutputPlugin(&ctx->callbacks, NameStr(slot->plugin));
+
+	/*
+	 * Now that the slot's xmin has been set, we can announce ourselves as a
+	 * logical decoding backend which doesn't need to be checked when
+	 * computing the xmin horizon.
+	 */
+	MyPgXact->vacuumFlags |= PROC_IN_LOGICAL_DECODING;
 
 	ctx->slot = slot;
 
@@ -1378,14 +708,9 @@ CreateLogicalDecodingContext(LogicalDecodingSlot *slot,
 
 	ctx->output_plugin_options = output_plugin_options;
 
-	if (is_init)
-		ctx->stop_after_consistent = true;
-	else
-		ctx->stop_after_consistent = false;
-
 	/* call output plugin initialization callback */
-	if (ctx->callbacks.init_cb != NULL)
-		init_slot_wrapper(ctx, is_init);
+	if (ctx->callbacks.startup_cb != NULL)
+		startup_slot_wrapper(ctx, is_init);
 
 	MemoryContextSwitchTo(old_context);
 
@@ -1393,16 +718,16 @@ CreateLogicalDecodingContext(LogicalDecodingSlot *slot,
 }
 
 void
-FreeLogicalDecodingContext(LogicalDecodingContext *ctx)
+FreeDecodingContext(LogicalDecodingContext *ctx)
 {
-	if (ctx->callbacks.cleanup_cb != NULL)
-		cleanup_slot_wrapper(ctx);
+	if (ctx->callbacks.shutdown_cb != NULL)
+		shutdown_slot_wrapper(ctx);
 }
 
 
 /* has the initial snapshot found a consistent state? */
 bool
-LogicalDecodingContextReady(LogicalDecodingContext *ctx)
+DecodingContextReady(LogicalDecodingContext *ctx)
 {
 	return SnapBuildCurrentState(ctx->snapshot_builder) == SNAPBUILD_CONSISTENT;
 }

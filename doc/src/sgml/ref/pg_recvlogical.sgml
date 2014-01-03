@@ -1,0 +1,80 @@
+<!--
+doc/src/sgml/ref/pg_recvlogical.sgml
+PostgreSQL documentation
+-->
+
+<refentry id="app-pgrecvlogical">
+ <refmeta>
+  <refentrytitle><application>pg_recvlogical</application></refentrytitle>
+  <manvolnum>1</manvolnum>
+  <refmiscinfo>Application</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>pg_recvlogical</refname>
+  <refpurpose>Control changeset extraction
+  (see <xref linkend="changesetextraction">) replication streams over a
+  walsender connection.</refpurpose>
+ </refnamediv>
+
+ <indexterm zone="app-pgrecvlogical">
+  <primary>pg_recvlogical</primary>
+ </indexterm>
+
+ <refsynopsisdiv>
+  <cmdsynopsis>
+   <command>pg_recvlogical</command>
+   <arg rep="repeat" choice="opt"><option>option</option></arg>
+  </cmdsynopsis>
+ </refsynopsisdiv>
+
+ <refsect1 id="R1-APP-PGRECVLOGICAL-1">
+  <title>Description</title>
+  <para>
+   <command>pg_recvlogical</command> controls changeset extraction replication
+   slots and streams data from such replication slots.
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Options</title>
+
+   <para>
+    The following command-line options control the location and format of the
+    output:
+
+    <variablelist>
+     <varlistentry>
+      <term><option>-f <replaceable>filename</replaceable></option></term>
+      <term><option>--file=<replaceable>filename</replaceable></option></term>
+      <listitem>
+       <para>
+        Receive log into this file. - for stdout.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+       <term><option>-V</></term>
+       <term><option>--version</></term>
+       <listitem>
+       <para>
+       Print the <application>pg_recvlogical</application> version and exit.
+       </para>
+       </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-?</></term>
+      <term><option>--help</></term>
+       <listitem>
+        <para>
+         Show help about <application>pg_recvlogical</application> command line
+         arguments, and exit.
+        </para>
+       </listitem>
+      </varlistentry>
+    </variablelist>
+   </para>
+ </refsect1>
+</refentry>

@@ -345,6 +345,6 @@ ReorderBufferTXN *ReorderBufferGetOldestTXN(ReorderBuffer *);
 
 void		ReorderBufferSetRestartPoint(ReorderBuffer *, XLogRecPtr ptr);
 
-void		ReorderBufferStartup(void);
+void		StartupReorderBuffer(void);
 
 #endif

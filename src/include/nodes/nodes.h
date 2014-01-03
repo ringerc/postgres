@@ -411,10 +411,9 @@ typedef enum NodeTag
 	 */
 	T_IdentifySystemCmd,
 	T_BaseBackupCmd,
+	T_CreateReplicationSlotCmd,
+	T_DropReplicationSlotCmd,
 	T_StartReplicationCmd,
-	T_InitLogicalReplicationCmd,
-	T_StartLogicalReplicationCmd,
-	T_FreeLogicalReplicationCmd,
 	T_TimeLineHistoryCmd,
 
 	/*
