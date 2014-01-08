@@ -1179,11 +1179,17 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 	const char *attrname;
 	TargetEntry *tle;
 
+	Assert(parsetree->resultRelation <= list_length(parsetree->rtable));
+	Assert(target_relation->rd_id == target_rte->relid);
+
 	if (target_relation->rd_rel->relkind == RELKIND_RELATION ||
 		target_relation->rd_rel->relkind == RELKIND_MATVIEW)
 	{
 		/*
 		 * Emit CTID so that executor can find the row to update or delete.
+		 * If we're updating a simply updatable view the relation we're scanning
+		 * to get the ctid might not be the resultRelation, so look up our
+		 * target_rte to determine the correct relid.
 		 */
 		var = makeVar(parsetree->resultRelation,
 					  SelfItemPointerAttributeNumber,
@@ -1222,6 +1228,7 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 
 		attrname = "wholerow";
 	}
+
 
 	tle = makeTargetEntry((Expr *) var,
 						  list_length(parsetree->targetList) + 1,
