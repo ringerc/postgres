@@ -1,4 +1,4 @@
-<!-- doc/src/sgml/protocol.sgml -->
+obligatory<!-- doc/src/sgml/protocol.sgml -->
 
 <chapter id="protocol">
  <title>Frontend/Backend Protocol</title>
@@ -1414,7 +1414,7 @@ The commands accepted in walsender mode are:
   </varlistentry>
 
   <varlistentry>
-    <term>START_REPLICATION [SLOT <replaceable class="parameter">slotname</>] [PYHSICAL] <replaceable class="parameter">XXX/XXX</> TIMELINE <replaceable class="parameter">tli</></term>
+    <term>START_REPLICATION [SLOT <replaceable class="parameter">slotname</>] [PHYSICAL] <replaceable class="parameter">XXX/XXX</> TIMELINE <replaceable class="parameter">tli</></term>
     <listitem>
      <para>
       Instructs server to start streaming WAL, starting at
