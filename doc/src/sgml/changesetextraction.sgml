@@ -1,0 +1,499 @@
+<!-- doc/src/sgml/changesetextraction.sgml -->
+ <chapter id="changesetextraction">
+  <title>Changeset Extraction</title>
+  <indexterm zone="changesetextraction">
+   <primary>Changeset Extraction</primary>
+  </indexterm>
+  <para>
+   PostgreSQL provides infrastructure to stream the modifications performed
+   via SQL to external consumers which can be used to implement replication
+   solutions, perform auditing and similar tasks.
+  </para>
+
+  <para>
+   <indexterm><primary>Changeset Extraction Slot</primary></indexterm>
+   A changeset extraction slot ("logical replication slot") is a persistent
+   server-side record of the replay progress of a stream of changes. A stream of
+   changes is read from the slot to a receiving client program.
+  </para>
+  <para>
+   The format in which those changes are streamed is determined by the output
+   plugin used. While an example plugin is provided, additional plugins can
+   be written to extend the choice of available formats.
+  </para>
+  <para>
+   Changes can be consumed either using one streaming replication protocol
+   (see <xref linkend="protocol-replication"> and
+   <xref linkend="changesetextraction-walsender">), or by calling functions
+   via SQL (see <xref linkend="changesetextraction-sql">). It is also
+   possible to write additional methods of consuming the output of a
+   replication slot without modifying core code (see
+   <xref linkend="changesetextraction-writer">).
+  </para>
+
+  <sect1 id="changesetextraction-example">
+   <title>Changeset Extraction Example</title>
+   <para>
+    The following example shows usage of the SQL interface.
+   </para>
+   <programlisting>
+postgres=# SHOW max_replication_slots;
+ max_replication_slots
+-----------------------
+ 15
+(1 row)
+
+postgres=# SHOW wal_level;
+ wal_level
+-----------
+ logical
+(1 row)
+
+postgres=# SELECT * FROM pg_replication_slots;
+ slot_name | plugin | slottype | datoid | database | active | catalog_xmin | data_xmin | restart_decoding_lsn
+-----------+--------+----------+--------+----------+--------+--------------+-----------+----------------------
+(0 rows)
+
+postgres=# SELECT * FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
+    slotname     | xlog_position
+-----------------+---------------
+ regression_slot | 0/16B1970
+
+postgres=# SELECT * FROM pg_replication_slots;
+    slot_name    |    plugin     | slottype | datoid | database | active | catalog_xmin | data_xmin | restart_decoding_lsn
+-----------------+---------------+----------+--------+----------+--------+--------------+-----------+----------------------
+ regression_slot | test_decoding | logical  |  12054 | postgres | f      |          690 |         0 | 0/16B1938
+(1 row)
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location | xid | data
+----------+-----+------
+(0 rows)
+
+postgres=# CREATE TABLE data(id serial primary key, data text);
+CREATE TABLE
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |  data
+-----------+-----+--------
+ 0/16E1558 | 716 | BEGIN
+ 0/16EBAC8 | 716 | COMMIT
+(2 rows)
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBBC0 | 717 | BEGIN
+ 0/16EBCD8 | 717 | table "data": INSERT: id[int4]:1 data[text]:1
+ 0/16EBCD8 | 717 | COMMIT
+(3 rows)
+
+Time: 28.123 ms
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location | xid | data
+----------+-----+------
+(0 rows)
+
+postgres=# BEGIN;
+postgres=# INSERT INTO data(data) VALUES('1');
+postgres=# INSERT INTO data(data) VALUES('1');
+postgres=# COMMIT;
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBD10 | 718 | BEGIN
+ 0/16EBE60 | 718 | table "data": INSERT: id[int4]:2 data[text]:1
+ 0/16EBE60 | 718 | table "data": INSERT: id[int4]:3 data[text]:1
+ 0/16EBE60 | 718 | COMMIT
+(4 rows)
+
+postgres=# INSERT INTO data(data) VALUES('1');
+postgres=# SELECT * FROM decoding_slot_peek_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBE98 | 719 | BEGIN
+ 0/16EBF58 | 719 | table "data": INSERT: id[int4]:4 data[text]:1
+ 0/16EBF58 | 719 | COMMIT
+(3 rows)
+
+Time: 40.875 ms
+postgres=# SELECT * FROM decoding_slot_peek_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBE98 | 719 | BEGIN
+ 0/16EBF58 | 719 | table "data": INSERT: id[int4]:4 data[text]:1
+ 0/16EBF58 | 719 | COMMIT
+    </programlisting>
+   <para>
+    The following example shows usage of the walsender interface using the <link
+    linkend="app-pgrecvlogical"><command>pg_recvlogical</command></link> shell
+    command.
+   </para>
+   <programlisting>
+# pg_recvlogical --slot test --init
+# pg_recvlogical --slot test -f - --start
+CTRL-Z
+# psql -c "INSERT INTO data(data) VALUES('1');"
+# fg
+BEGIN 721
+table "data": INSERT: id[int4]:5 data[text]:1
+COMMIT 721
+   </programlisting>
+  </sect1>
+  <sect1 id="changesetextraction-explanation">
+   <title>Changeset Extraction Concepts</title>
+   <sect2>
+    <indexterm>
+     <primary>Logical Replication Slot</primary>
+    </indexterm>
+    <title>Logical Replication Slots</title>
+    <para>
+     In the context of changeset extraction a logical replication slot
+     represents a stream of changes which can be replayed to a client in the
+     order they were made on the origin server. Each slot streams a sequence
+     of changes from a single database, sending each change exactly once
+     (unless peeking forward in the stream).
+    </para>
+    <note>
+     <para>PostgreSQL also has streaming replication slots (see <xref
+     linkend="streaming-replication">), but they are used somewhat differently
+     there. Streaming replication slots have a different interface and can not
+     be used with the functions described here.
+     </para>
+    </note>
+    <para>
+     Logical replication slots have an identifier which is unique across all
+     databases in a <productname>PostgreSQL</productname> cluster. Slots persist
+     independently of the connection using them and are crash-safe.
+     They can be allocated in primary servers or hot-standby servers (streaming
+     replicas or archive-replaying hot standbys), so it's possible to replicate
+     changes over physical replication then read a logical change stream from a
+     physical replica server.
+    </para>
+    <para>
+     Multiple independent slots may exist for a single database. Each slot
+     has its own independent position marker, allowing different consumers
+     to start replaying from different points in the database change stream
+     and replay at different rates. For most applications a separate slot
+     is required for each changeset consumer.
+    </para>
+    <para>
+     A changeset extraction slot knows nothing about the state of the receiver(s).
+     It's even possible to have multiple different receivers use the same slot at
+     different times; they'll just get the changes following on from when the last
+     receiver stopped consuming them. Only one receiver may consume changes from
+     a slot at any given time.
+    </para>
+    <sect3 id="changesetextraction-abandoned-slots">
+     <title>Unused/abandoned slots</title>
+     <para>
+      Because changeset extraction slots persist across crashes, know nothing
+      about the state of any consumer(s), and exist even when there is no
+      connection using them, they need to record and store changes made on the
+      server. This consumes storage and delays necessary cleanup tasks in the
+      system catalogs, so if a slot is no longer required it should be dropped.
+     </para>
+     <para>
+      Slots may be created manually, or using a client like a replication tool.
+      Keep this in mind when you retire a client that uses a changeset extraction
+      slot, like a logical replica - you may need to give it a specific command to
+      remove its changeset extraction slot, or drop the slot yourself, even if you
+      did not initially create the slot by hand.
+     </para>
+    </sect3>
+   </sect2>
+   <sect2>
+    <title>Exported Snapshots</title>
+    <para>
+     When a new replication slot is created over the walsender interface a
+     snapshot is exported
+     (see <xref linkend="functions-snapshot-synchronization">) which will show
+     exactly the state of the database after which all changes will be
+     included in the changestream. This can be used to create a new replica
+     by using <link linkend="sql-set-transaction"><literal>SET TRANSACTION
+     SNAPSHOT</literal></link> to read the state of the database at the moment
+     the slot was created.
+    </para>
+     
+   </sect2>
+  </sect1>
+  <sect1 id="changesetextraction-walsender">
+   <title>Streaming Replication Protocol Interface</title>
+   <para>
+    The <literal>CREATE_REPLICATION_SLOT SLOT slotname LOGICAL
+    options</literal>, <literal>DROP_REPLICATION_SLOT SLOT slotname</literal>
+    and <literal>START_REPLICATION SLOT slotname LOGICAL options</literal>
+    commands can be used to create, drop and stream changes from a replication
+    slot respectively. These commands are only available over a replication
+    connection; the won't work from the SQL level. See <xref linkend="protocol-replication">.
+   </para>
+   <para>
+    The <command>pg_recvlogical</command> command
+    (see <xref linkend="app-pgrecvlogical">) can be used to control changeset
+    extraction over a walsender connection.
+   </para>
+  </sect1>
+  <sect1 id="changesetextraction-sql">
+   <title>Changeset Extraction <acronym>SQL</acronym> Interface</title>
+   <para>
+    <table id="changesetextraction-sql-functions">
+     <title>Changeset Extraction <acronym>SQL</acronym> Functions</title>
+     <tgroup cols="3">
+      <thead>
+       <row>
+        <entry>Function</entry>
+        <entry>Return Type</entry>
+        <entry>Description</entry>
+       </row>
+      </thead>
+      <tbody>
+       <row>
+        <entry>
+         <indexterm>
+          <primary>create_decoding_replication_slot</primary>
+         </indexterm>
+         <literal><function>create_decoding_replication_slot(<parameter>slotname</parameter> <type>text</type>, <parameter>plugin</parameter> <type>text</type>)</function></literal>
+        </entry>
+        <entry>
+         (<parameter>slotname</parameter> <type>text</type>, <parameter>xlog_position</parameter> <type>text</type>)
+        </entry>
+        <entry>
+         Creates a new replication slot named <parameter>slotname</parameter>
+         using the output plugin <parameter>plugin</parameter>. Output plugins
+         are listed amongst the extensions in
+         <literal>pg_catalog.pg_available_extensions</literal>, but there is no
+         specific listing of available output plugins.
+        </entry>
+       </row>
+       <row>
+        <entry>
+         <indexterm>
+          <primary>decoding_slot_get_changes</primary>
+         </indexterm>
+         <literal><function>decoding_slot_get_changes(<parameter>slotname</parameter> <type>text</type>)</function></literal>
+        </entry>
+        <entry>
+         (<parameter>location</parameter> <type>text</type>, <parameter>xid</parameter> <type>xid</type>, <parameter>data</parameter> <type>text</type>)
+        </entry>
+        <entry>
+         Returns all changes in the slot <parameter>slotname</parameter> since
+         changes have been consumed last, up until the changes visible at the
+         time this call starts. Changes will be consumed.
+        </entry>
+       </row>
+       <row>
+        <entry>
+         <indexterm>
+          <primary>decoding_slot_peek_changes</primary>
+         </indexterm>
+         <literal><function>decoding_slot_peek_changes(<parameter>slotname</parameter> <type>text</type>)</function></literal>
+        </entry>
+        <entry>
+         (<parameter>location</parameter> <type>text</type>, <parameter>xid</parameter> <type>xid</type>, <parameter>data</parameter> <type>text</type>)
+        </entry>
+        <entry>
+         Returns all changes in the slot <parameter>slotname</parameter> since
+         changes have been consumed last, up to the changes visible at the start
+         of this call. Changes will not be consumed.
+        </entry>
+       </row>
+       <row>
+        <entry>
+         <indexterm>
+          <primary>decoding_slot_get_binary_changes</primary>
+         </indexterm>
+         <literal><function>decoding_slot_get_binary_changes(<parameter>slotname</parameter> <type>text</type>)</function></literal>
+        </entry>
+        <entry>
+         (<parameter>location</parameter> <type>text</type>, <parameter>xid</parameter> <type>xid</type>, <parameter>data</parameter> <type>bytea</type>)
+        </entry>
+        <entry>
+         Returns all changes in the slot <parameter>slotname</parameter> since
+         changes have been consumed last in binary format. Changes will be consumed.
+        </entry>
+       </row>
+       <row>
+        <entry>
+         <indexterm>
+          <primary>decoding_slot_peek_binary_changes</primary>
+         </indexterm>
+         <literal><function>decoding_slot_peek_binary_changes(<parameter>slotname</parameter> <type>text</type>)</function></literal>
+        </entry>
+        <entry>
+         (<parameter>location</parameter> <type>text</type>, <parameter>xid</parameter> <type>xid</type>, <parameter>data</parameter> <type>binary</type>)
+        </entry>
+        <entry>
+         Returns all changes in the slot <parameter>slotname</parameter> since
+         changes have been consumed last in binary format. Changes will not
+         be consumed.
+        </entry>
+       </row>
+      </tbody>
+     </tgroup>
+    </table>
+   </para>
+  </sect1>
+  <sect1 id="changesetextraction-output-plugin">
+   <title>Changeset Extraction Output Plugins</title>
+   <para>
+    An example output plugin can be found in the
+    <filename>contrib/test_decoding</filename> subdirectory of the PostgreSQL
+    source tree.
+   </para>
+   <sect2 id="changesetextraction-output-init">
+    <title>Initialization Function</title>
+    <indexterm zone="changesetextraction">
+     <primary>_PG_output_plugin_init</primary>
+    </indexterm>
+    <para>
+     An output plugin is loaded by dynamically loading a shared library
+     with the output plugin's name as the library basename. To
+     provide the required output plugin callbacks and to indicate that the
+     library is actually an output plugin it needs to provide a function named
+     <function>_PG_output_plugin_init</function>. This function is passed a
+     struct that needs to be filled with the callback function pointers for
+     individual actions.
+     <programlisting>
+typedef struct OutputPluginCallbacks
+{
+    LogicalDecodeStartupCB startup_cb;
+    LogicalDecodeBeginCB begin_cb;
+    LogicalDecodeChangeCB change_cb;
+    LogicalDecodeCommitCB commit_cb;
+    LogicalDecodeShutdownCB shutdown_cb;
+} OutputPluginCallbacks;
+typedef void (*LogicalOutputPluginInit)(struct OutputPluginCallbacks *cb);
+     </programlisting>
+     The <function>begin_cb</function>, <function>change_cb</function>
+     and <function>commit_cb</> callbacks are required,
+     while <function>startup_cb</function> and <function>shutdown_cb</function> are optional.
+    </para>
+   </sect2>
+   <sect2 id="changesetextraction-output-plugin-startup">
+    <title>Startup Callback</title>
+    <para>
+     The optional startup callback is called whenever an replication slot
+     is created or asked to stream changes, independent of the number of
+     changes that are ready to be output.
+     <programlisting>
+typedef void (*LogicalDecodeStartupCB) (
+    struct LogicalDecodingContext *ctx,
+    bool is_init
+);
+     </programlisting>
+     The is_init paramter will be true when the replication slot is being
+     created and false otherwise.
+    </para>
+    <para>
+     The startup callback should validate the options present in
+     <literal>ctx-&gt;output_plugin_options</>. If the output plugin needs
+     to have state, it can use <literal>ctx-&gt;output_plugin_private</> to
+     store it.
+    </para>
+   </sect2>
+   <sect2 id="changesetextraction-output-plugin-shutdown">
+    <title>Shutdown Callback</title>
+    <para>
+     The optional shutdown callback is called whenever a formerly active
+     replication slot is not used anymore and can be used to deallocate
+     resources private to the output plugin. The slot isn't necessarily being
+     dropped, streaming is just being stopped.
+     <programlisting>
+      typedef void (*LogicalDecodeShutdownCB) (struct LogicalDecodingContext *ctx);
+     </programlisting>
+    </para>
+   </sect2>
+   <sect2 id="changesetextraction-output-plugin-begin">
+    <title>Transaction Begin Callback</title>
+    <para>
+     The required <function>begin_cb</function> callback is called whenever a
+     transaction start has been decoded, but only if we know that the
+     transaction has committed. Aborted transactions and their contents are
+     never decoded.
+     <programlisting>
+typedef void (*LogicalDecodeBeginCB) (
+    struct LogicalDecodingContext *,
+    ReorderBufferTXN *txn
+);
+     </programlisting>
+     The txn parameter contains meta information about the transaction,
+     like the timestamp at which it committed and its xid.
+    </para>
+   </sect2>
+   <sect2 id="changesetextraction-output-plugin-commit">
+    <title>Transaction End Callback</title>
+    <para>
+     The required <function>commit_cb</function> callback is called whenever a
+     transaction commit has been decoded. The <function>change_cb</function>
+     callbacks for all modified rows will have been called before this, if
+     there are have been any modified rows.
+     <programlisting>
+typedef void (*LogicalDecodeCommitCB) (
+    struct LogicalDecodingContext *,
+    ReorderBufferTXN *txn
+);
+     </programlisting>
+    </para>
+   </sect2>
+   <sect2 id="changesetextraction-output-plugin-change">
+    <title>Callback called for each individual change in a transaction</title>
+    <para>
+     The required <function>change_cb</function> callback is called for
+     every individual row modification inside a transaction, be it
+     an <command>INSERT</command>, <command>UPDATE</command>
+     or <command>DELETE</command>. Even if the original command modified
+     several rows at once, the callback will be called indvidually for each
+     row.
+     <programlisting>
+typedef void (*LogicalDecodeChangeCB) (
+    struct LogicalDecodingContext *ctx,
+    ReorderBufferTXN *txn,
+    Relation relation,
+    ReorderBufferChange *change
+);
+     </programlisting>
+     The <parameter>ctx</parameter> and <parameter>txn</parameter> parameters
+     have the same contents as for the <function>begin_cb</function>
+     and <function>commit_cb</function> callbacks, but additionally the
+     relation descriptor <parameter>relation</parameter>for the relation the
+     row belongs to and a struct <parameter>change</parameter> describing the
+     row modification are passed in.
+    </para>
+    <note>
+     <para>
+      Only changes in user defined tables, that are not unlogged or
+      temporary can be extracted using changeset extraction.
+     </para>
+    </note>
+   </sect2>
+   <sect2 id="changesetextraction-output-plugin-output">
+    <title>Functions for producing output from an output plugin</title>
+    <para>
+     To actually produce output output plugins can write data to
+     the <literal>StringInfo</literal> output buffer
+     in <literal>ctx-&gt;out</literal> when inside
+     the <function>begin_cb</function>, <function>commit_cb</function>, <function>change_cb</function>
+     callbacks. Before writing to the output
+     buffer <function>OutputPluginPrepareWrite(ctx, last_write)</function> has
+     to be called, and after finishing writing to the
+     buffer <function>OutputPluginWrite(ctx, last_write)</function> has to be
+     called to perform the write. The <parameter>last_write</parameter>
+     indicates whether a particular write was the callback's last write.
+    </para>
+   </sect2>
+  </sect1>
+  <sect1 id="changesetextraction-writer">
+   <title>Changeset Extraction Output Writers</title>
+   <para>
+    It is possible to add additional output methods, in addition to the SQL
+    and replication protocol variants, of consuming changeset extraction
+    data. For details look at the implementation of the SQL interface
+    functions
+    in <filename>src/backend/replication/logical/logicalfuncs.c</filename>. Essentially
+    three functions need to be provided, one to read WAL, one to prepare
+    writing output and one to write the output
+    (see <xref linkend="changesetextraction-output-plugin-output">).
+   </para>
+  </sect1>
+ </chapter>
