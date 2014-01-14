@@ -718,8 +718,8 @@ replay_read_page(XLogReaderState* state, XLogRecPtr targetPagePtr, int reqLen,
 }
 
 /*
- * Initialize logical replication and wait for an initial consistent point to
- * start sending changes from.
+ * Initialize a logical or physical replication slot and wait for an initial
+ * consistent point to start sending changes from.
  */
 static void
 CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
@@ -850,7 +850,7 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 	pq_endmessage(&buf);
 
 	/*
-	 * release active status again, START_LOGICAL_REPLICATION will reacquire it
+	 * release active status again, START_REPLICATION will reacquire it
 	 */
 	ReplicationSlotRelease();
 }
