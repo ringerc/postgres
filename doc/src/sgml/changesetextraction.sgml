@@ -226,7 +226,7 @@ COMMIT 721
     and <literal>START_REPLICATION SLOT slotname LOGICAL options</literal>
     commands can be used to create, drop and stream changes from a replication
     slot respectively. These commands are only available over a replication
-    connection; the won't work from the SQL level.
+    connection; the won't work from the SQL level. See <xref linkend="protocol-replication">.
    </para>
    <para>
     The <command>pg_recvlogical</command> command
