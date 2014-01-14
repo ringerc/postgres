@@ -126,8 +126,9 @@ postgres=# SELECT * FROM decoding_slot_peek_changes('regression_slot', 'now', 'i
  0/16EBF58 | 719 | COMMIT
     </programlisting>
    <para>
-    The following example shows usage of the walsender interface
-    using <link linkend="app-pgrecvlogical"><command>pg_recvlogical</command></link>.
+    The following example shows usage of the walsender interface using the <link
+    linkend="app-pgrecvlogical"><command>pg_recvlogical</command></link> shell
+    command.
    </para>
    <programlisting>
 # pg_recvlogical --slot test --init
@@ -145,7 +146,6 @@ COMMIT 721
    <sect2>
     <indexterm>
      <primary>Logical Replication Slot</primary>
-     <secondary>Changeset Extraction Slot</secondary>
     </indexterm>
     <title>Logical Replication Slots</title>
     <para>
@@ -210,8 +210,12 @@ COMMIT 721
      snapshot is exported
      (see <xref linkend="functions-snapshot-synchronization">) which will show
      exactly the state of the database after which all changes will be
-     included in the changestream. This can be used to create a new replica.
+     included in the changestream. This can be used to create a new replica
+     by using <link linkend="sql-set-transaction"><literal>SET TRANSACTION
+     SNAPSHOT</literal></link> to read the state of the database at the moment
+     the slot was created.
     </para>
+     
    </sect2>
   </sect1>
   <sect1 id="changesetextraction-walsender">
@@ -221,7 +225,8 @@ COMMIT 721
     options</literal>, <literal>DROP_REPLICATION_SLOT SLOT slotname</literal>
     and <literal>START_REPLICATION SLOT slotname LOGICAL options</literal>
     commands can be used to create, drop and stream changes from a replication
-    slot respectively.
+    slot respectively. These commands are only available over a replication
+    connection; the won't work from the SQL level.
    </para>
    <para>
     The <command>pg_recvlogical</command> command
@@ -254,7 +259,11 @@ COMMIT 721
          (<parameter>slotname</parameter> <type>text</type>, <parameter>xlog_position</parameter> <type>text</type>)
         </entry>
         <entry>
-         Creates a new replication slot named <parameter>slotname</parameter> using the output plugin <parameter>plugin</parameter>.
+         Creates a new replication slot named <parameter>slotname</parameter>
+         using the output plugin <parameter>plugin</parameter>. Output plugins
+         are listed amongst the extensions in
+         <literal>pg_catalog.pg_available_extensions</literal>, but there is no
+         specific listing of available output plugins.
         </entry>
        </row>
        <row>
@@ -269,7 +278,8 @@ COMMIT 721
         </entry>
         <entry>
          Returns all changes in the slot <parameter>slotname</parameter> since
-         changes have been consumed last. Changes will be consumed.
+         changes have been consumed last, up until the changes visible at the
+         time this call starts. Changes will be consumed.
         </entry>
        </row>
        <row>
@@ -284,7 +294,8 @@ COMMIT 721
         </entry>
         <entry>
          Returns all changes in the slot <parameter>slotname</parameter> since
-         changes have been consumed last. Changes will not be consumed.
+         changes have been consumed last, up to the changes visible at the start
+         of this call. Changes will not be consumed.
         </entry>
        </row>
        <row>
@@ -326,8 +337,9 @@ COMMIT 721
   <sect1 id="changesetextraction-output-plugin">
    <title>Changeset Extraction Output Plugins</title>
    <para>
-    Look into the <filename>contrib/test_decoding</filename> subdirectory for an
-    example output plugin.
+    An example output plugin can be found in the
+    <filename>contrib/test_decoding</filename> subdirectory of the PostgreSQL
+    source tree.
    </para>
    <sect2 id="changesetextraction-output-init">
     <title>Initialization Function</title>
@@ -335,12 +347,12 @@ COMMIT 721
      <primary>_PG_output_plugin_init</primary>
     </indexterm>
     <para>
-     An output plugin will be loaded by dynamically loading the output
-     plugin using the plugin's name as the shared object's basename. To
-     provide its callbacks and to signal that the shared object indeed
-     implements an output plugin it needs to provide a function
-     named <function>_PG_output_plugin_init</function> which will get
-     passed a struct that needs to be filled with the callback for
+     An output plugin is loaded by dynamically loading a shared library
+     with the output plugin's name as the library basename. To
+     provide the required output plugin callbacks and to indicate that the
+     library is actually an output plugin it needs to provide a function named
+     <function>_PG_output_plugin_init</function>. This function is passed a
+     struct that needs to be filled with the callback function pointers for
      individual actions.
      <programlisting>
 typedef struct OutputPluginCallbacks
@@ -354,8 +366,8 @@ typedef struct OutputPluginCallbacks
 typedef void (*LogicalOutputPluginInit)(struct OutputPluginCallbacks *cb);
      </programlisting>
      The <function>begin_cb</function>, <function>change_cb</function>
-     and <function>commit_cb</> callbacks are obligatory,
-     while <function>startup_cb</function> and <function>shutdown_cb</function> are not.
+     and <function>commit_cb</> callbacks are required,
+     while <function>startup_cb</function> and <function>shutdown_cb</function> are optional.
     </para>
    </sect2>
    <sect2 id="changesetextraction-output-plugin-startup">
@@ -385,7 +397,8 @@ typedef void (*LogicalDecodeStartupCB) (
     <para>
      The optional shutdown callback is called whenever a formerly active
      replication slot is not used anymore and can be used to deallocate
-     resources private to the output plugin.
+     resources private to the output plugin. The slot isn't necessarily being
+     dropped, streaming is just being stopped.
      <programlisting>
       typedef void (*LogicalDecodeShutdownCB) (struct LogicalDecodingContext *ctx);
      </programlisting>
@@ -394,7 +407,7 @@ typedef void (*LogicalDecodeStartupCB) (
    <sect2 id="changesetextraction-output-plugin-begin">
     <title>Transaction Begin Callback</title>
     <para>
-     The obligatory <function>begin_cb</function> callback is called whenever a
+     The required <function>begin_cb</function> callback is called whenever a
      transaction start has been decoded, but only if we know that the
      transaction has committed. Aborted transactions and their contents are
      never decoded.
@@ -411,7 +424,7 @@ typedef void (*LogicalDecodeBeginCB) (
    <sect2 id="changesetextraction-output-plugin-commit">
     <title>Transaction End Callback</title>
     <para>
-     The obligatory <function>commit_cb</function> callback is called whenever a
+     The required <function>commit_cb</function> callback is called whenever a
      transaction commit has been decoded. The <function>change_cb</function>
      callbacks for all modified rows will have been called before this, if
      there are have been any modified rows.
@@ -426,7 +439,7 @@ typedef void (*LogicalDecodeCommitCB) (
    <sect2 id="changesetextraction-output-plugin-change">
     <title>Callback called for each individual change in a transaction</title>
     <para>
-     The obligatory <function>change_cb</function> callback is called for
+     The required <function>change_cb</function> callback is called for
      every individual row modification inside a transaction, be it
      an <command>INSERT</command>, <command>UPDATE</command>
      or <command>DELETE</command>. Even if the original command modified
