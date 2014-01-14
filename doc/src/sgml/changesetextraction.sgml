@@ -28,6 +28,115 @@
    replication slot without modifying core code (see
    <xref linkend="changesetextraction-writer">).
   </para>
+  <sect1 id="changesetextraction-example">
+   <title>Changeset Extraction Example</title>
+   <para>
+    The following example shows usage of the SQL interface.
+   </para>
+   <programlisting>
+postgres=# SHOW max_replication_slots;
+ max_replication_slots
+-----------------------
+ 15
+(1 row)
+
+postgres=# SHOW wal_level;
+ wal_level
+-----------
+ logical
+(1 row)
+
+postgres=# SELECT * FROM pg_replication_slots;
+ slot_name | plugin | slottype | datoid | database | active | catalog_xmin | data_xmin | restart_decoding_lsn
+-----------+--------+----------+--------+----------+--------+--------------+-----------+----------------------
+(0 rows)
+
+postgres=# SELECT * FROM create_decoding_replication_slot('regression_slot', 'test_decoding');
+    slotname     | xlog_position
+-----------------+---------------
+ regression_slot | 0/16B1970
+
+postgres=# SELECT * FROM pg_replication_slots;
+    slot_name    |    plugin     | slottype | datoid | database | active | catalog_xmin | data_xmin | restart_decoding_lsn
+-----------------+---------------+----------+--------+----------+--------+--------------+-----------+----------------------
+ regression_slot | test_decoding | logical  |  12054 | postgres | f      |          690 |         0 | 0/16B1938
+(1 row)
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location | xid | data
+----------+-----+------
+(0 rows)
+
+postgres=# CREATE TABLE data(id serial primary key, data text);
+CREATE TABLE
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |  data
+-----------+-----+--------
+ 0/16E1558 | 716 | BEGIN
+ 0/16EBAC8 | 716 | COMMIT
+(2 rows)
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBBC0 | 717 | BEGIN
+ 0/16EBCD8 | 717 | table "data": INSERT: id[int4]:1 data[text]:1
+ 0/16EBCD8 | 717 | COMMIT
+(3 rows)
+
+Time: 28.123 ms
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location | xid | data
+----------+-----+------
+(0 rows)
+
+postgres=# BEGIN;
+postgres=# INSERT INTO data(data) VALUES('1');
+postgres=# INSERT INTO data(data) VALUES('1');
+postgres=# COMMIT;
+
+postgres=# SELECT * FROM decoding_slot_get_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBD10 | 718 | BEGIN
+ 0/16EBE60 | 718 | table "data": INSERT: id[int4]:2 data[text]:1
+ 0/16EBE60 | 718 | table "data": INSERT: id[int4]:3 data[text]:1
+ 0/16EBE60 | 718 | COMMIT
+(4 rows)
+
+postgres=# INSERT INTO data(data) VALUES('1');
+postgres=# SELECT * FROM decoding_slot_peek_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBE98 | 719 | BEGIN
+ 0/16EBF58 | 719 | table "data": INSERT: id[int4]:4 data[text]:1
+ 0/16EBF58 | 719 | COMMIT
+(3 rows)
+
+Time: 40.875 ms
+postgres=# SELECT * FROM decoding_slot_peek_changes('regression_slot', 'now', 'include-xids', '0');
+ location  | xid |                     data
+-----------+-----+-----------------------------------------------
+ 0/16EBE98 | 719 | BEGIN
+ 0/16EBF58 | 719 | table "data": INSERT: id[int4]:4 data[text]:1
+ 0/16EBF58 | 719 | COMMIT
+    </programlisting>
+   <para>
+    The following example shows usage of the walsender interface
+    using <link linkend="app-pgrecvlogical"><command>pg_recvlogical</command></link>.
+   </para>
+   <programlisting>
+# pg_recvlogical --slot test --init
+# pg_recvlogical --slot test -f - --start
+CTRL-Z
+# psql -c "INSERT INTO data(data) VALUES('1');"
+# fg
+BEGIN 721
+table "data": INSERT: id[int4]:5 data[text]:1
+COMMIT 721
+   </programlisting>
+  </sect1>
   <sect1 id="changesetextraction-explanation">
    <title>Changeset Extraction Concepts</title>
    <sect2>
