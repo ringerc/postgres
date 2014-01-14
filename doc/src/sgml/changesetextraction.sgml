@@ -11,8 +11,10 @@
   </para>
 
   <para>
-   <indexterm><primary>Replication Slot</primary></indexterm>
-   A Replication Slot is frak.
+   <indexterm><primary>Changeset Extraction Slot</primary></indexterm>
+   A changeset extraction slot ("logical replication slot") is a persistent
+   server-side record of the replay progress of a stream of changes. A stream of
+   changes is read from the slot to a receiving client program.
   </para>
   <para>
    The format in which those changes are streamed is determined by the output
@@ -20,7 +22,7 @@
    be written to extend the choice of available formats.
   </para>
   <para>
-   Changes can be consumed either using the streaming replication protocol
+   Changes can be consumed either using one streaming replication protocol
    (see <xref linkend="protocol-replication"> and
    <xref linkend="changesetextraction-walsender">), or by calling functions
    via SQL (see <xref linkend="changesetextraction-sql">). It is also
@@ -28,6 +30,7 @@
    replication slot without modifying core code (see
    <xref linkend="changesetextraction-writer">).
   </para>
+
   <sect1 id="changesetextraction-example">
    <title>Changeset Extraction Example</title>
    <para>
@@ -141,27 +144,64 @@ COMMIT 721
    <title>Changeset Extraction Concepts</title>
    <sect2>
     <indexterm>
-     <primary>Replication Slot</primary>
+     <primary>Logical Replication Slot</primary>
+     <secondary>Changeset Extraction Slot</secondary>
     </indexterm>
-    <title>Replication Slots</title>
+    <title>Logical Replication Slots</title>
     <para>
-     In the context of changeset extraction a replication slot is a stream of
-     changes which can be replicated. Each slot can stream changes from a
-     single database and streams each change exactly once (unless peeking
-     forward in the stream).
+     In the context of changeset extraction a logical replication slot
+     represents a stream of changes which can be replayed to a client in the
+     order they were made on the origin server. Each slot streams a sequence
+     of changes from a single database, sending each change exactly once
+     (unless peeking forward in the stream).
     </para>
     <note>
-     <para>Replication slots also exist in the context of streaming replication (see
-      <xref linkend="streaming-replication">), but they are used to a
-       slightly different end there.
+     <para>PostgreSQL also has streaming replication slots (see <xref
+     linkend="streaming-replication">), but they are used somewhat differently
+     there. Streaming replication slots have a different interface and can not
+     be used with the functions described here.
      </para>
     </note>
     <para>
-     Replication streams are identified by an identifier which has to be
-     unique across all databases in a <productname>PostgreSQL</productname>
-     cluster. They persist across crashes, and can be allocated in both
-     primaries and Hot-Standby standbys.
+     Logical replication slots have an identifier which is unique across all
+     databases in a <productname>PostgreSQL</productname> cluster. Slots persist
+     independently of the connection using them and are crash-safe.
+     They can be allocated in primary servers or hot-standby servers (streaming
+     replicas or archive-replaying hot standbys), so it's possible to replicate
+     changes over physical replication then read a logical change stream from a
+     physical replica server.
     </para>
+    <para>
+     Multiple independent slots may exist for a single database. Each slot
+     has its own independent position marker, allowing different consumers
+     to start replaying from different points in the database change stream
+     and replay at different rates. For most applications a separate slot
+     is required for each changeset consumer.
+    </para>
+    <para>
+     A changeset extraction slot knows nothing about the state of the receiver(s).
+     It's even possible to have multiple different receivers use the same slot at
+     different times; they'll just get the changes following on from when the last
+     receiver stopped consuming them. Only one receiver may consume changes from
+     a slot at any given time.
+    </para>
+    <sect3 id="changesetextraction-abandoned-slots">
+     <title>Unused/abandoned slots</title>
+     <para>
+      Because changeset extraction slots persist across crashes, know nothing
+      about the state of any consumer(s), and exist even when there is no
+      connection using them, they need to record and store changes made on the
+      server. This consumes storage and delays necessary cleanup tasks in the
+      system catalogs, so if a slot is no longer required it should be dropped.
+     </para>
+     <para>
+      Slots may be created manually, or using a client like a replication tool.
+      Keep this in mind when you retire a client that uses a changeset extraction
+      slot, like a logical replica - you may need to give it a specific command to
+      remove its changeset extraction slot, or drop the slot yourself, even if you
+      did not initially create the slot by hand.
+     </para>
+    </sect3>
    </sect2>
    <sect2>
     <title>Exported Snapshots</title>
