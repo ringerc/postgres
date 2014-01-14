@@ -357,6 +357,9 @@ ReplicationSlotRelease(void)
 
 	MyReplicationSlot = NULL;
 
+	/* might not have been set when we've been a plain slot */
+	MyPgXact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
+
 	/*
 	 * XXX: There's not actually any need to save the slot to disk, it will be
 	 * marked inactive after a crash/restart anyway. But we'd need to
@@ -567,6 +570,8 @@ KillSlot(int code, Datum arg)
 	if (MyReplicationSlot && MyReplicationSlot->active)
 	{
 		MyReplicationSlot->active = false;
+		/* might not have been set when we've been a plain slot */
+		MyPgXact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
 	}
 	MyReplicationSlot = NULL;
 }

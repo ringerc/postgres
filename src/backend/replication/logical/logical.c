@@ -28,6 +28,7 @@
 #include "replication/snapbuild.h"
 
 #include "storage/ipc.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/fd.h"
 
@@ -643,7 +644,7 @@ CreateDecodingContext(bool is_init,
 		 * global xmin to advance above our xmin.
 		 */
 		LWLockAcquire(ProcArrayLock, LW_SHARED);
-		slot->effective_catalog_xmin = GetOldestXmin(true, true, true);
+		slot->effective_catalog_xmin = GetOldestXmin(true, true, true, true);
 		slot->catalog_xmin = slot->effective_catalog_xmin;
 
 		if (!TransactionIdIsValid(ReplicationSlotCtl->catalog_xmin) ||
@@ -652,7 +653,7 @@ CreateDecodingContext(bool is_init,
 			ReplicationSlotCtl->catalog_xmin = slot->effective_catalog_xmin;
 		LWLockRelease(ProcArrayLock);
 
-		Assert(slot->effective_catalog_xmin <= GetOldestXmin(true, true, false));
+		Assert(slot->effective_catalog_xmin <= GetOldestXmin(true, true, true, false));
 
 		xmin_horizon = slot->catalog_xmin;
 	}
@@ -661,6 +662,13 @@ CreateDecodingContext(bool is_init,
 
 	/* load output plugins, so we detect a wrong output plugin now. */
 	LoadOutputPlugin(&ctx->callbacks, NameStr(slot->plugin));
+
+	/*
+	 * Now that the slot's xmin has been set, we can announce ourselves as a
+	 * logical decoding backend which doesn't need to be checked when
+	 * computing the xmin horizon.
+	 */
+	MyPgXact->vacuumFlags |= PROC_IN_LOGICAL_DECODING;
 
 	ctx->slot = slot;
 

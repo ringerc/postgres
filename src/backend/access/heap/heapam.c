@@ -347,8 +347,11 @@ heapgetpage(HeapScanDesc scan, BlockNumber page)
 	/*
 	 * Prune and repair fragmentation for the whole page, if possible.
 	 */
-	Assert(TransactionIdIsValid(RecentGlobalXmin));
-	heap_page_prune_opt(scan->rs_rd, buffer, RecentGlobalXmin);
+	if (IsSystemRelation(scan->rs_rd)
+		|| RelationIsAccessibleInLogicalDecoding(scan->rs_rd))
+		heap_page_prune_opt(scan->rs_rd, buffer, RecentGlobalXmin);
+	else
+		heap_page_prune_opt(scan->rs_rd, buffer, RecentGlobalDataXmin);
 
 	/*
 	 * We must hold share lock on the buffer content while examining tuple
