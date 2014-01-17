@@ -1431,7 +1431,8 @@ The commands accepted in walsender mode are:
     <term><literal>CREATE_REPLICATION_SLOT</literal> <literal>SLOT</literal> <replaceable class="parameter">slotname</> [ <literal>PHYSICAL</literal> | <literal>LOGICAL</literal> <replaceable class="parameter">output_plugin</> ] </term>
     <listitem>
      <para>
-     Create a physical or logical replication slot. XXXXTODOXXXX
+      Create a physical or logical replication slot. See <xref
+      linkend="changesetextraction"> for more about replication slots.
      </para>
      <para>
        Whether a database name must be specified at connect time depends on whether
@@ -1474,10 +1475,6 @@ The commands accepted in walsender mode are:
          identifier specifying the name of the shared library implementing the
          desired output plugin. See <xref linkend="changesetextraction">.
         </para>
-        <para>
-         The output plugin is loaded immediately. Failure to load the plugin
-         results in an error. (XXXXTODOXXXX Fact check)
-        </para>
        </listitem>
       </varlistentry>
      </variablelist>
@@ -1491,10 +1488,10 @@ The commands accepted in walsender mode are:
       Instructs server to start streaming physical WAL records, starting at
       WAL position <replaceable class="parameter">XXX/XXX</>. If specified,
       streaming starts on timeline <replaceable class="parameter">tli</>, otherwise
-      the server's current timeline is selected (XXXXTODOXXXX check this). The
-      server can reply with an error, e.g. if the requested section of WAL has
-      already been recycled. On success, server responds with a
-      CopyBothResponse message, and then starts to stream WAL to the frontend.
+      the server's current timeline is selected. The server can reply with an
+      error, e.g. if the requested section of WAL has already been recycled. On
+      success, server responds with a CopyBothResponse message, and then starts
+      to stream WAL to the frontend.
      </para>
 
      <para>
@@ -1840,10 +1837,7 @@ The commands accepted in walsender mode are:
        <term><replaceable class="parameter">XXX/XXX</></term>
        <listitem>
         <para>
-         The WAL position to begin streaming at. This must be equal to or greater
-         than the current LSN of the specified slot; if greater, the slot seeks
-         forward to the specified LSN, discarding prior changes. (XXXXTODOXXXX just
-         a guess, read the code to confirm this).
+         The WAL position to begin streaming at.
         </para>
        </listitem>
       </varlistentry>
@@ -1857,7 +1851,7 @@ The commands accepted in walsender mode are:
      <para>
      Drops a physical or logical replication slot, freeing any reserved server-side
      resources. If the slot is currently in use by an active connection this command
-     fails with XXXXTODOXXXX.
+     fails.
      </para>
      <variablelist>
       <varlistentry>
