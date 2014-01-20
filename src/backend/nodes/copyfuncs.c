@@ -1936,6 +1936,7 @@ _copyAppendRelInfo(const AppendRelInfo *from)
 
 	COPY_SCALAR_FIELD(parent_relid);
 	COPY_SCALAR_FIELD(child_relid);
+	COPY_SCALAR_FIELD(child_result);
 	COPY_SCALAR_FIELD(parent_reltype);
 	COPY_SCALAR_FIELD(child_reltype);
 	COPY_NODE_FIELD(translated_vars);
@@ -2467,6 +2468,7 @@ _copyQuery(const Query *from)
 	COPY_SCALAR_FIELD(canSetTag);
 	COPY_NODE_FIELD(utilityStmt);
 	COPY_SCALAR_FIELD(resultRelation);
+	COPY_SCALAR_FIELD(sourceRelation);
 	COPY_SCALAR_FIELD(hasAggs);
 	COPY_SCALAR_FIELD(hasWindowFuncs);
 	COPY_SCALAR_FIELD(hasSubLinks);

@@ -814,6 +814,7 @@ _equalAppendRelInfo(const AppendRelInfo *a, const AppendRelInfo *b)
 {
 	COMPARE_SCALAR_FIELD(parent_relid);
 	COMPARE_SCALAR_FIELD(child_relid);
+	COMPARE_SCALAR_FIELD(child_result);
 	COMPARE_SCALAR_FIELD(parent_reltype);
 	COMPARE_SCALAR_FIELD(child_reltype);
 	COMPARE_NODE_FIELD(translated_vars);
@@ -849,6 +850,7 @@ _equalQuery(const Query *a, const Query *b)
 	COMPARE_SCALAR_FIELD(canSetTag);
 	COMPARE_NODE_FIELD(utilityStmt);
 	COMPARE_SCALAR_FIELD(resultRelation);
+	COMPARE_SCALAR_FIELD(sourceRelation);
 	COMPARE_SCALAR_FIELD(hasAggs);
 	COMPARE_SCALAR_FIELD(hasWindowFuncs);
 	COMPARE_SCALAR_FIELD(hasSubLinks);
