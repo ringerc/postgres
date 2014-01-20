@@ -37,6 +37,7 @@
 #include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_rowsecurity.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -2807,6 +2808,8 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_SetTableSpace:		/* must rewrite heap */
 			case AT_DropNotNull:		/* may change some SQL plans */
 			case AT_SetNotNull:
+			case AT_SetRowSecurity:
+			case AT_ResetRowSecurity:
 			case AT_GenericOptions:
 			case AT_AlterColumnGenericOptions:
 				cmd_lockmode = AccessExclusiveLock;
@@ -3182,6 +3185,8 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DropInherit:	/* NO INHERIT */
 		case AT_AddOf:			/* OF */
 		case AT_DropOf: /* NOT OF */
+		case AT_SetRowSecurity:
+		case AT_ResetRowSecurity:
 			ATSimplePermissions(rel, ATT_TABLE);
 			/* These commands never recurse */
 			/* No command-specific prep needed */
@@ -3466,6 +3471,12 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			break;
 		case AT_DropOf:
 			ATExecDropOf(rel, lockmode);
+			break;
+		case AT_SetRowSecurity:
+			ATExecSetRowSecurity(rel, cmd->name, (Node *) cmd->def);
+			break;
+		case AT_ResetRowSecurity:
+			ATExecSetRowSecurity(rel, cmd->name, NULL);
 			break;
 		case AT_ReplicaIdentity:
 			ATExecReplicaIdentity(rel, (ReplicaIdentityStmt *) cmd->def, lockmode);
@@ -7830,6 +7841,22 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 				 * it below.
 				 */
 				Assert(defaultexpr);
+				break;
+
+			case OCLASS_ROWSECURITY:
+				/*
+				 * A row-level security policy can depend on a column in case
+				 * when the policy clause references a particular column.
+				 * Due to same reason why TRIGGER ... WHEN does not support
+				 * to change column's type being referenced in clause, row-
+				 * level security policy also does not support it.
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot alter type of a column used in a row-level security policy"),
+						 errdetail("%s depends on column \"%s\"",
+								   getObjectDescription(&foundObject),
+								   colName)));
 				break;
 
 			case OCLASS_PROC:
