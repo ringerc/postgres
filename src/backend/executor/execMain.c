@@ -789,8 +789,9 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	foreach(l, plannedstmt->rowMarks)
 	{
 		PlanRowMark *rc = (PlanRowMark *) lfirst(l);
-		Oid			relid;
-		Relation	relation;
+		RangeTblEntry *rte = NULL;
+		Relation	relation = NULL;
+		LOCKMODE	lockmode = NoLock;
 		ExecRowMark *erm;
 
 		/* ignore "parent" rowmarks; they are irrelevant at runtime */
@@ -803,27 +804,33 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 			case ROW_MARK_NOKEYEXCLUSIVE:
 			case ROW_MARK_SHARE:
 			case ROW_MARK_KEYSHARE:
-				relid = getrelid(rc->rti, rangeTable);
-				relation = heap_open(relid, RowShareLock);
+				rte = rt_fetch(rc->rti, rangeTable);
+				lockmode = RowShareLock;
 				break;
 			case ROW_MARK_REFERENCE:
-				relid = getrelid(rc->rti, rangeTable);
-				relation = heap_open(relid, AccessShareLock);
+				rte = rt_fetch(rc->rti, rangeTable);
+				lockmode = AccessShareLock;
 				break;
 			case ROW_MARK_COPY:
 				/* there's no real table here ... */
-				relation = NULL;
 				break;
 			default:
 				elog(ERROR, "unrecognized markType: %d", rc->markType);
-				relation = NULL;	/* keep compiler quiet */
 				break;
 		}
 
 		/* Check that relation is a legal target for marking */
-		if (relation)
+		if (rte)
+		{
+			if (rte->rtekind == RTE_RELATION)
+				relation = heap_open(rte->relid, lockmode);
+			else
+			{
+				Assert(rte->rtekind == RTE_SUBQUERY);
+				relation = heap_open(rte->rowsec_relid, lockmode);
+			}
 			CheckValidRowMarkRel(relation, rc->markType);
-
+		}
 		erm = (ExecRowMark *) palloc(sizeof(ExecRowMark));
 		erm->relation = relation;
 		erm->rti = rc->rti;
