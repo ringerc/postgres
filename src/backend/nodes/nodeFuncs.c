@@ -1948,8 +1948,11 @@ query_tree_walker(Query *query,
 		return true;
 	if (walker((Node *) query->withCheckOptions, context))
 		return true;
-	if (walker((Node *) query->returningList, context))
-		return true;
+	if (!(flags & QTW_IGNORE_RETURNING))
+	{
+		if (walker((Node *) query->returningList, context))
+			return true;
+	}
 	if (walker((Node *) query->jointree, context))
 		return true;
 	if (walker(query->setOperations, context))
@@ -2686,7 +2689,10 @@ query_tree_mutator(Query *query,
 
 	MUTATE(query->targetList, query->targetList, List *);
 	MUTATE(query->withCheckOptions, query->withCheckOptions, List *);
-	MUTATE(query->returningList, query->returningList, List *);
+	if (!(flags & QTW_IGNORE_RETURNING))
+		MUTATE(query->returningList, query->returningList, List *);
+	else
+		query->returningList = copyObject(query->returningList);
 	MUTATE(query->jointree, query->jointree, FromExpr *);
 	MUTATE(query->setOperations, query->setOperations, Node *);
 	MUTATE(query->havingQual, query->havingQual, Node *);

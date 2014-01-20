@@ -33,6 +33,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
+#include "optimizer/rowsecurity.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/analyze.h"
@@ -404,6 +405,19 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	 * subqueries.
 	 */
 	expand_inherited_tables(root);
+
+	/*
+	 * Apply row-security policy of the relation being referenced,
+	 * if configured with either of built-in or extension's features.
+	 * RangeTblEntry of the relation with row-security policy shall
+	 * be replaced with a row-security subquery that has simple scan
+	 * on the target relation with row-security policy qualifiers.
+	 *
+	 * This routine assumes PlannerInfo is already handled with
+	 * expand_inherited_tables, thus, AppendRelInfo or PlanRowMark
+	 * have valid information.
+	 */
+	apply_row_security_policy(root);
 
 	/*
 	 * Set hasHavingQual to remember if HAVING clause is present.  Needed
@@ -898,6 +912,8 @@ inheritance_planner(PlannerInfo *root)
 					ChangeVarNodes((Node *) subroot.parse, rti, newrti, 0);
 					ChangeVarNodes((Node *) subroot.rowMarks, rti, newrti, 0);
 					ChangeVarNodes((Node *) subroot.append_rel_list, rti, newrti, 0);
+ 					if (subroot.parse->sourceRelation == rti)
+ 						subroot.parse->sourceRelation = newrti;
 					rte = copyObject(rte);
 					subroot.parse->rtable = lappend(subroot.parse->rtable,
 													rte);
@@ -960,7 +976,10 @@ inheritance_planner(PlannerInfo *root)
 		root->init_plans = subroot.init_plans;
 
 		/* Build list of target-relation RT indexes */
-		resultRelations = lappend_int(resultRelations, appinfo->child_relid);
+		resultRelations = lappend_int(resultRelations,
+									  (appinfo->child_result > 0 ?
+									   appinfo->child_result :
+									   appinfo->child_relid));
 
 		/* Build lists of per-relation WCO and RETURNING targetlists */
 		if (parse->withCheckOptions)

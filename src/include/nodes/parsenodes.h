@@ -113,7 +113,9 @@ typedef struct Query
 
 	int			resultRelation; /* rtable index of target relation for
 								 * INSERT/UPDATE/DELETE; 0 for SELECT */
-
+	int			sourceRelation;	/* rtable index of source relation for
+								 * UPDATE/DELETE, if not identical with
+								 * resultRelation; 0 for elsewhere */
 	bool		hasAggs;		/* has aggregates in tlist or havingQual */
 	bool		hasWindowFuncs; /* has window functions in tlist */
 	bool		hasSubLinks;	/* has subquery SubLink */

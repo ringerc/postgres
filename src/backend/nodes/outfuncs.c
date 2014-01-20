@@ -1925,6 +1925,7 @@ _outAppendRelInfo(StringInfo str, const AppendRelInfo *node)
 
 	WRITE_UINT_FIELD(parent_relid);
 	WRITE_UINT_FIELD(child_relid);
+	WRITE_UINT_FIELD(child_result);
 	WRITE_OID_FIELD(parent_reltype);
 	WRITE_OID_FIELD(child_reltype);
 	WRITE_NODE_FIELD(translated_vars);
@@ -2241,6 +2242,7 @@ _outQuery(StringInfo str, const Query *node)
 		appendStringInfoString(str, " :utilityStmt <>");
 
 	WRITE_INT_FIELD(resultRelation);
+	WRITE_INT_FIELD(sourceRelation);
 	WRITE_BOOL_FIELD(hasAggs);
 	WRITE_BOOL_FIELD(hasWindowFuncs);
 	WRITE_BOOL_FIELD(hasSubLinks);
