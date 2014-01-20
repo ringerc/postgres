@@ -69,6 +69,8 @@ typedef struct
 } RowSecurityDesc;
 
 extern void	RelationBuildRowSecurity(Relation relation);
+extern void	ATExecSetRowSecurity(Relation relation,
+								 const char *cmdname, Node *clause);
 extern void	RemoveRowSecurityById(Oid relationId);
 
 #endif  /* PG_ROWSECURITY_H */

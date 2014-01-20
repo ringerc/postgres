@@ -69,6 +69,8 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
     NOT OF
     OWNER TO <replaceable class="PARAMETER">new_owner</replaceable>
     SET TABLESPACE <replaceable class="PARAMETER">new_tablespace</replaceable>
+    SET ROW SECURITY FOR <replaceable class="PARAMETER">rowsec_command</replaceable> TO (<replaceable class="PARAMETER">condition</replaceable>)
+    RESET ROW SECURITY FOR <replaceable class="PARAMETER">rowsec_command</replaceable>
     REPLICA IDENTITY {DEFAULT | USING INDEX <replaceable class="PARAMETER">index_name</replaceable> | FULL | NOTHING}
 
 <phrase>and <replaceable class="PARAMETER">table_constraint_using_index</replaceable> is:</phrase>
@@ -76,6 +78,8 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
     [ CONSTRAINT <replaceable class="PARAMETER">constraint_name</replaceable> ]
     { UNIQUE | PRIMARY KEY } USING INDEX <replaceable class="PARAMETER">index_name</replaceable>
     [ DEFERRABLE | NOT DEFERRABLE ] [ INITIALLY DEFERRED | INITIALLY IMMEDIATE ]
+<phrase>and <replaceable class="PARAMETER">rowsec_command</replaceable> is:</phrase>
+    { ALL | SELECT | INSERT | UPDATE | DELETE }
 </synopsis>
  </refsynopsisdiv>
 
@@ -581,6 +585,26 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
    </varlistentry>
 
    <varlistentry>
+    <term><literal>SET ROW SECURITY FOR <replaceable class="PARAMETER">rowsec_command</replaceable> TO (<replaceable class="PARAMETER">condition</replaceable>)</literal></term>
+    <listitem>
+     <para>
+      This form set row-level security policy of the table.
+      Supplied <replaceable class="PARAMETER">condition</replaceable> performs
+      as if it is implicitly appended to the qualifiers of <literal>WHERE</literal>
+      clause, although mechanism guarantees to evaluate this condition earlier
+      than any other user given condition.
+      <literal>ALL</> is the only supported command type right now.
+      See also <xref linkend="ROW-SECURITY">.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>RESET ROW SECURITY FOR <replaceable class="PARAMETER">rowsec_command</replaceable></literal></term>
+    <listitem>
+     <para>
+      This form reset row-level security policy of the table, if exists.
+      <literal>ALL</> is the only supported command type right now.
     <term><literal>REPLICA IDENTITY</literal></term>
     <listitem>
      <para>
@@ -836,6 +860,20 @@ ALTER TABLE [ IF EXISTS ] <replaceable class="PARAMETER">name</replaceable>
       <listitem>
        <para>
         The name of the schema to which the table will be moved.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><replaceable class="PARAMETER">condition</replaceable></term>
+      <listitem>
+       <para>
+        An expression that returns a value of type boolean. Expect for a case
+        when queries are executed with superuser privilege, only rows for which
+        this expression returns true will be fetched, updated or deleted.
+        This expression can reference columns of the relation being configured.
+        Sub-queries can be contained within expression tree, unless referenced
+        relation recursively references the same relation.
        </para>
       </listitem>
      </varlistentry>
