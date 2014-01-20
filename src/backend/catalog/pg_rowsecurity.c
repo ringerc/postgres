@@ -285,3 +285,53 @@ RemoveRowSecurityById(Oid rowsecId)
 	systable_endscan(sscan);
 	heap_close(catalog, RowExclusiveLock);
 }
+
+/*
+ * ALTER TABLE <name> SET ROW SECURITY (...) OR
+ *                    RESET ROW SECURITY
+ */
+void
+ATExecSetRowSecurity(Relation relation, const char *cmdname, Node *clause)
+{
+	Oid			relid = RelationGetRelid(relation);
+	char		rseccmd;
+
+	if (strcmp(cmdname, "all") == 0)
+		rseccmd = ROWSECURITY_CMD_ALL;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Row-security for \"%s\" is not implemented yet",
+						cmdname)));
+
+	if (clause != NULL)
+	{
+		InsertOrUpdatePolicyRow(relation, rseccmd, clause);
+
+		/*
+		 * Also, turn on relhasrowsecurity, if not.
+		 */
+		if (!RelationGetForm(relation)->relhasrowsecurity)
+		{
+			Relation	class_rel = heap_open(RelationRelationId,
+											  RowExclusiveLock);
+			HeapTuple	tuple;
+
+			tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+			if (!HeapTupleIsValid(tuple))
+				elog(ERROR, "cache lookup failed for relation %u", relid);
+
+			((Form_pg_class) GETSTRUCT(tuple))->relhasrowsecurity = true;
+
+			simple_heap_update(class_rel, &tuple->t_self, tuple);
+			CatalogUpdateIndexes(class_rel, tuple);
+
+			heap_freetuple(tuple);
+			heap_close(class_rel, RowExclusiveLock);
+		}
+	}
+	else
+		DeletePolicyRow(relation, rseccmd);
+
+	CacheInvalidateRelcache(relation);
+}
