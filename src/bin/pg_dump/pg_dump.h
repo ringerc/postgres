@@ -111,7 +111,8 @@ typedef enum
 	DO_PRE_DATA_BOUNDARY,
 	DO_POST_DATA_BOUNDARY,
 	DO_EVENT_TRIGGER,
-	DO_REFRESH_MATVIEW
+	DO_REFRESH_MATVIEW,
+	DO_ROW_SECURITY,
 } DumpableObjectType;
 
 typedef struct _dumpableObject
@@ -245,6 +246,7 @@ typedef struct _tableInfo
 	bool		hasindex;		/* does it have any indexes? */
 	bool		hasrules;		/* does it have any rules? */
 	bool		hastriggers;	/* does it have any triggers? */
+	bool		hasrowsec;		/* does it have any row-security policy? */
 	bool		hasoids;		/* does it have OIDs? */
 	uint32		frozenxid;		/* for restore frozen xid */
 	Oid			toast_oid;		/* for restore toast frozen xid */
@@ -484,6 +486,14 @@ typedef struct _blobInfo
 	char	   *blobacl;
 } BlobInfo;
 
+typedef struct _rowSecurityInfo
+{
+	DumpableObject dobj;
+	TableInfo  *rstable;
+	char	   *rseccmd;
+	char	   *rsecqual;
+} RowSecurityInfo;
+
 /* global decls */
 extern bool force_quotes;		/* double-quotes for identifiers flag */
 extern bool g_verbose;			/* verbose flag */
@@ -575,5 +585,6 @@ extern DefaultACLInfo *getDefaultACLs(Archive *fout, int *numDefaultACLs);
 extern void getExtensionMembership(Archive *fout, ExtensionInfo extinfo[],
 					   int numExtensions);
 extern EventTriggerInfo *getEventTriggers(Archive *fout, int *numEventTriggers);
+extern void getRowSecurity(Archive *fout, TableInfo tblinfo[], int numTables);
 
 #endif   /* PG_DUMP_H */
