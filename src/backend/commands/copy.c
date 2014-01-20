@@ -24,6 +24,7 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
+#include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
@@ -34,15 +35,19 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
+#include "optimizer/rowsecurity.h"
 #include "parser/parse_relation.h"
+#include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/memutils.h"
 #include "utils/portal.h"
 #include "utils/rel.h"
@@ -814,6 +819,21 @@ DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed)
 		rel = heap_openrv(stmt->relation,
 						  (is_from ? RowExclusiveLock : AccessShareLock));
 
+		tupDesc = RelationGetDescr(rel);
+		attnums = CopyGetAttnums(tupDesc, rel, stmt->attlist);
+
+		/*
+		 * We have to run regular query, if the target relation has
+ 		 * row-level security policy
+		 */
+		if (copy_row_security_policy((CopyStmt *)stmt, rel, attnums))
+		{
+			heap_close(rel, NoLock);	/* close with keeping lock */
+			relid = InvalidOid;
+			rel = NULL;
+		}
+		else
+		{
 		relid = RelationGetRelid(rel);
 
 		rte = makeNode(RangeTblEntry);
@@ -822,8 +842,6 @@ DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed)
 		rte->relkind = rel->rd_rel->relkind;
 		rte->requiredPerms = required_access;
 
-		tupDesc = RelationGetDescr(rel);
-		attnums = CopyGetAttnums(tupDesc, rel, stmt->attlist);
 		foreach(cur, attnums)
 		{
 			int			attno = lfirst_int(cur) -
@@ -835,6 +853,7 @@ DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed)
 				rte->selectedCols = bms_add_member(rte->selectedCols, attno);
 		}
 		ExecCheckRTPerms(list_make1(rte), true);
+		}
 	}
 	else
 	{
@@ -1193,6 +1212,53 @@ ProcessCopyOptions(CopyState cstate,
 }
 
 /*
+ * Adjust Query tree constructed with row-level security feature.
+ * If WITH OIDS option was supplied, it adds Var node to reference
+ * object-id system column.
+ */
+static void
+fixup_oid_of_rls_query(Query *query)
+{
+	RangeTblEntry  *subrte;
+	TargetEntry	   *subtle;
+	Var			   *subvar;
+	ListCell	   *cell;
+	Form_pg_attribute	attform
+		= SystemAttributeDefinition(ObjectIdAttributeNumber, true);
+
+	subrte = rt_fetch((Index) 1, query->rtable);
+	Assert(subrte->rtekind == RTE_RELATION);
+
+	if (!SearchSysCacheExists2(ATTNUM,
+							   ObjectIdGetDatum(subrte->relid),
+							   Int16GetDatum(attform->attnum)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("table \"%s\" does not have OIDs",
+						get_rel_name(subrte->relid))));
+
+	subvar = makeVar((Index) 1,
+					 attform->attnum,
+					 attform->atttypid,
+					 attform->atttypmod,
+					 attform->attcollation,
+					 0);
+	subtle = makeTargetEntry((Expr *) subvar,
+							 0,
+							 pstrdup(NameStr(attform->attname)),
+							 false);
+
+	query->targetList = list_concat(list_make1(subtle),
+									query->targetList);
+	/* adjust resno of TargetEntry */
+	foreach (cell, query->targetList)
+	{
+		subtle = lfirst(cell);
+		subtle->resno++;
+	}
+}
+
+/*
  * Common setup routines used by BeginCopyFrom and BeginCopyTo.
  *
  * Iff <binary>, unload or reload in the binary format, as opposed to the
@@ -1264,6 +1330,25 @@ BeginCopy(bool is_from,
 		Assert(!is_from);
 		cstate->rel = NULL;
 
+		/*
+		 * In case when regular COPY TO was replaced because of row-level
+		 * security, "raw_query" node have already analyzed / rewritten
+		 * query tree.
+		 */
+		if (IsA(raw_query, Query))
+		{
+			query = (Query *) raw_query;
+
+			Assert(query->querySource == QSRC_ROW_SECURITY);
+			if (cstate->oids)
+			{
+				fixup_oid_of_rls_query(query);
+				cstate->oids = false;
+			}
+			attnamelist = NIL;
+		}
+		else
+		{
 		/* Don't allow COPY w/ OIDs from a select */
 		if (cstate->oids)
 			ereport(ERROR,
@@ -1288,6 +1373,7 @@ BeginCopy(bool is_from,
 			elog(ERROR, "unexpected rewrite result");
 
 		query = (Query *) linitial(rewritten);
+		}
 
 		/* The grammar allows SELECT INTO, but we don't support that */
 		if (query->utilityStmt != NULL &&
