@@ -128,6 +128,8 @@ typedef struct CachedPlan
 	bool		is_oneshot;		/* is it a "oneshot" plan? */
 	bool		is_saved;		/* is CachedPlan in a long-lived context? */
 	bool		is_valid;		/* is the stmt_list currently valid? */
+	Oid			planUserId;		/* is user-id that is assumed on this cached
+								   plan, or InvalidOid if portable for anybody */
 	TransactionId saved_xmin;	/* if valid, replan when TransactionXmin
 								 * changes from this value */
 	int			generation;		/* parent's generation number for this plan */
