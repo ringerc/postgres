@@ -234,6 +234,11 @@
      </row>
 
      <row>
+      <entry><link linkend="catalog-pg-rowsecurity"><structname>pg_rowsecuritylevelsec</structname></link></entry>
+      <entry>row-level security policy of relation</entry>
+     </row>
+
+     <row>
       <entry><link linkend="catalog-pg-seclabel"><structname>pg_seclabel</structname></link></entry>
       <entry>security labels on database objects</entry>
      </row>
@@ -1872,6 +1877,16 @@
       <entry>
        True if table has (or once had) triggers; see
        <link linkend="catalog-pg-trigger"><structname>pg_trigger</structname></link> catalog
+      </entry>
+     </row>
+
+     <row>
+      <entry><structfield>relhasrowsecurity</structfield></entry>
+      <entry><type>bool</type></entry>
+      <entry></entry>
+      <entry>
+       True if table has row-security policy; see
+       <link linkend="catalog-pg-rowsecurity"><structname>pg_rowsecurity</structname></link> catalog
       </entry>
      </row>
 
@@ -5157,6 +5172,56 @@
 
  </sect1>
 
+ <sect1 id="catalog-pg-rowsecurity">
+  <title><structname>pg_rowsecurity</structname></title>
+
+  <indexterm zone="catalog-pg-rowsecurity">
+   <primary>pg_rowsecurity</primary>
+  </indexterm>
+  <para>
+   The catalog <structname>pg_rowsecurity</structname> stores expression
+   tree of row-security policy to be performed on a particular relation.
+  </para>
+  <table>
+   <title><structname>pg_rowsecurity</structname> Columns</title>
+   <tgroup cols="4">
+    <thead>
+     <row>
+      <entry>Name</entry>
+      <entry>Type</entry>
+      <entry>References</entry>
+      <entry>Description</entry>
+     </row>
+    </thead>
+    <tbody>
+     <row>
+      <entry><structfield>rsecrelid</structfield></entry>
+      <entry><type>oid</type></entry>
+      <entry><literal><link linkend="catalog-pg-class"><structname>pg_class</structname></link>.oid</literal></entry>
+      <entry>The table this row-security is for</entry>
+     </row>
+     <row>
+      <entry><structfield>rseccmd</structfield></entry>
+      <entry><type>char</type></entry>
+      <entry></entry>
+      <entry>The command this row-security is for. 'a' meaning all is only possible value right now.</entry>
+     </row>
+     <row>
+      <entry><structfield>rsecqual</structfield></entry>
+      <entry><type>pg_node_tree</type></entry>
+      <entry></entry>
+      <entry>An expression tree to be performed as row-security policy</entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+  <note>
+   <para>
+    <literal>pg_class.relhasrowsecurity</literal>
+    must be true if a table has row-security policy in this catalog.
+   </para>
+  </note>
+ </sect1>
 
  <sect1 id="catalog-pg-seclabel">
   <title><structname>pg_seclabel</structname></title>
