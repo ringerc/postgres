@@ -260,6 +260,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	alter_table_cmd alter_type_cmd opt_collate_clause
 	   replica_identity
 %type <list>	alter_table_cmds alter_type_cmds
+%type <str>		row_security_cmd
 
 %type <dbehavior>	opt_drop_behavior
 
@@ -2191,6 +2192,24 @@ alter_table_cmd:
 					n->def = (Node *)$2;
 					$$ = (Node *)n;
 				}
+			/* ALTER TABLE <name> SET ROW SECURITY FOR <cmd> TO (<expr>) */
+			| SET ROW SECURITY FOR row_security_cmd TO '(' a_expr ')'
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					n->subtype = AT_SetRowSecurity;
+					n->name = $5;
+					n->def = (Node *) $8;
+					$$ = (Node *)n;
+				}
+			/* ALTER TABLE <name> RESET ROW SECURITY FOR <cmd> */
+			| RESET ROW SECURITY FOR row_security_cmd
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					n->subtype = AT_ResetRowSecurity;
+					n->name = $5;
+					n->def = NULL;
+					$$ = (Node *)n;
+				}
 			/* ALTER TABLE <name> REPLICA IDENTITY  */
 			| REPLICA IDENTITY_P replica_identity
 				{
@@ -2301,6 +2320,12 @@ reloption_elem:
 				}
 		;
 
+row_security_cmd: ALL	{ $$ = "all"; }
+			| SELECT	{ $$ = "select"; }
+			| INSERT	{ $$ = "insert"; }
+			| UPDATE	{ $$ = "update"; }
+			| DELETE_P	{ $$ = "delete"; }
+		;
 
 /*****************************************************************************
  *
