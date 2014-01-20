@@ -1323,6 +1323,8 @@ typedef enum AlterTableType
 	AT_AddOf,					/* OF <type_name> */
 	AT_DropOf,					/* NOT OF */
 	AT_ReplicaIdentity,			/* REPLICA IDENTITY */
+	AT_SetRowSecurity,			/* SET ROW SECURITY (...) */
+	AT_ResetRowSecurity,		/* RESET ROW SECURITY */
 	AT_GenericOptions			/* OPTIONS (...) */
 } AlterTableType;
 
