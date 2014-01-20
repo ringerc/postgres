@@ -31,7 +31,8 @@ typedef enum QuerySource
 	QSRC_PARSER,				/* added by parse analysis (now unused) */
 	QSRC_INSTEAD_RULE,			/* added by unconditional INSTEAD rule */
 	QSRC_QUAL_INSTEAD_RULE,		/* added by conditional INSTEAD rule */
-	QSRC_NON_INSTEAD_RULE		/* added by non-INSTEAD rule */
+	QSRC_NON_INSTEAD_RULE,		/* added by non-INSTEAD rule */
+	QSRC_ROW_SECURITY,			/* added by row-security */
 } QuerySource;
 
 /* Sort ordering options for ORDER BY and CREATE INDEX */
@@ -741,6 +742,11 @@ typedef struct RangeTblEntry
 	 */
 	Query	   *subquery;		/* the sub-query */
 	bool		security_barrier;		/* is from security_barrier view? */
+	Oid			rowsec_relid;	/* OID of the original relation, if this
+								 * sub-query originated from row-security
+								 * policy on the relation. Elsewhere, it
+								 * should be InvalidOid.
+								 */
 
 	/*
 	 * Fields valid for a join RTE (else NULL/zero):
