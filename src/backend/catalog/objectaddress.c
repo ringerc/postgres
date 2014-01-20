@@ -2166,6 +2166,56 @@ getObjectDescription(const ObjectAddress *object)
 				break;
 			}
 
+		case OCLASS_ROWSECURITY:
+			{
+				Relation	rsec_rel;
+				ScanKeyData	skey;
+				SysScanDesc	sscan;
+				HeapTuple	tuple;
+				Form_pg_rowsecurity	form_rsec;
+
+				rsec_rel = heap_open(RowSecurityRelationId, AccessShareLock);
+
+				ScanKeyInit(&skey,
+							ObjectIdAttributeNumber,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(object->objectId));
+				sscan = systable_beginscan(rsec_rel, RowSecurityOidIndexId,
+										   true, NULL, 1, &skey);
+				tuple = systable_getnext(sscan);
+				if (!HeapTupleIsValid(tuple))
+					elog(ERROR, "could not find tuple for row-security %u",
+						 object->objectId);
+				form_rsec = (Form_pg_rowsecurity) GETSTRUCT(tuple);
+
+				appendStringInfo(&buffer, _("row-security of "));
+				getRelationDescription(&buffer, form_rsec->rsecrelid);
+				switch (form_rsec->rseccmd)
+				{
+					case ROWSECURITY_CMD_ALL:
+						appendStringInfo(&buffer, _(" FOR ALL"));
+						break;
+					case ROWSECURITY_CMD_SELECT:
+						appendStringInfo(&buffer, _(" FOR SELECT"));
+						break;
+					case ROWSECURITY_CMD_INSERT:
+						appendStringInfo(&buffer, _(" FOR INSERT"));
+						break;
+					case ROWSECURITY_CMD_UPDATE:
+						appendStringInfo(&buffer, _(" FOR UPDATE"));
+						break;
+					case ROWSECURITY_CMD_DELETE:
+						appendStringInfo(&buffer, _(" FOR DELETE"));
+						break;
+					default:
+						elog(ERROR, "unexpected row-security command type: %c",
+							 form_rsec->rseccmd);
+				}
+				systable_endscan(sscan);
+				heap_close(rsec_rel, AccessShareLock);
+				break;
+			}
+
 		default:
 			appendStringInfo(&buffer, "unrecognized object %u %u %d",
 							 object->classId,
