@@ -346,6 +346,7 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	Node	   *qual;
 
 	qry->commandType = CMD_DELETE;
+	qry->dependsUserId = InvalidOid;
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
@@ -428,6 +429,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	Assert(pstate->p_ctenamespace == NIL);
 
 	qry->commandType = CMD_INSERT;
+	qry->dependsUserId = InvalidOid;
 	pstate->p_is_insert = true;
 
 	/* process the WITH clause independently of all else */
@@ -912,6 +914,7 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	ListCell   *l;
 
 	qry->commandType = CMD_SELECT;
+	qry->dependsUserId = InvalidOid;
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
@@ -1051,6 +1054,7 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 	int			i;
 
 	qry->commandType = CMD_SELECT;
+	qry->dependsUserId = InvalidOid;
 
 	/* Most SELECT stuff doesn't apply in a VALUES clause */
 	Assert(stmt->distinctClause == NIL);
@@ -1287,6 +1291,7 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	int			tllen;
 
 	qry->commandType = CMD_SELECT;
+	qry->dependsUserId = InvalidOid;
 
 	/*
 	 * Find leftmost leaf SelectStmt.  We currently only need to do this in
@@ -1909,6 +1914,7 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	ListCell   *tl;
 
 	qry->commandType = CMD_UPDATE;
+	qry->dependsUserId = InvalidOid;
 	pstate->p_is_update = true;
 
 	/* process the WITH clause independently of all else */

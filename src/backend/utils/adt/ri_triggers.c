@@ -2955,6 +2955,7 @@ ri_PlanCheck(const char *querystr, int nargs, Oid *argtypes,
 	Relation	query_rel;
 	Oid			save_userid;
 	int			save_sec_context;
+	int			temp_sec_context;
 
 	/*
 	 * Use the query type code to determine whether the query is run against
@@ -2967,8 +2968,18 @@ ri_PlanCheck(const char *querystr, int nargs, Oid *argtypes,
 
 	/* Switch to proper UID to perform check as */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+
+	/*
+	 * Row-level security should be disabled in the case where a foreign-key
+	 * relation is queried to check existence of tuples that references the
+	 * primary-key being modified.
+	 */
+	temp_sec_context = save_sec_context | SECURITY_LOCAL_USERID_CHANGE;
+	if (qkey->constr_queryno != RI_PLAN_CHECK_LOOKUPPK)
+		temp_sec_context |= SECURITY_ROW_LEVEL_DISABLED;
+
 	SetUserIdAndSecContext(RelationGetForm(query_rel)->relowner,
-						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+						   temp_sec_context);
 
 	/* Create the plan */
 	qplan = SPI_prepare(querystr, nargs, argtypes);
@@ -3087,6 +3098,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 
 	/* Switch to proper UID to perform check as */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+
 	SetUserIdAndSecContext(RelationGetForm(query_rel)->relowner,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 

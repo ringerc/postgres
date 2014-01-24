@@ -372,7 +372,8 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 		 */
 		extract_query_dependencies((Node *) querytree_list,
 								   &plansource->relationOids,
-								   &plansource->invalItems);
+								   &plansource->invalItems,
+								   &plansource->planUserId);
 
 		/*
 		 * Also save the current search_path in the query_context.	(This
@@ -584,6 +585,16 @@ RevalidateCachedQuery(CachedPlanSource *plansource)
 	}
 
 	/*
+	 * If the plan was constructed with assumption of a particular user-id,
+	 * and the current user ID is different, invalidate the plan, then rerun
+	 * rewrite on the original parsetree.
+	 */
+	if (plansource->is_valid &&
+		OidIsValid(plansource->planUserId) &&
+		plansource->planUserId != GetUserId())
+		plansource->is_valid = false;
+
+	/*
 	 * If the query is currently valid, acquire locks on the referenced
 	 * objects; then check again.  We need to do it this way to cover the race
 	 * condition that an invalidation message arrives before we get the locks.
@@ -724,7 +735,9 @@ RevalidateCachedQuery(CachedPlanSource *plansource)
 	 */
 	extract_query_dependencies((Node *) qlist,
 							   &plansource->relationOids,
-							   &plansource->invalItems);
+							   &plansource->invalItems,
+							   &plansource->planUserId
+							   );
 
 	/*
 	 * Also save the current search_path in the query_context.	(This should
@@ -796,16 +809,6 @@ CheckCachedPlan(CachedPlanSource *plansource)
 		AcquireExecutorLocks(plan->stmt_list, true);
 
 		/*
-		 * If plan was constructed with assumption of a particular user-id,
-		 * and it is different from the current one, the cached-plan shall
-		 * be invalidated to construct suitable query plan.
-		 */
-		if (plan->is_valid &&
-			OidIsValid(plan->planUserId) &&
-			plan->planUserId == GetUserId())
-			plan->is_valid = false;
-
-		/*
 		 * If plan was transient, check to see if TransactionXmin has
 		 * advanced, and if so invalidate it.
 		 */
@@ -859,7 +862,6 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	CachedPlan *plan;
 	List	   *plist;
 	ListCell   *cell;
-	Oid			planUserId = InvalidOid;
 	bool		snapshot_set;
 	bool		spi_pushed;
 	MemoryContext plan_context;
@@ -927,24 +929,6 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 		PopActiveSnapshot();
 
 	/*
-	 * Check whether the generated plan assumes a particular user-id, or not.
-	 * In case when a valid user-id is recorded on PlannedStmt->planUserId,
-	 * it should be kept and used to validation check of the cached plan
-	 * under the "current" user-id.
-	 */
-	foreach (cell, plist)
-	{
-		PlannedStmt	*pstmt = lfirst(cell);
-
-		if (IsA(pstmt, PlannedStmt) && OidIsValid(pstmt->planUserId))
-		{
-			Assert(!OidIsValid(planUserId) || planUserId == pstmt->planUserId);
-
-			planUserId = pstmt->planUserId;
-		}
-	}
-
-	/*
 	 * Normally we make a dedicated memory context for the CachedPlan and its
 	 * subsidiary data.  (It's probably not going to be large, but just in
 	 * case, use the default maxsize parameter.  It's transient for the
@@ -987,7 +971,6 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	plan->is_oneshot = plansource->is_oneshot;
 	plan->is_saved = false;
 	plan->is_valid = true;
-	plan->planUserId = planUserId;
 
 	/* assign generation number to new plan */
 	plan->generation = ++(plansource->generation);

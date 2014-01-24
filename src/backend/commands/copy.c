@@ -34,6 +34,7 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "rewrite/rowsecurity.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
 #include "parser/parse_relation.h"
@@ -807,6 +808,7 @@ DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed)
 		RangeTblEntry *rte;
 		List	   *attnums;
 		ListCell   *cur;
+		List	   *rowsecpolicy;
 
 		Assert(!stmt->query);
 
@@ -814,8 +816,14 @@ DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed)
 		rel = heap_openrv(stmt->relation,
 						  (is_from ? RowExclusiveLock : AccessShareLock));
 
-		relid = RelationGetRelid(rel);
+		/* Test for row-security policy. If there's any policy for this
+		 * relation, we don't permit COPY on it. */
+		rowsecpolicy = pull_row_security_policy(CMD_UTILITY, rel, NULL);
+		if (rowsecpolicy != NIL)
+			ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						   errmsg("Cannot COPY a relation with a row-security policy as non-superuser")));
 
+		relid = RelationGetRelid(rel);
 		rte = makeNode(RangeTblEntry);
 		rte->rtekind = RTE_RELATION;
 		rte->relid = RelationGetRelid(rel);

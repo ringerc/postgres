@@ -2264,6 +2264,7 @@ _outQuery(StringInfo str, const Query *node)
 	WRITE_NODE_FIELD(rowMarks);
 	WRITE_NODE_FIELD(setOperations);
 	WRITE_NODE_FIELD(constraintDeps);
+	WRITE_OID_FIELD(dependsUserId);
 }
 
 static void
