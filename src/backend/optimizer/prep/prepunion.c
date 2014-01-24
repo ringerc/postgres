@@ -1349,6 +1349,11 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 		childRTindex = list_length(parse->rtable);
 
 		/*
+		 * XXX TODO We need to apply row-security policy after inheritance
+		 * expansion.
+		 */
+
+		/*
 		 * Build an AppendRelInfo for this parent and child.
 		 */
 		appinfo = makeNode(AppendRelInfo);
