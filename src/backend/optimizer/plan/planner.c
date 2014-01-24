@@ -388,6 +388,13 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	}
 
 	/*
+	 * Check RTEs for row-security policies and set securityQuals on the
+	 * RTE if a policy is found. This must happen before inherited table
+	 * expansion so that the quals get copied to the child rels.
+	 */
+	apply_row_security_policy(root);
+
+	/*
 	 * Preprocess RowMark information.	We need to do this after subquery
 	 * pullup (so that all non-inherited RTEs are present) and before
 	 * inheritance expansion (so that the info is available for
