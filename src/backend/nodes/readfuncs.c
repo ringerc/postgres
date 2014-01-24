@@ -224,6 +224,7 @@ _readQuery(void)
 	READ_NODE_FIELD(rowMarks);
 	READ_NODE_FIELD(setOperations);
 	READ_NODE_FIELD(constraintDeps);
+	READ_NODE_FIELD(rowSecParents);
 
 	READ_DONE();
 }

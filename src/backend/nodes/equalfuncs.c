@@ -872,6 +872,7 @@ _equalQuery(const Query *a, const Query *b)
 	COMPARE_NODE_FIELD(rowMarks);
 	COMPARE_NODE_FIELD(setOperations);
 	COMPARE_NODE_FIELD(constraintDeps);
+	COMPARE_NODE_FIELD(rowSecParents);
 
 	return true;
 }
@@ -2294,6 +2295,7 @@ _equalRangeTblEntry(const RangeTblEntry *a, const RangeTblEntry *b)
 	COMPARE_BITMAPSET_FIELD(selectedCols);
 	COMPARE_BITMAPSET_FIELD(modifiedCols);
 	COMPARE_NODE_FIELD(securityQuals);
+	COMPARE_SCALAR_FIELD(rowsec_done);
 
 	return true;
 }

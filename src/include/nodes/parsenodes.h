@@ -152,6 +152,9 @@ typedef struct Query
 
 	List	   *constraintDeps; /* a list of pg_constraint OIDs that the query
 								 * depends on to be semantically valid */
+
+	List	   *rowSecParents;  /* oids of tables with row-security quals expanded
+								 * to produce this Query. */
 } Query;
 
 
