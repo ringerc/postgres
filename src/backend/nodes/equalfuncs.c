@@ -2293,6 +2293,7 @@ _equalRangeTblEntry(const RangeTblEntry *a, const RangeTblEntry *b)
 	COMPARE_SCALAR_FIELD(checkAsUser);
 	COMPARE_BITMAPSET_FIELD(selectedCols);
 	COMPARE_BITMAPSET_FIELD(modifiedCols);
+	COMPARE_NODE_FIELD(securityQuals);
 
 	return true;
 }

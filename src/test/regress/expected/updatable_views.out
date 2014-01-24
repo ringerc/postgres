@@ -22,12 +22,10 @@ CREATE VIEW rw_view14 AS SELECT ctid, a, b FROM base_tbl; -- System columns may 
 CREATE VIEW rw_view15 AS SELECT a, upper(b) FROM base_tbl; -- Expression/function may be part of an updatable view
 CREATE VIEW rw_view16 AS SELECT a, b, a AS aa FROM base_tbl; -- Repeated column may be part of an updatable view
 CREATE VIEW ro_view17 AS SELECT * FROM ro_view1; -- Base relation not updatable
-CREATE VIEW ro_view18 WITH (security_barrier = true)
-  AS SELECT * FROM base_tbl; -- Security barrier views not updatable
-CREATE VIEW ro_view19 AS SELECT * FROM (VALUES(1)) AS tmp(a); -- VALUES in rangetable
+CREATE VIEW ro_view18 AS SELECT * FROM (VALUES(1)) AS tmp(a); -- VALUES in rangetable
 CREATE SEQUENCE seq;
-CREATE VIEW ro_view20 AS SELECT * FROM seq; -- View based on a sequence
-CREATE VIEW ro_view21 AS SELECT a, b, generate_series(1, a) g FROM base_tbl; -- SRF in targetlist not supported
+CREATE VIEW ro_view19 AS SELECT * FROM seq; -- View based on a sequence
+CREATE VIEW ro_view20 AS SELECT a, b, generate_series(1, a) g FROM base_tbl; -- SRF in targetlist not supported
 SELECT table_name, is_insertable_into
   FROM information_schema.tables
  WHERE table_name LIKE E'r_\\_view%'
@@ -44,7 +42,6 @@ SELECT table_name, is_insertable_into
  ro_view19  | NO
  ro_view2   | NO
  ro_view20  | NO
- ro_view21  | NO
  ro_view3   | NO
  ro_view4   | NO
  ro_view5   | NO
@@ -55,7 +52,7 @@ SELECT table_name, is_insertable_into
  rw_view14  | YES
  rw_view15  | YES
  rw_view16  | YES
-(21 rows)
+(20 rows)
 
 SELECT table_name, is_updatable, is_insertable_into
   FROM information_schema.views
@@ -73,7 +70,6 @@ SELECT table_name, is_updatable, is_insertable_into
  ro_view19  | NO           | NO
  ro_view2   | NO           | NO
  ro_view20  | NO           | NO
- ro_view21  | NO           | NO
  ro_view3   | NO           | NO
  ro_view4   | NO           | NO
  ro_view5   | NO           | NO
@@ -84,7 +80,7 @@ SELECT table_name, is_updatable, is_insertable_into
  rw_view14  | YES          | YES
  rw_view15  | YES          | YES
  rw_view16  | YES          | YES
-(21 rows)
+(20 rows)
 
 SELECT table_name, column_name, is_updatable
   FROM information_schema.columns
@@ -103,23 +99,21 @@ SELECT table_name, column_name, is_updatable
  ro_view17  | a             | NO
  ro_view17  | b             | NO
  ro_view18  | a             | NO
- ro_view18  | b             | NO
- ro_view19  | a             | NO
+ ro_view19  | sequence_name | NO
+ ro_view19  | last_value    | NO
+ ro_view19  | start_value   | NO
+ ro_view19  | increment_by  | NO
+ ro_view19  | max_value     | NO
+ ro_view19  | min_value     | NO
+ ro_view19  | cache_value   | NO
+ ro_view19  | log_cnt       | NO
+ ro_view19  | is_cycled     | NO
+ ro_view19  | is_called     | NO
  ro_view2   | a             | NO
  ro_view2   | b             | NO
- ro_view20  | sequence_name | NO
- ro_view20  | last_value    | NO
- ro_view20  | start_value   | NO
- ro_view20  | increment_by  | NO
- ro_view20  | max_value     | NO
- ro_view20  | min_value     | NO
- ro_view20  | cache_value   | NO
- ro_view20  | log_cnt       | NO
- ro_view20  | is_cycled     | NO
- ro_view20  | is_called     | NO
- ro_view21  | a             | NO
- ro_view21  | b             | NO
- ro_view21  | g             | NO
+ ro_view20  | a             | NO
+ ro_view20  | b             | NO
+ ro_view20  | g             | NO
  ro_view3   | ?column?      | NO
  ro_view4   | count         | NO
  ro_view5   | a             | NO
@@ -140,7 +134,7 @@ SELECT table_name, column_name, is_updatable
  rw_view16  | a             | YES
  rw_view16  | b             | YES
  rw_view16  | aa            | YES
-(48 rows)
+(46 rows)
 
 -- Read-only views
 DELETE FROM ro_view1;
@@ -268,24 +262,20 @@ INSERT INTO ro_view17 VALUES (3, 'ROW 3');
 ERROR:  cannot insert into view "ro_view1"
 DETAIL:  Views containing DISTINCT are not automatically updatable.
 HINT:  To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.
-INSERT INTO ro_view18 VALUES (3, 'ROW 3');
-ERROR:  cannot insert into view "ro_view18"
-DETAIL:  Security-barrier views are not automatically updatable.
-HINT:  To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.
-DELETE FROM ro_view19;
-ERROR:  cannot delete from view "ro_view19"
+DELETE FROM ro_view18;
+ERROR:  cannot delete from view "ro_view18"
 DETAIL:  Views that do not select from a single table or view are not automatically updatable.
 HINT:  To enable deleting from the view, provide an INSTEAD OF DELETE trigger or an unconditional ON DELETE DO INSTEAD rule.
-UPDATE ro_view20 SET max_value=1000;
-ERROR:  cannot update view "ro_view20"
+UPDATE ro_view19 SET max_value=1000;
+ERROR:  cannot update view "ro_view19"
 DETAIL:  Views that do not select from a single table or view are not automatically updatable.
 HINT:  To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule.
-UPDATE ro_view21 SET b=upper(b);
-ERROR:  cannot update view "ro_view21"
+UPDATE ro_view20 SET b=upper(b);
+ERROR:  cannot update view "ro_view20"
 DETAIL:  Views that return set-returning functions are not automatically updatable.
 HINT:  To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule.
 DROP TABLE base_tbl CASCADE;
-NOTICE:  drop cascades to 17 other objects
+NOTICE:  drop cascades to 16 other objects
 DETAIL:  drop cascades to view ro_view1
 drop cascades to view ro_view17
 drop cascades to view ro_view2
@@ -299,13 +289,12 @@ drop cascades to view ro_view11
 drop cascades to view ro_view13
 drop cascades to view rw_view15
 drop cascades to view rw_view16
-drop cascades to view ro_view18
-drop cascades to view ro_view21
+drop cascades to view ro_view20
 drop cascades to view ro_view4
 drop cascades to view rw_view14
-DROP VIEW ro_view10, ro_view12, ro_view19;
+DROP VIEW ro_view10, ro_view12, ro_view18;
 DROP SEQUENCE seq CASCADE;
-NOTICE:  drop cascades to view ro_view20
+NOTICE:  drop cascades to view ro_view19
 -- simple updatable view
 CREATE TABLE base_tbl (a int PRIMARY KEY, b text DEFAULT 'Unspecified');
 INSERT INTO base_tbl SELECT i, 'Row ' || i FROM generate_series(-2, 2) g(i);
@@ -1740,3 +1729,259 @@ DROP TABLE base_tbl CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to view rw_view1
 drop cascades to view rw_view2
+-- security barrier view
+CREATE TABLE base_tbl (person text, visibility text);
+INSERT INTO base_tbl VALUES ('Tom', 'public'),
+                            ('Dick', 'private'),
+                            ('Harry', 'public');
+CREATE VIEW rw_view1 AS
+  SELECT person FROM base_tbl WHERE visibility = 'public';
+CREATE FUNCTION snoop(val text)
+RETURNS boolean AS
+$$
+BEGIN
+  RAISE NOTICE 'snooped value: %', val;
+  RETURN true;
+END;
+$$
+LANGUAGE plpgsql COST 0.000001;
+SELECT * FROM rw_view1 WHERE snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Dick
+NOTICE:  snooped value: Harry
+ person 
+--------
+ Tom
+ Harry
+(2 rows)
+
+UPDATE rw_view1 SET person=person WHERE snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Dick
+NOTICE:  snooped value: Harry
+DELETE FROM rw_view1 WHERE NOT snoop(person);
+NOTICE:  snooped value: Dick
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+ALTER VIEW rw_view1 SET (security_barrier = true);
+SELECT table_name, is_insertable_into
+  FROM information_schema.tables
+ WHERE table_name = 'rw_view1';
+ table_name | is_insertable_into 
+------------+--------------------
+ rw_view1   | YES
+(1 row)
+
+SELECT table_name, is_updatable, is_insertable_into
+  FROM information_schema.views
+ WHERE table_name = 'rw_view1';
+ table_name | is_updatable | is_insertable_into 
+------------+--------------+--------------------
+ rw_view1   | YES          | YES
+(1 row)
+
+SELECT table_name, column_name, is_updatable
+  FROM information_schema.columns
+ WHERE table_name = 'rw_view1'
+ ORDER BY ordinal_position;
+ table_name | column_name | is_updatable 
+------------+-------------+--------------
+ rw_view1   | person      | YES
+(1 row)
+
+SELECT * FROM rw_view1 WHERE snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+ person 
+--------
+ Tom
+ Harry
+(2 rows)
+
+UPDATE rw_view1 SET person=person WHERE snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+DELETE FROM rw_view1 WHERE NOT snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+EXPLAIN (costs off) SELECT * FROM rw_view1 WHERE snoop(person);
+                  QUERY PLAN                   
+-----------------------------------------------
+ Subquery Scan on rw_view1
+   Filter: snoop(rw_view1.person)
+   ->  Seq Scan on base_tbl
+         Filter: (visibility = 'public'::text)
+(4 rows)
+
+EXPLAIN (costs off) UPDATE rw_view1 SET person=person WHERE snoop(person);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Update on base_tbl base_tbl_1
+   ->  Subquery Scan on base_tbl
+         Filter: snoop(base_tbl.person)
+         ->  Seq Scan on base_tbl base_tbl_2
+               Filter: (visibility = 'public'::text)
+(5 rows)
+
+EXPLAIN (costs off) DELETE FROM rw_view1 WHERE NOT snoop(person);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Delete on base_tbl base_tbl_1
+   ->  Subquery Scan on base_tbl
+         Filter: (NOT snoop(base_tbl.person))
+         ->  Seq Scan on base_tbl base_tbl_2
+               Filter: (visibility = 'public'::text)
+(5 rows)
+
+-- security barrier view on top of security barrier view
+CREATE VIEW rw_view2 WITH (security_barrier = true) AS
+  SELECT * FROM rw_view1 WHERE snoop(person);
+SELECT table_name, is_insertable_into
+  FROM information_schema.tables
+ WHERE table_name = 'rw_view2';
+ table_name | is_insertable_into 
+------------+--------------------
+ rw_view2   | YES
+(1 row)
+
+SELECT table_name, is_updatable, is_insertable_into
+  FROM information_schema.views
+ WHERE table_name = 'rw_view2';
+ table_name | is_updatable | is_insertable_into 
+------------+--------------+--------------------
+ rw_view2   | YES          | YES
+(1 row)
+
+SELECT table_name, column_name, is_updatable
+  FROM information_schema.columns
+ WHERE table_name = 'rw_view2'
+ ORDER BY ordinal_position;
+ table_name | column_name | is_updatable 
+------------+-------------+--------------
+ rw_view2   | person      | YES
+(1 row)
+
+SELECT * FROM rw_view2 WHERE snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+NOTICE:  snooped value: Harry
+ person 
+--------
+ Tom
+ Harry
+(2 rows)
+
+UPDATE rw_view2 SET person=person WHERE snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+NOTICE:  snooped value: Harry
+DELETE FROM rw_view2 WHERE NOT snoop(person);
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Tom
+NOTICE:  snooped value: Harry
+NOTICE:  snooped value: Harry
+EXPLAIN (costs off) SELECT * FROM rw_view2 WHERE snoop(person);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Subquery Scan on rw_view2
+   Filter: snoop(rw_view2.person)
+   ->  Subquery Scan on rw_view1
+         Filter: snoop(rw_view1.person)
+         ->  Seq Scan on base_tbl
+               Filter: (visibility = 'public'::text)
+(6 rows)
+
+EXPLAIN (costs off) UPDATE rw_view2 SET person=person WHERE snoop(person);
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Update on base_tbl base_tbl_1
+   ->  Subquery Scan on base_tbl
+         Filter: snoop(base_tbl.person)
+         ->  Subquery Scan on base_tbl_2
+               Filter: snoop(base_tbl_2.person)
+               ->  Seq Scan on base_tbl base_tbl_3
+                     Filter: (visibility = 'public'::text)
+(7 rows)
+
+EXPLAIN (costs off) DELETE FROM rw_view2 WHERE NOT snoop(person);
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Delete on base_tbl base_tbl_1
+   ->  Subquery Scan on base_tbl
+         Filter: (NOT snoop(base_tbl.person))
+         ->  Subquery Scan on base_tbl_2
+               Filter: snoop(base_tbl_2.person)
+               ->  Seq Scan on base_tbl base_tbl_3
+                     Filter: (visibility = 'public'::text)
+(7 rows)
+
+DROP TABLE base_tbl CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to view rw_view1
+drop cascades to view rw_view2
+-- security barrier view on top of table with rules
+CREATE TABLE base_tbl(id int PRIMARY KEY, data text, deleted boolean);
+INSERT INTO base_tbl VALUES (1, 'Row 1', false), (2, 'Row 2', true);
+CREATE RULE base_tbl_ins_rule AS ON INSERT TO base_tbl
+  WHERE EXISTS (SELECT 1 FROM base_tbl t WHERE t.id = new.id)
+  DO INSTEAD
+    UPDATE base_tbl SET data = new.data, deleted = false WHERE id = new.id;
+CREATE RULE base_tbl_del_rule AS ON DELETE TO base_tbl
+  DO INSTEAD
+    UPDATE base_tbl SET deleted = true WHERE id = old.id;
+CREATE VIEW rw_view1 WITH (security_barrier=true) AS
+  SELECT id, data FROM base_tbl WHERE NOT deleted;
+SELECT * FROM rw_view1;
+ id | data  
+----+-------
+  1 | Row 1
+(1 row)
+
+EXPLAIN (costs off) DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Update on base_tbl base_tbl_1
+   ->  Nested Loop
+         ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_1
+               Index Cond: (id = 1)
+         ->  Subquery Scan on base_tbl
+               Filter: snoop(base_tbl.data)
+               ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_2
+                     Index Cond: (id = 1)
+                     Filter: (NOT deleted)
+(9 rows)
+
+DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
+NOTICE:  snooped value: Row 1
+EXPLAIN (costs off) INSERT INTO rw_view1 VALUES (2, 'New row 2');
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Insert on base_tbl
+   InitPlan 1 (returns $0)
+     ->  Index Only Scan using base_tbl_pkey on base_tbl t
+           Index Cond: (id = 2)
+   ->  Result
+         One-Time Filter: ($0 IS NOT TRUE)
+ 
+ Update on base_tbl
+   InitPlan 1 (returns $0)
+     ->  Index Only Scan using base_tbl_pkey on base_tbl t
+           Index Cond: (id = 2)
+   ->  Result
+         One-Time Filter: $0
+         ->  Index Scan using base_tbl_pkey on base_tbl
+               Index Cond: (id = 2)
+(15 rows)
+
+INSERT INTO rw_view1 VALUES (2, 'New row 2');
+SELECT * FROM base_tbl;
+ id |   data    | deleted 
+----+-----------+---------
+  1 | Row 1     | t
+  2 | New row 2 | f
+(2 rows)
+
+DROP TABLE base_tbl CASCADE;
+NOTICE:  drop cascades to view rw_view1

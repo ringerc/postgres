@@ -916,6 +916,12 @@ inheritance_planner(PlannerInfo *root)
 		subplan = grouping_planner(&subroot, 0.0 /* retrieve all tuples */ );
 
 		/*
+		 * Planning may have modified the query result relation (if there
+		 * were security barrier quals on the result RTE).
+		 */
+		appinfo->child_relid = subroot.parse->resultRelation;
+
+		/*
 		 * If this child rel was excluded by constraint exclusion, exclude it
 		 * from the result plan.
 		 */
@@ -932,9 +938,32 @@ inheritance_planner(PlannerInfo *root)
 		if (final_rtable == NIL)
 			final_rtable = subroot.parse->rtable;
 		else
-			final_rtable = list_concat(final_rtable,
+		{
+			List	   *tmp_rtable = NIL;
+			ListCell   *cell1, *cell2;
+
+			/*
+			 * Planning this new child may have turned some of the original
+			 * RTEs into subqueries (if they had security barrier quals). If
+			 * so, we want to use these in the final rtable.
+			 */
+			forboth(cell1, final_rtable, cell2, subroot.parse->rtable)
+			{
+				RangeTblEntry *rte1 = (RangeTblEntry *) lfirst(cell1);
+				RangeTblEntry *rte2 = (RangeTblEntry *) lfirst(cell2);
+
+				if (rte1->rtekind == RTE_RELATION &&
+					rte1->securityQuals != NIL &&
+					rte2->rtekind == RTE_SUBQUERY)
+					tmp_rtable = lappend(tmp_rtable, rte2);
+				else
+					tmp_rtable = lappend(tmp_rtable, rte1);
+			}
+
+			final_rtable = list_concat(tmp_rtable,
 									   list_copy_tail(subroot.parse->rtable,
 												 list_length(final_rtable)));
+		}
 
 		/*
 		 * We need to collect all the RelOptInfos from all child plans into
@@ -1161,6 +1190,12 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 
 		/* Preprocess targetlist */
 		tlist = preprocess_targetlist(root, tlist);
+
+		/*
+		 * Expand any rangetable entries that have security barrier quals.
+		 * This may add new security barrier subquery RTEs to the rangetable.
+		 */
+		expand_security_quals(root, tlist);
 
 		/*
 		 * Locate any window functions in the tlist.  (We don't need to look
