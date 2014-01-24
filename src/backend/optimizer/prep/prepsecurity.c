@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * prepsecurity.c
- *	  Routines for preprocessing security barrier quals.
+ *	  Routines for preprocessing security barrier quals and applying row-security
+ *	  policies.
  *
  * Portions Copyright (c) 1996-2013, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -15,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/transam.h"
 #include "access/sysattr.h"
 #include "catalog/heap.h"
 #include "nodes/makefuncs.h"
@@ -24,6 +26,7 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/rel.h"
+#include "optimizer/rowsecurity.h"
 
 
 typedef struct
@@ -76,6 +79,16 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
 
 		rt_index++;
+
+		/*
+		 * Check for row-security quals on the relation and, if found, prepend them
+		 * as new inner-most security quals. Ignore the return, we don't care. 
+		 *
+		 * This will set rowsec_done on the RTE, which we'll copy if we expand
+		 * it, ensuring that no infinitely recursive expansion of row security quals
+		 * is done.
+		 */
+		(void) prepend_row_security_quals(root->parse->commandType, rte);
 
 		if (rte->securityQuals == NIL)
 			continue;
