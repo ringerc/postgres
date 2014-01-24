@@ -199,6 +199,15 @@ SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 
 --
+-- COPY TO statement 
+--
+COPY t1 TO stdout;
+COPY t1 TO stdout WITH OIDS;
+COPY t2(c,b) TO stdout WITH OIDS;
+COPY (SELECT * FROM t1) TO stdout;
+COPY document TO stdout WITH OIDS;	-- failed (no oid column)
+
+--
 -- recursive RLS and VIEWs in policy
 --
 CREATE TABLE s1 (a int, b text);

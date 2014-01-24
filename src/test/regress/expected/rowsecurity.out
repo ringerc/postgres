@@ -517,6 +517,28 @@ EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 (12 rows)
 
 --
+-- COPY TO statement 
+--
+COPY t1 TO stdout;
+2	bbb
+4	ddd
+COPY t1 TO stdout WITH OIDS;
+102	2	bbb
+104	4	ddd
+COPY t2(c,b) TO stdout WITH OIDS;
+201	1.1	abc
+203	3.3	cde
+COPY (SELECT * FROM t1) TO stdout;
+2	bbb
+4	ddd
+1	abc
+3	cde
+1	xxx
+2	yyy
+3	zzz
+COPY document TO stdout WITH OIDS;	-- failed (no oid column)
+ERROR:  table "document" does not have OIDs
+--
 -- recursive RLS and VIEWs in policy
 --
 CREATE TABLE s1 (a int, b text);
