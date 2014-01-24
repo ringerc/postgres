@@ -2490,6 +2490,7 @@ _copyQuery(const Query *from)
 	COPY_NODE_FIELD(rowMarks);
 	COPY_NODE_FIELD(setOperations);
 	COPY_NODE_FIELD(constraintDeps);
+	COPY_NODE_FIELD(rowSecParents);
 
 	return newnode;
 }
