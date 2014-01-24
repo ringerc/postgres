@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * prepsecurity.c
- *	  Routines for preprocessing security barrier quals.
+ *	  Routines for preprocessing security barrier quals and applying row-security
+ *	  policies.
  *
  * Portions Copyright (c) 1996-2013, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -15,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/transam.h"
 #include "access/sysattr.h"
 #include "catalog/heap.h"
 #include "nodes/makefuncs.h"
@@ -24,7 +26,6 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/rel.h"
-
 
 typedef struct
 {

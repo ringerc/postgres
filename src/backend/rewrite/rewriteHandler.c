@@ -25,17 +25,18 @@
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
+#include "rewrite/rowsecurity.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
-
 /* We use a list of these to detect recursion in RewriteQuery */
 typedef struct rewrite_event
 {
-	Oid			relation;		/* OID of relation having rules */
-	CmdType		event;			/* type of rule being fired */
+	Oid             relation;               /* OID of relation having rules */
+	CmdType         event;                  /* type of rule being fired */
 } rewrite_event;
+ 
 
 static bool acquireLocksOnSubLinks(Node *node, void *context);
 static Query *rewriteRuleAction(Query *parsetree,
@@ -1623,46 +1624,63 @@ fireRIRrules(Query *parsetree, List *activeRIRs, bool forUpdatePushedDown)
 		 * Collect the RIR rules that we must apply
 		 */
 		rules = rel->rd_rules;
-		if (rules == NULL)
+		if (rules != NULL)
 		{
-			heap_close(rel, NoLock);
-			continue;
-		}
-		locks = NIL;
-		for (i = 0; i < rules->numLocks; i++)
-		{
-			rule = rules->rules[i];
-			if (rule->event != CMD_SELECT)
-				continue;
+			locks = NIL;
+			for (i = 0; i < rules->numLocks; i++)
+			{
+				rule = rules->rules[i];
+				if (rule->event != CMD_SELECT)
+					continue;
 
-			locks = lappend(locks, rule);
-		}
+				locks = lappend(locks, rule);
+			}
 
+			/*
+			 * If we found any, apply them --- but first check for recursion!
+			 */
+			if (locks != NIL)
+			{
+				ListCell   *l;
+
+				if (list_member_oid(activeRIRs, RelationGetRelid(rel)))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							 errmsg("infinite recursion detected in rules for relation \"%s\"",
+									RelationGetRelationName(rel))));
+				activeRIRs = lcons_oid(RelationGetRelid(rel), activeRIRs);
+
+				foreach(l, locks)
+				{
+					rule = lfirst(l);
+
+					parsetree = ApplyRetrieveRule(parsetree,
+												  rule,
+												  rt_index,
+												  rel,
+												  activeRIRs,
+												  forUpdatePushedDown);
+				}
+
+				activeRIRs = list_delete_first(activeRIRs);
+			}
+		}
 		/*
-		 * If we found any, apply them --- but first check for recursion!
+		 * If the RTE has row-security quals, apply them and recurse into the 
+		 * securityQuals.
 		 */
-		if (locks != NIL)
+		if (prepend_row_security_quals(parsetree, rte, rt_index))
 		{
-			ListCell   *l;
-
+			// We applied security quals, check for infinite recursion and
+			// then expand any nested queries.
 			if (list_member_oid(activeRIRs, RelationGetRelid(rel)))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("infinite recursion detected in rules for relation \"%s\"",
+						 errmsg("infinite recursion detected in row-security policy for relation \"%s\"",
 								RelationGetRelationName(rel))));
 			activeRIRs = lcons_oid(RelationGetRelid(rel), activeRIRs);
-
-			foreach(l, locks)
-			{
-				rule = lfirst(l);
-
-				parsetree = ApplyRetrieveRule(parsetree,
-											  rule,
-											  rt_index,
-											  rel,
-											  activeRIRs,
-											  forUpdatePushedDown);
-			}
+			
+			expression_tree_walker( (Node*) rte->securityQuals, fireRIRonSubLink, (void*)activeRIRs );
 
 			activeRIRs = list_delete_first(activeRIRs);
 		}
@@ -2852,7 +2870,7 @@ rewriteTargetView(Query *parsetree, Relation view)
  * rewrite_events is a list of open query-rewrite actions, so we can detect
  * infinite recursion.
  */
-static List *
+List *
 RewriteQuery(Query *parsetree, List *rewrite_events)
 {
 	CmdType		event = parsetree->commandType;
@@ -2924,6 +2942,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 					 errmsg("multi-statement DO INSTEAD rules are not supported for data-modifying statements in WITH")));
 		}
 	}
+
 
 	/*
 	 * If the statement is an insert, update, or delete, adjust its targetlist
