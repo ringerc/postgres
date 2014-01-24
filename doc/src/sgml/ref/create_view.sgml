@@ -323,12 +323,6 @@ CREATE VIEW vista AS SELECT text 'Hello World' AS hello;
        or set-returning functions.
       </para>
      </listitem>
-
-     <listitem>
-      <para>
-       The view must not have the <literal>security_barrier</> property.
-      </para>
-     </listitem>
     </itemizedlist>
    </para>
 
