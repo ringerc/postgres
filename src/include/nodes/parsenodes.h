@@ -735,6 +735,7 @@ typedef struct RangeTblEntry
 	 */
 	Oid			relid;			/* OID of the relation */
 	char		relkind;		/* relation kind (see pg_class.relkind) */
+	bool		rowsec_done;	/* True if row-security quals checked for and applied already */
 
 	/*
 	 * Fields valid for a subquery RTE (else NULL):
