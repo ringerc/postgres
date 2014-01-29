@@ -89,7 +89,8 @@ prepend_row_security_quals(CmdType commandType, RangeTblEntry* rte)
 	GetUserIdAndSecContext(&userid, &sec_context);
 
 	bool qualsAdded = false;
-	if (rte->relid >= FirstNormalObjectId 
+	if (rte->relid >= FirstNormalObjectId
+		&& rte->relkind == RTE_RELATION
 		&& !rte->rowsec_done
 		&& !(sec_context & SECURITY_ROW_LEVEL_DISABLED))
 	{
