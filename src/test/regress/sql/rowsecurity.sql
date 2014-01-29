@@ -79,13 +79,13 @@ ALTER TABLE document SET ROW SECURITY FOR ALL
 
 -- viewpoint from rls_regress_user1
 SET SESSION AUTHORIZATION rls_regress_user1;
-SELECT * FROM document WHERE f_leak(dtitle);
-SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+SELECT * FROM document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle) ORDER BY did;
 
 -- viewpoint from rls_regress_user2
 SET SESSION AUTHORIZATION rls_regress_user2;
-SELECT * FROM document WHERE f_leak(dtitle);
-SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+SELECT * FROM document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle) ORDER BY did;
 
 EXPLAIN (costs off) SELECT * FROM document WHERE f_leak(dtitle);
 EXPLAIN (costs off) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
@@ -99,13 +99,13 @@ ALTER TABLE document SET ROW SECURITY FOR ALL TO (dauthor = current_user);
 
 -- viewpoint from rls_regress_user1 again
 SET SESSION AUTHORIZATION rls_regress_user1;
-SELECT * FROM document WHERE f_leak(dtitle);
-SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+SELECT * FROM document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle) ORDER BY did;
 
 -- viewpoint from rls_regress_user2 again
 SET SESSION AUTHORIZATION rls_regress_user2;
-SELECT * FROM document WHERE f_leak(dtitle);
-SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
+SELECT * FROM document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle) ORDER BY did;
 
 EXPLAIN (costs off) SELECT * FROM document WHERE f_leak(dtitle);
 EXPLAIN (costs off) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dtitle);
