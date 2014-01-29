@@ -20,6 +20,6 @@ typedef List *(*row_security_policy_hook_type)(CmdType cmdtype,
 											   Relation relation);
 extern PGDLLIMPORT row_security_policy_hook_type row_security_policy_hook;
 
-extern bool prepend_row_security_quals(CmdType commandType, RangeTblEntry* rte);
+extern bool prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte);
 
 #endif	/* ROWSECURITY_H */
