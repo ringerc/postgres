@@ -31,6 +31,50 @@
 /* hook to allow extensions to apply their own security policy */
 row_security_policy_hook_type	row_security_policy_hook = NULL;
 
+static void
+add_uid_plan_inval(PlannerGlobal* glob);
+
+static List *
+pull_row_security_policy(CmdType cmd, Relation relation);
+
+/*
+ * Check the given RTE to see whether it's already had row-security
+ * quals expanded and, if not, prepend any row-security rules
+ * from built-in or plug-in sources to the securityQuals.
+ *
+ * Returns true if any quals were added.
+ */
+bool
+prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte)
+{
+	List	   *rowsecquals;
+	Relation 	rel;
+	Oid			userid;
+	int			sec_context;
+
+	GetUserIdAndSecContext(&userid, &sec_context);
+
+	bool qualsAdded = false;
+	if (rte->relid >= FirstNormalObjectId
+		&& rte->relkind == 'r'
+		&& !rte->rowsec_done
+		&& !(sec_context & SECURITY_ROW_LEVEL_DISABLED))
+	{
+		rel = heap_open(rte->relid, NoLock);
+		rowsecquals = pull_row_security_policy(root->parse->commandType, rel);
+		if (rowsecquals)
+		{
+			rte->securityQuals = list_concat(rowsecquals, rte->securityQuals);
+			qualsAdded = true;
+		}
+		heap_close(rel, NoLock);
+		rte->rowsec_done = true;
+	}
+	if (qualsAdded)
+		add_uid_plan_inval(root->glob);
+	return qualsAdded;
+}
+
 /*
  * pull_row_security_policy
  *
@@ -72,37 +116,29 @@ pull_row_security_policy(CmdType cmd, Relation relation)
 }
 
 /*
- * Check the given RTE to see whether it's already had row-security
- * quals expanded and, if not, prepend any row-security rules
- * from built-in or plug-in sources to the securityQuals.
- *
- * Returns true if any quals were added.
+ * Row-security plans are dependent on the current user id because of the if
+ * (superuser) test. So row-security plans must be invalidated if the user id
+ * changes.
  */
-bool
-prepend_row_security_quals(CmdType commandType, RangeTblEntry* rte)
+static void
+add_uid_plan_inval(PlannerGlobal* glob)
 {
-	List	   *rowsecquals;
-	Relation 	rel;
-	Oid			userid;
-	int			sec_context;
+	PlanInvalItem  *pi_item;
 
-	GetUserIdAndSecContext(&userid, &sec_context);
-
-	bool qualsAdded = false;
-	if (rte->relid >= FirstNormalObjectId
-		&& rte->relkind == RTE_RELATION
-		&& !rte->rowsec_done
-		&& !(sec_context & SECURITY_ROW_LEVEL_DISABLED))
+	if (!OidIsValid(glob->planUserId))
 	{
-		rel = heap_open(rte->relid, NoLock);
-		rowsecquals = pull_row_security_policy(commandType, rel);
-		if (rowsecquals)
-		{
-			rte->securityQuals = list_concat(rowsecquals, rte->securityQuals);
-			qualsAdded = true;
-		}
-		heap_close(rel, NoLock);
-		rte->rowsec_done = true;
+		/* Plan invalidation on session user-id */
+		glob->planUserId = GetUserId();
+	
+		/* Plan invalidation on catalog updates of pg_authid */
+		pi_item = makeNode(PlanInvalItem);
+		pi_item->cacheId = AUTHOID;
+		pi_item->hashValue =
+		GetSysCacheHashValue1(AUTHOID,
+	    					  ObjectIdGetDatum(glob->planUserId));
+		glob->invalItems = lappend(glob->invalItems, pi_item);
 	}
-	return qualsAdded;
+	else
+		Assert(glob->planUserId == GetUserId());
+
 }

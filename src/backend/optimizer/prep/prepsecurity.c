@@ -82,13 +82,15 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 
 		/*
 		 * Check for row-security quals on the relation and, if found, prepend them
-		 * as new inner-most security quals. Ignore the return, we don't care. 
+		 * as new inner-most security quals. Ignore the return, we don't care at the
+		 * moment.
 		 *
 		 * This will set rowsec_done on the RTE, which we'll copy if we expand
 		 * it, ensuring that no infinitely recursive expansion of row security quals
 		 * is done.
 		 */
-		(void) prepend_row_security_quals(root->parse->commandType, rte);
+		(void) prepend_row_security_quals(root, rte);
+
 
 		if (rte->securityQuals == NIL)
 			continue;
