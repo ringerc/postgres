@@ -34,9 +34,6 @@ row_security_policy_hook_type	row_security_policy_hook = NULL;
 static void
 add_uid_plan_inval(PlannerGlobal* glob);
 
-static List *
-pull_row_security_policy(CmdType cmd, Relation relation);
-
 /*
  * Check the given RTE to see whether it's already had row-security
  * quals expanded and, if not, prepend any row-security rules
@@ -82,7 +79,7 @@ prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte)
  * extensions. If any policy is found a list of qualifier expressions is
  * returned, where each is treated as a securityQual.
  */
-static List *
+List *
 pull_row_security_policy(CmdType cmd, Relation relation)
 {
 	List   *quals = NIL;

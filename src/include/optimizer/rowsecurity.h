@@ -22,4 +22,7 @@ extern PGDLLIMPORT row_security_policy_hook_type row_security_policy_hook;
 
 extern bool prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte);
 
+extern List *pull_row_security_policy(CmdType cmd, Relation relation);
+
+
 #endif	/* ROWSECURITY_H */
