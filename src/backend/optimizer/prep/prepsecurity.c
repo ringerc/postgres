@@ -46,6 +46,9 @@ static void security_barrier_replace_vars(Node *node,
 static bool security_barrier_replace_vars_walker(Node *node,
 									 security_barrier_replace_vars_context *context);
 
+static void change_rowmarks(PlanRowMark *parent, int old_rt_index,
+							int new_rt_index, List *rowMarks);
+
 
 /*
  * expand_security_quals -
@@ -61,8 +64,9 @@ static bool security_barrier_replace_vars_walker(Node *node,
 void
 expand_security_quals(PlannerInfo *root, List *tlist)
 {
-	Query	   *parse = root->parse;
-	int			rt_index;
+	Query	       *parse = root->parse;
+	int				rt_index, new_rt_index;
+	PlanRowMark	   *rowmark;
 
 	/*
 	 * Process each RTE in the rtable list.
@@ -102,16 +106,17 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 			continue;
 
 		/*
-		 * If this RTE is the target then we need to make a copy of it before
-		 * expanding it.  The unexpanded copy will become the new target, and
-		 * the original RTE will be expanded to become the source of rows to
-		 * update/delete.
+		 * If this RTE is the target relation or is the subject of any RowMarks
+		 * then we need to make a copy of it before expanding it.  The
+		 * unexpanded copy will become the new target, and the original RTE
+		 * will be expanded to become the source of rows to update/delete.
 		 */
-		if (rt_index == parse->resultRelation)
+		rowmark = get_plan_rowmark(root->rowMarks, rt_index);
+		if (rt_index == parse->resultRelation || rowmark != NULL )
 		{
 			RangeTblEntry *newrte = copyObject(rte);
 			parse->rtable = lappend(parse->rtable, newrte);
-			parse->resultRelation = list_length(parse->rtable);
+			parse->resultRelation = new_rt_index = list_length(parse->rtable);
 
 			/*
 			 * Wipe out any copied security barrier quals on the new target to
@@ -141,6 +146,14 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 
 			ChangeVarNodes((Node *) parse->withCheckOptions, rt_index,
 						   parse->resultRelation, 0);
+
+			/*
+			 * The PlanRowMark for this RTI, if present, must also
+			 * point to the underlying RTE_RELATION we copied,
+			 * not to the subquery RTE.
+			 */
+			if (rowmark)
+				change_rowmarks(rowmark, rt_index, new_rt_index, root->rowMarks);
 		}
 
 		/*
@@ -162,6 +175,37 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 		}
 	}
 }
+
+/*
+ * When the rangetable entry for a rowmark target is copied and replaced with a
+ * subquery, rowmarks referring to the replaced RTE must be rewritten to point to
+ * its new index.
+ *
+ * Takes the rowmark to adjust ("parent"), the old and new rtis for the RTE we
+ * just copied, and the list of all rowmarks in the plan.
+ */
+static void
+change_rowmarks(PlanRowMark *parent, int old_rt_index,
+				int new_rt_index, List *rowMarks)
+{
+	ListCell	   *lc;
+	PlanRowMark	   *rowmark;
+
+	/* Adjust rti and (if self) prti to point to the copied RTE. */
+	parent->rti = new_rt_index;
+	if (parent->prti == old_rt_index)
+		parent->prti = new_rt_index;
+	/* If this is a parent RowMark, fix up prti on its children. */
+	if (parent->isParent) {
+		foreach (lc, rowMarks)
+		{
+			rowmark = (PlanRowMark*) lfirst(lc);
+			if (rowmark->prti == old_rt_index)
+				rowmark->prti = new_rt_index;
+		}
+	}
+}
+
 
 
 /*

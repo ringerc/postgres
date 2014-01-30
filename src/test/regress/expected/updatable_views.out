@@ -1942,13 +1942,13 @@ SELECT * FROM rw_view1;
 EXPLAIN (costs off) DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
                                QUERY PLAN                                
 -------------------------------------------------------------------------
- Update on base_tbl base_tbl_1
+ Update on base_tbl base_tbl_2
    ->  Nested Loop
          ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_1
                Index Cond: (id = 1)
          ->  Subquery Scan on base_tbl
                Filter: snoop(base_tbl.data)
-               ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_2
+               ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_3
                      Index Cond: (id = 1)
                      Filter: (NOT deleted)
 (9 rows)
