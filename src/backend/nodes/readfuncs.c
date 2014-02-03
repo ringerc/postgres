@@ -1215,6 +1215,7 @@ _readRangeTblEntry(void)
 			READ_OID_FIELD(relid);
 			READ_CHAR_FIELD(relkind);
 			READ_BOOL_FIELD(rowsec_done);
+			READ_NODE_FIELD(rowSecurityParents);
 			break;
 		case RTE_SUBQUERY:
 			READ_NODE_FIELD(subquery);

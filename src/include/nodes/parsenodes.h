@@ -706,6 +706,11 @@ typedef struct XmlSerialize
  *	  integer members, so we subtract FirstLowInvalidHeapAttributeNumber from
  *	  column numbers before storing them in these fields.  A whole-row Var
  *	  reference is represented by setting the bit for InvalidAttrNumber.
+ *
+ *	  The rowSecurityParents list keeps a "breadcrumbs" record of the relids
+ *	  of all relations that were expanded into row-security subqueries
+ *	  to produce this RangeTblEntry. NIL unless this RangeTblEntry
+ *	  resulted from one or more row-security qual expansions.
  *--------------------
  */
 typedef enum RTEKind
@@ -742,6 +747,7 @@ typedef struct RangeTblEntry
 	 */
 	Query	   *subquery;		/* the sub-query */
 	bool		security_barrier;		/* is from security_barrier view? */
+	List	   *rowSecurityParents; /* relids rowsec-expanded to reach this one */
 
 	/*
 	 * Fields valid for a join RTE (else NULL/zero):

@@ -2373,6 +2373,7 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 			WRITE_OID_FIELD(relid);
 			WRITE_CHAR_FIELD(relkind);
 			WRITE_BOOL_FIELD(rowsec_done);
+			WRITE_NODE_FIELD(rowSecurityParents);
 			break;
 		case RTE_SUBQUERY:
 			WRITE_NODE_FIELD(subquery);

@@ -2000,6 +2000,7 @@ _copyRangeTblEntry(const RangeTblEntry *from)
 	COPY_BITMAPSET_FIELD(selectedCols);
 	COPY_BITMAPSET_FIELD(modifiedCols);
 	COPY_NODE_FIELD(securityQuals);
+	COPY_NODE_FIELD(rowSecurityParents);
 
 	return newnode;
 }
