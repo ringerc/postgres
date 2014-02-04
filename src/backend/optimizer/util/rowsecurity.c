@@ -45,18 +45,44 @@ bool
 prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte)
 {
 	List	   *rowsecquals;
+	ListCell   *lc;
 	Relation 	rel;
 	Oid			userid;
 	int			sec_context;
+	bool qualsAdded = false;
 
 	GetUserIdAndSecContext(&userid, &sec_context);
 
-	bool qualsAdded = false;
 	if (rte->relid >= FirstNormalObjectId
 		&& rte->relkind == 'r'
 		&& !rte->rowsec_done
 		&& !(sec_context & SECURITY_ROW_LEVEL_DISABLED))
 	{
+		/*
+		 * Test for infinite recursion. Each RTE carrys a list of relids
+		 * whose row-security qualifiers were expanded to generate that RTE.
+		 *
+		 * For RTEs that arent't the result of row-security qual expansion
+		 * it's NIL. Otherwise, it's our breadcrumb trail. If we find ourself
+		 * on the breadcrumb trail, we're in a loop and need to bail out.
+		 *
+		 * See row_security_expanded_rel for how the parent list is copied into
+		 * RTEs in subqueries after row-security expansion.
+		 */
+		foreach(lc, rte->rowSecurityParents)
+			if (lfirst_oid(lc) == rte->relid)
+				/* TODO: we have enough info to report the recursion path. Do it. */
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("infinite recursion detected for relation \"%s\"",
+							 get_rel_name(rte->relid))));
+
+		/* rowSecurityParents will get copied to the subquery RTE and any nested
+		 * RTEs in sublinks, so we can just append our own oid to it here. */
+		rte->rowSecurityParents = lcons_oid(rte->relid, rte->rowSecurityParents);
+
+		/* Then fetch the row-security qual and add it to the list of quals
+		 * to be expanded by expand_security_quals */
 		rel = heap_open(rte->relid, NoLock);
 		rowsecquals = pull_row_security_policy(root->parse->commandType, rel);
 		if (rowsecquals)
@@ -138,4 +164,58 @@ add_uid_plan_inval(PlannerGlobal* glob)
 	else
 		Assert(glob->planUserId == GetUserId());
 
+}
+
+struct set_rowsecparent_walker_context
+{
+	List		*parentList;
+};
+
+static bool
+set_rowsecparent_walker(Node* node, struct set_rowsecparent_walker_context *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry* rte = (RangeTblEntry*)node;
+		/* Sanity check - parent list must be NIL, or exaclty what we're going
+		 * to be copying into place anyway. */
+		Assert(rte->rowSecurityParents == NIL || equal(rte->rowSecurityParents, context->parentList));
+		if (rte->rtekind == RTE_RELATION)
+		{
+			/* We'll hit the top level RangeTblEntry that's already got our
+			 * parentList, so only modify entries with no parent list. */
+			if (rte->rowSecurityParents == NIL)
+				rte->rowSecurityParents = (List*) copyObject(context->parentList);
+			
+		}
+		/* Examine any children, in case this is a subquery node or has securityQuals */
+		return true;
+	}
+
+	/* Recurse into subqueries, that's why we're here */
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, &set_rowsecparent_walker, (void*) context, QTW_EXAMINE_RTES);
+
+	return expression_tree_walker(node, &set_rowsecparent_walker, (void *) context);
+}
+
+/*
+ * After row-security quals are expanded by expand_security_quals, it's
+ * necessary to copy the rowSecurityParents list in the RTE's top level (as set
+ * up by prepend_row_security_quals above) to any inner RTEs in the product
+ * query. When those RTEs are examined and expanded we can check for infinite
+ * recursion at that point.
+ *
+ * This is a wrapper around a walker.
+ */
+void
+row_security_expanded_rel(PlannerInfo *root, RangeTblEntry* rte, Oid parentRelid)
+{
+	Assert(rte->rtekind == RTE_SUBQUERY);
+	struct set_rowsecparent_walker_context context;
+	context.parentList = rte->rowSecurityParents;
+	(void) query_tree_walker(rte->subquery, &set_rowsecparent_walker, &context, QTW_EXAMINE_RTES);
 }

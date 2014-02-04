@@ -66,6 +66,7 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 	Query	   *parse = root->parse;
 	int			rt_index;
 	ListCell   *cell;
+	Oid			rowsec_relid = InvalidOid;
 
 	/*
 	 * Process each RTE in the rtable list.
@@ -82,15 +83,14 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 
 		/*
 		 * Check for row-security quals on the relation and, if found, prepend them
-		 * as new inner-most security quals. Ignore the return, we don't care at the
-		 * moment.
+		 * as new inner-most security quals.
 		 *
 		 * This will set rowsec_done on the RTE, which we'll copy if we expand
-		 * it, ensuring that no infinitely recursive expansion of row security quals
-		 * is done.
+		 * it, ensuring that no relid that's already been expanded gets
+		 * expanded again.
 		 */
-		(void) prepend_row_security_quals(root, rte);
-
+		if (prepend_row_security_quals(root, rte))
+			rowsec_relid = rte->relid;
 
 		if (rte->securityQuals == NIL)
 			continue;
@@ -162,6 +162,13 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 			ChangeVarNodes(qual, rt_index, 1, 0);
 			expand_security_qual(root, tlist, rt_index, rte, qual);
 		}
+
+		/* If row-security provided quals it needs a chance to do fixups
+		 * after the RTE is expanded into a subquery. (We should probably only
+		 * call this on the rel after we expand all row-security quals,
+		 * before expanding other quals, but it doesn't really matter.) */
+		if (rowsec_relid != InvalidOid)
+			row_security_expanded_rel(root, rte, rowsec_relid);
 	}
 }
 

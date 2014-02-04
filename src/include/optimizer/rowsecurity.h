@@ -24,5 +24,7 @@ extern bool prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte);
 
 extern List *pull_row_security_policy(CmdType cmd, Relation relation);
 
+extern void row_security_expanded_rel(PlannerInfo *root, RangeTblEntry* rte, Oid parentRelid);
+
 
 #endif	/* ROWSECURITY_H */
