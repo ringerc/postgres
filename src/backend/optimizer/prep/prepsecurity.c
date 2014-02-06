@@ -26,8 +26,6 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/rel.h"
-#include "optimizer/rowsecurity.h"
-
 
 typedef struct
 {
@@ -66,7 +64,6 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 	Query	   *parse = root->parse;
 	int			rt_index;
 	ListCell   *cell;
-	Oid			rowsec_relid = InvalidOid;
 
 	/*
 	 * Process each RTE in the rtable list.
@@ -80,17 +77,6 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
 
 		rt_index++;
-
-		/*
-		 * Check for row-security quals on the relation and, if found, prepend them
-		 * as new inner-most security quals.
-		 *
-		 * This will set rowsec_done on the RTE, which we'll copy if we expand
-		 * it, ensuring that no relid that's already been expanded gets
-		 * expanded again.
-		 */
-		if (prepend_row_security_quals(root, rte))
-			rowsec_relid = rte->relid;
 
 		if (rte->securityQuals == NIL)
 			continue;
@@ -162,13 +148,6 @@ expand_security_quals(PlannerInfo *root, List *tlist)
 			ChangeVarNodes(qual, rt_index, 1, 0);
 			expand_security_qual(root, tlist, rt_index, rte, qual);
 		}
-
-		/* 
-		 * If row-security provided quals or if this node is descended
-		 * from a previous row-security qual expansion, row-security
-		 * needs to annotate nested queries for infinite recursion detection.
-		 */
-		row_security_expanded_rel(root, rte->subquery, rowsec_relid);
 	}
 }
 

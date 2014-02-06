@@ -20,11 +20,9 @@ typedef List *(*row_security_policy_hook_type)(CmdType cmdtype,
 											   Relation relation);
 extern PGDLLIMPORT row_security_policy_hook_type row_security_policy_hook;
 
-extern bool prepend_row_security_quals(PlannerInfo* root, RangeTblEntry* rte);
+extern bool apply_row_security_policies(Query *parsetree, List *rewrite_events);
 
 extern List *pull_row_security_policy(CmdType cmd, Relation relation);
-
-extern void row_security_expanded_rel(PlannerInfo *root, Query *subquery, Oid parentRelid);
 
 
 #endif	/* ROWSECURITY_H */

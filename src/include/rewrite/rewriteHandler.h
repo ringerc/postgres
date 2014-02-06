@@ -28,4 +28,6 @@ extern int	relation_is_updatable(Oid reloid,
 						  bool include_triggers,
 						  Bitmapset *include_cols);
 
+extern List *RewriteQuery(Query *parsetree, List *rewrite_events);
+
 #endif   /* REWRITEHANDLER_H */

@@ -25,6 +25,7 @@
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
+#include "rewrite/rowsecurity.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -2852,7 +2853,7 @@ rewriteTargetView(Query *parsetree, Relation view)
  * rewrite_events is a list of open query-rewrite actions, so we can detect
  * infinite recursion.
  */
-static List *
+List *
 RewriteQuery(Query *parsetree, List *rewrite_events)
 {
 	CmdType		event = parsetree->commandType;
@@ -2924,6 +2925,12 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 					 errmsg("multi-statement DO INSTEAD rules are not supported for data-modifying statements in WITH")));
 		}
 	}
+
+
+	/* Apply any row-security quals on tables in the query's rtable.
+	 * (Does this need to recurse into child RTEs, or will rewrite already
+	 * do that? */
+	(void) apply_row_security_policies(parsetree, rewrite_events);
 
 	/*
 	 * If the statement is an insert, update, or delete, adjust its targetlist
