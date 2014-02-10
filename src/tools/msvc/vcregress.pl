@@ -2,7 +2,14 @@
 
 # src/tools/msvc/vcregress.pl
 
+BEGIN {
+	chdir "../../.." if (-d "../../../src/tools/msvc");
+	push(@INC, "src/tools/msvc");
+}
+
 use strict;
+use warnings;
+use 5.10.1;
 
 our $config;
 
@@ -11,9 +18,9 @@ use File::Copy;
 
 use Install qw(Install);
 
+
 my $startdir = getcwd();
 
-chdir "../../.." if (-d "../../../src/tools/msvc");
 
 my $topdir = getcwd();
 
@@ -42,7 +49,16 @@ else
 }
 
 # use a capital C here because config.pl has $config
-my $Config = -e "release/postgres/postgres.exe" ? "Release" : "Debug";
+my $Config;
+if (-e "Release/postgres/postgres.exe") {
+	$Config = "Release";
+	print("Testing RELEASE build\n");
+} elsif (-e "Debug/postgres/postgres.exe") {
+	$Config = "Debug";
+	print("Testing DEBUG build\n");
+} else {
+	die("No postgres/postgres.exe found in Release or Debug dirs");
+}
 
 copy("$Config/refint/refint.dll",                 "src/test/regress");
 copy("$Config/autoinc/autoinc.dll",               "src/test/regress");
