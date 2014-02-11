@@ -209,7 +209,6 @@ DROP TABLE dependee; -- Should fail without CASCADE due to dependency on row-sec
 
 EXPLAIN SELECT * FROM dependent; -- After drop, should be unqualified
 
-
 -----   RECURSION    ----
 
 --
@@ -247,7 +246,7 @@ SELECT * FROM rec1;    -- fail, mutual recursion via views
 -- Mutual recursion via .s.b views
 -- 
 
-DROP VIEW rec1v, rec2v;
+DROP VIEW rec1v, rec2v CASCADE;
 CREATE VIEW rec1v WITH (security_barrier) AS SELECT * FROM rec1;
 CREATE VIEW rec2v WITH (security_barrier) AS SELECT * FROM rec2;
 ALTER TABLE rec1 SET ROW SECURITY FOR ALL TO (x = (SELECT a FROM rec2v WHERE b = y));
