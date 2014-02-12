@@ -50,6 +50,16 @@ CREATE TABLESPACE <replaceable class="parameter">tablespace_name</replaceable>
    <command>CREATE INDEX</> or <command>ADD CONSTRAINT</> to have the data
    files for these objects stored within the specified tablespace.
   </para>
+
+  <warning>
+   <para>
+    You can't use the contents of a tablespace without the database it's part of,
+    nor can you use the main database if a tablespace is missing.  Don't try to
+    use tablespaces for backup or redundancy.
+    See <xref linkend="manage-ag-tablespaces" />.
+   </para>
+  </warning>
+
  </refsect1>
 
  <refsect1>
