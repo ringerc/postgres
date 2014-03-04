@@ -516,6 +516,62 @@ EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
                Filter: f_leak(b)
 (12 rows)
 
+----- Dependencies -----
+CREATE TABLE dependee (x integer, y integer);
+CREATE TABLE dependent(x integer, y integer);
+ALTER TABLE dependent SET ROW SECURITY FOR ALL TO (x = (SELECT d.x FROM dependee d WHERE d.y = y));
+DROP TABLE dependee; -- Should fail without CASCADE due to dependency on row-security qual?
+ERROR:  cannot drop table dependee because other objects depend on it
+DETAIL:  row-security of table dependent FOR ALL depends on table dependee
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+EXPLAIN SELECT * FROM dependent; -- After drop, should be unqualified
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Seq Scan on dependent  (cost=0.00..31.40 rows=2140 width=8)
+ Planning time: 0.078 ms
+(2 rows)
+
+-----   RECURSION    ----
+--
+-- Simple recursion
+--
+CREATE TABLE rec1 (x integer, y integer);
+ALTER TABLE rec1
+SET ROW SECURITY FOR ALL TO (
+	x = (SELECT r.x FROM rec1 r WHERE y = r.y)
+);
+SELECT * FROM rec1; -- fail, direct recursion
+ERROR:  infinite recursion detected in row-security policy for relation "rec1"
+--
+-- Mutual recursion
+--
+CREATE TABLE rec2 (a integer, b integer);
+ALTER TABLE rec1 SET ROW SECURITY FOR ALL TO (x = (SELECT a FROM rec2 WHERE b = y));
+ALTER TABLE rec2 SET ROW SECURITY FOR ALL TO (a = (SELECT x FROM rec1 WHERE y = b));
+SELECT * FROM rec1;    -- fail, mutual recursion
+ERROR:  infinite recursion detected in row-security policy for relation "rec1"
+--
+-- Mutual recursion via views
+--
+CREATE VIEW rec1v AS SELECT * FROM rec1;
+CREATE VIEW rec2v AS SELECT * FROM rec2;
+ALTER TABLE rec1 SET ROW SECURITY FOR ALL TO (x = (SELECT a FROM rec2v WHERE b = y));
+ALTER TABLE rec2 SET ROW SECURITY FOR ALL TO (a = (SELECT x FROM rec1v WHERE y = b));
+SELECT * FROM rec1;    -- fail, mutual recursion via views
+ERROR:  infinite recursion detected in row-security policy for relation "rec1"
+--
+-- Mutual recursion via .s.b views
+-- 
+DROP VIEW rec1v, rec2v CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to row-security of table rec1 FOR ALL
+drop cascades to row-security of table rec2 FOR ALL
+CREATE VIEW rec1v WITH (security_barrier) AS SELECT * FROM rec1;
+CREATE VIEW rec2v WITH (security_barrier) AS SELECT * FROM rec2;
+ALTER TABLE rec1 SET ROW SECURITY FOR ALL TO (x = (SELECT a FROM rec2v WHERE b = y));
+ALTER TABLE rec2 SET ROW SECURITY FOR ALL TO (a = (SELECT x FROM rec1v WHERE y = b));
+SELECT * FROM rec1;    -- fail, mutual recursion via s.b. views
+ERROR:  infinite recursion detected in row-security policy for relation "rec1"
 --
 -- recursive RLS and VIEWs in policy
 --
