@@ -203,7 +203,7 @@ EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 CREATE TABLE dependee (x integer, y integer);
 
 CREATE TABLE dependent(x integer, y integer);
-ALTER TABLE dependent SET ROW SECURITY FOR ALL AS (x = (SELECT d.x FROM dependee d WHERE d.y = y));
+ALTER TABLE dependent SET ROW SECURITY FOR ALL TO (x = (SELECT d.x FROM dependee d WHERE d.y = y));
 
 DROP TABLE dependee; -- Should fail without CASCADE due to dependency on row-security qual?
 
