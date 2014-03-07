@@ -93,6 +93,9 @@ typedef struct CachedPlanSource
 	List	   *invalItems;		/* other dependencies, as PlanInvalItems */
 	struct OverrideSearchPath *search_path;		/* search_path used for
 												 * parsing and planning */
+	Oid			planUserId;		/* User-id that the plan depends on, or
+								 * InvalidOid if the plan doesn't depend on any
+								 * particular user ID. */
 	MemoryContext query_context;	/* context holding the above, or NULL */
 	/* If we have a generic plan, this is a reference-counted link to it: */
 	struct CachedPlan *gplan;	/* generic plan, or NULL if not valid */
@@ -128,8 +131,6 @@ typedef struct CachedPlan
 	bool		is_oneshot;		/* is it a "oneshot" plan? */
 	bool		is_saved;		/* is CachedPlan in a long-lived context? */
 	bool		is_valid;		/* is the stmt_list currently valid? */
-	Oid			planUserId;		/* is user-id that is assumed on this cached
-								   plan, or InvalidOid if portable for anybody */
 	TransactionId saved_xmin;	/* if valid, replan when TransactionXmin
 								 * changes from this value */
 	int			generation;		/* parent's generation number for this plan */

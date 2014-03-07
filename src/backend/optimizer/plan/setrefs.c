@@ -2040,7 +2040,8 @@ record_plan_function_dependency(PlannerInfo *root, Oid funcid)
 void
 extract_query_dependencies(Node *query,
 						   List **relationOids,
-						   List **invalItems)
+						   List **invalItems,
+						   Oid  *planUserId)
 {
 	PlannerGlobal glob;
 	PlannerInfo root;
@@ -2050,6 +2051,7 @@ extract_query_dependencies(Node *query,
 	glob.type = T_PlannerGlobal;
 	glob.relationOids = NIL;
 	glob.invalItems = NIL;
+	glob.planUserId = InvalidOid;
 
 	MemSet(&root, 0, sizeof(root));
 	root.type = T_PlannerInfo;
@@ -2059,6 +2061,7 @@ extract_query_dependencies(Node *query,
 
 	*relationOids = glob.relationOids;
 	*invalItems = glob.invalItems;
+	*planUserId = glob.planUserId;
 }
 
 static bool
@@ -2073,6 +2076,17 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 	{
 		Query	   *query = (Query *) node;
 		ListCell   *lc;
+
+		/* Check to see if this node has a user id dependency; if so,
+		 * register it in the global state. */
+		if (OidIsValid(query->dependsUserId))
+		{
+			/* Different Query nodes may not have the same user id
+			 * dependency. */
+			Assert( !OidIsValid(context->glob->planUserId) 
+					|| context->glob->planUserId == query->dependsUserId );
+			context->glob->planUserId = query->dependsUserId;
+		}
 
 		if (query->commandType == CMD_UTILITY)
 		{

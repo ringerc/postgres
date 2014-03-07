@@ -100,7 +100,8 @@ typedef struct PlannerGlobal
 
 	bool		transientPlan;	/* redo plan when TransactionXmin changes? */
 
-	Oid			planUserId;		/* User-Id to be assumed on this plan */
+	Oid			planUserId;		/* User-id this plan depends on, or
+								 * InvalidOid if it doesn't depend on a userid. */
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */

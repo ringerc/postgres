@@ -35,7 +35,8 @@ row_security_policy_hook_type	row_security_policy_hook = NULL;
  * plug-in sources to the securityQuals. The security quals are rewritten (for
  * view expansion, etc) before being added to the RTE.
  *
- * Returns true if any quals were added.
+ * Returns true if any quals were added. Note that quals may have been found
+ * but not added if user rights make the user exempt from row security.
  */
 bool
 prepend_row_security_quals(Query* root, RangeTblEntry* rte, int rt_index)
@@ -45,6 +46,7 @@ prepend_row_security_quals(Query* root, RangeTblEntry* rte, int rt_index)
 	Oid				userid;
 	int				sec_context;
 	bool			qualsAdded = false;
+	bool			depends_on_userid;
 
 	GetUserIdAndSecContext(&userid, &sec_context);
 	
@@ -57,7 +59,7 @@ prepend_row_security_quals(Query* root, RangeTblEntry* rte, int rt_index)
 		 * to be expanded by expand_security_quals.
 		 */
 		rel = heap_open(rte->relid, NoLock);
-		rowsecquals = pull_row_security_policy(root->commandType, rel);
+		rowsecquals = pull_row_security_policy(root->commandType, rel, &depends_on_userid);
 		if (rowsecquals)
 		{
 			/* 
@@ -68,15 +70,19 @@ prepend_row_security_quals(Query* root, RangeTblEntry* rte, int rt_index)
 			 *
 			 * We rewrite the expression in-place.
 			 */
+			qualsAdded = true;
 			ChangeVarNodes(rowsecquals, 1, rt_index, 0);
 			rte->securityQuals = list_concat(rowsecquals, rte->securityQuals);
-			qualsAdded = true;
 		}
 		heap_close(rel, NoLock);
 	}
-	if (qualsAdded)
-		elog(WARNING, "Added quals, but not plan invalidation for user id");
-		/* add_uid_plan_inval(root->glob); */
+	if (depends_on_userid)
+	{
+		/* Record that this plan depends on the current user ID
+		 * and must be replanned if it changes. */
+		Assert( !OidIsValid(root->dependsUserId) || root->dependsUserId == GetUserId() );
+		root->dependsUserId = GetUserId();
+	}
 	return qualsAdded;
 }
 
@@ -93,7 +99,7 @@ prepend_row_security_quals(Query* root, RangeTblEntry* rte, int rt_index)
  * you're not generating the expression tree each time.
  */
 List *
-pull_row_security_policy(CmdType cmd, Relation relation)
+pull_row_security_policy(CmdType cmd, Relation relation, bool* depends_on_userid)
 {
 	List   *quals = NIL;
 	Expr   *qual = NULL;
@@ -102,11 +108,20 @@ pull_row_security_policy(CmdType cmd, Relation relation)
 	 * Pull the row-security policy configured with built-in features,
 	 * if unprivileged users. Please note that superuser can bypass it.
 	 */
-	if (relation->rsdesc && !superuser())
+	if (relation->rsdesc)
 	{
-		RowSecurityDesc *rsdesc = relation->rsdesc;
-		qual = copyObject(rsdesc->rsall.qual);
-		quals = lcons(qual, quals);
+		if (depends_on_userid)
+			*depends_on_userid = true;
+		/* Should make this dependent on a grantable right instead: */
+		if (!superuser())
+		{
+			RowSecurityDesc *rsdesc = relation->rsdesc;
+			qual = copyObject(rsdesc->rsall.qual);
+			quals = lcons(qual, quals);
+		}
+	} else {
+		if (depends_on_userid)
+			*depends_on_userid = false;
 	}
 
 	/*

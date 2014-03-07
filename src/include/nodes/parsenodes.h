@@ -153,7 +153,7 @@ typedef struct Query
 	List	   *constraintDeps; /* a list of pg_constraint OIDs that the query
 								 * depends on to be semantically valid */
 
-	Oid		   *dependsUserId;  /* If this rewritten tree is only valid
+	Oid			dependsUserId;  /* If this rewritten tree is only valid
 	                             * for a given user ID, that ID. Otherwise InvalidOid.
 								 * Not used after PlannerGlobal is created. */
 } Query;

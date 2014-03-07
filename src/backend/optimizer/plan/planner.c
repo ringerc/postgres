@@ -40,6 +40,7 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
 
 
 /* GUC parameter */
@@ -260,6 +261,40 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	return result;
 }
 
+static void
+create_userdep_planinval(Query* parse, PlannerGlobal *glob)
+{
+	Oid dep = parse->dependsUserId;
+	Oid globdep = glob->planUserId;
+	/* If the global dependency is already set and we have a dependency
+	 * for this subtree, make sure it's the same as the one we found on
+	 * this subtree. A plan can't depend on multiple user IDs. */
+	Assert( !OidIsValid(globdep) || !OidIsValid(dep) || (globdep == dep) );
+
+	/*
+	 * If the global dependency isn't already set, and we have a 
+	 * user id dependency, copy the oid and create a plan inval
+	 * item on pg_authid so that if the user id is updated this plan
+	 * gets invalidated (say, due to the user becoming/ceasing to be
+	 * superuser).
+	 */
+	if (!OidIsValid(globdep) && OidIsValid(dep))
+	{
+		PlanInvalItem  *pi = makeNode(PlanInvalItem);
+
+		glob->planUserId = dep;
+
+		pi->cacheId = AUTHOID;
+		pi->hashValue = GetSysCacheHashValue1(AUTHOID,
+											  ObjectIdGetDatum(dep));
+		glob->invalItems = lappend(glob->invalItems, pi);
+	}
+
+	/* Otherwise we have nothing to do. Either the dependency
+	 * has already been recognised and invalidation items created,
+	 * or there isn't a dependency for this subnode.*/
+}
+
 
 /*--------------------
  * subquery_planner
@@ -323,6 +358,13 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	else
 		root->wt_param_id = -1;
 	root->non_recursive_plan = NULL;
+
+	/*
+	 * Check to see whether anything in the subquery depends on the current user ID.
+	 * If it does, set the relevant PlannerGlobal flag and create an inval item
+	 * on the catalog.
+	 */
+	create_userdep_planinval(parse, glob);
 
 	/*
 	 * If there is a WITH list, process each WITH query and build an initplan

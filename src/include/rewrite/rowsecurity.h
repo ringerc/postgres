@@ -20,7 +20,7 @@ typedef List *(*row_security_policy_hook_type)(CmdType cmdtype,
 											   Relation relation);
 extern PGDLLIMPORT row_security_policy_hook_type row_security_policy_hook;
 
-extern List *pull_row_security_policy(CmdType cmd, Relation relation);
+extern List *pull_row_security_policy(CmdType cmd, Relation relation, bool *depends_on_userid);
 
 extern bool prepend_row_security_quals(Query* root, RangeTblEntry* rte, int rt_index);
 
