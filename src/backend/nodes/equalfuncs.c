@@ -872,7 +872,7 @@ _equalQuery(const Query *a, const Query *b)
 	COMPARE_NODE_FIELD(rowMarks);
 	COMPARE_NODE_FIELD(setOperations);
 	COMPARE_NODE_FIELD(constraintDeps);
-	COMPARE_NODE_FIELD(rowSecParents);
+	COMPARE_SCALAR_FIELD(dependsUserId);
 
 	return true;
 }
