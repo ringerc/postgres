@@ -346,60 +346,51 @@ SELECT * FROM t1;
 ---+-----
  2 | bbb
  4 | ddd
- 1 | abc
- 3 | cde
- 1 | xxx
+ 2 | bcd
+ 4 | def
  2 | yyy
- 3 | zzz
-(7 rows)
+(5 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1;
-             QUERY PLAN              
--------------------------------------
+          QUERY PLAN           
+-------------------------------
  Append
-   ->  Subquery Scan on t1
-         ->  Seq Scan on t1 t1_1
-               Filter: ((a % 2) = 0)
-   ->  Subquery Scan on t2
-         ->  Seq Scan on t2 t2_1
-               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t1
+         Filter: ((a % 2) = 0)
+   ->  Seq Scan on t2
+         Filter: ((a % 2) = 0)
    ->  Seq Scan on t3
-(8 rows)
+         Filter: ((a % 2) = 0)
+(7 rows)
 
 SELECT * FROM t1 WHERE f_leak(b);
 NOTICE:  f_leak => bbb
 NOTICE:  f_leak => ddd
-NOTICE:  f_leak => abc
-NOTICE:  f_leak => cde
-NOTICE:  f_leak => xxx
+NOTICE:  f_leak => bcd
+NOTICE:  f_leak => def
 NOTICE:  f_leak => yyy
-NOTICE:  f_leak => zzz
  a |  b  
 ---+-----
  2 | bbb
  4 | ddd
- 1 | abc
- 3 | cde
- 1 | xxx
+ 2 | bcd
+ 4 | def
  2 | yyy
- 3 | zzz
-(7 rows)
+(5 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b);
              QUERY PLAN              
 -------------------------------------
- Append
-   ->  Subquery Scan on t1
-         Filter: f_leak(t1.b)
+ Subquery Scan on t1
+   Filter: f_leak(t1.b)
+   ->  Append
          ->  Seq Scan on t1 t1_1
                Filter: ((a % 2) = 0)
-   ->  Subquery Scan on t2
-         Filter: f_leak(t2.b)
-         ->  Seq Scan on t2 t2_1
-               Filter: ((a % 2) = 1)
-   ->  Seq Scan on t3
-         Filter: f_leak(b)
-(11 rows)
+         ->  Seq Scan on t2
+               Filter: ((a % 2) = 0)
+         ->  Seq Scan on t3
+               Filter: ((a % 2) = 0)
+(9 rows)
 
 -- reference to system column
 SELECT oid, * FROM t1;
@@ -407,25 +398,22 @@ SELECT oid, * FROM t1;
 -----+---+-----
  102 | 2 | bbb
  104 | 4 | ddd
- 201 | 1 | abc
- 203 | 3 | cde
- 301 | 1 | xxx
+ 202 | 2 | bcd
+ 204 | 4 | def
  302 | 2 | yyy
- 303 | 3 | zzz
-(7 rows)
+(5 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1;
-             QUERY PLAN              
--------------------------------------
+          QUERY PLAN           
+-------------------------------
  Append
-   ->  Subquery Scan on t1
-         ->  Seq Scan on t1 t1_1
-               Filter: ((a % 2) = 0)
-   ->  Subquery Scan on t2
-         ->  Seq Scan on t2 t2_1
-               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t1
+         Filter: ((a % 2) = 0)
+   ->  Seq Scan on t2
+         Filter: ((a % 2) = 0)
    ->  Seq Scan on t3
-(8 rows)
+         Filter: ((a % 2) = 0)
+(7 rows)
 
 -- reference to whole-row reference
 SELECT *,t1 FROM t1;
@@ -433,25 +421,22 @@ SELECT *,t1 FROM t1;
 ---+-----+---------
  2 | bbb | (2,bbb)
  4 | ddd | (4,ddd)
- 1 | abc | (1,abc)
- 3 | cde | (3,cde)
- 1 | xxx | (1,xxx)
+ 2 | bcd | (2,bcd)
+ 4 | def | (4,def)
  2 | yyy | (2,yyy)
- 3 | zzz | (3,zzz)
-(7 rows)
+(5 rows)
 
 EXPLAIN (costs off) SELECT *,t1 FROM t1;
-             QUERY PLAN              
--------------------------------------
+          QUERY PLAN           
+-------------------------------
  Append
-   ->  Subquery Scan on t1
-         ->  Seq Scan on t1 t1_1
-               Filter: ((a % 2) = 0)
-   ->  Subquery Scan on t2
-         ->  Seq Scan on t2 t2_1
-               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t1
+         Filter: ((a % 2) = 0)
+   ->  Seq Scan on t2
+         Filter: ((a % 2) = 0)
    ->  Seq Scan on t3
-(8 rows)
+         Filter: ((a % 2) = 0)
+(7 rows)
 
 -- for share/update lock
 SELECT * FROM t1 FOR SHARE;
