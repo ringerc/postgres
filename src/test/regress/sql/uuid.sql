@@ -75,5 +75,13 @@ INSERT INTO guid2(guid_field) VALUES('3f3e3c3b3a3039383736353433a2313e');
 SELECT COUNT(*) FROM guid1 g1 INNER JOIN guid2 g2 ON g1.guid_field = g2.guid_field;
 SELECT COUNT(*) FROM guid1 g1 LEFT JOIN guid2 g2 ON g1.guid_field = g2.guid_field WHERE g2.guid_field IS NULL;
 
+-- Test binary input and output
+SELECT bytea_to_uuid(BYTEA '\x0FCC6350118D11E4A5597DE5338EB025');
+SELECT uuid_to_bytea(UUID '0fcc6350-118d-11e4-a559-7de5338eb025');
+
+SELECT bytea_to_uuid(BYTEA '\x0FCC6350118D11E4A5597DE5338EB025DE');
+SELECT bytea_to_uuid(BYTEA '\x0FCC6350118D11E4A5597DE5338EB0');
+SELECT bytea_to_uuid(BYTEA '\x');
+
 -- clean up
 DROP TABLE guid1, guid2 CASCADE;

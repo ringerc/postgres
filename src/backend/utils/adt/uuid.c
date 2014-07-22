@@ -129,6 +129,72 @@ syntax_error:
 					source)));
 }
 
+/*
+ * Copy a uuid into a supplied buffer.
+ *
+ * This ensures that pg_uuid_t stays opaque.
+ */
+void pg_copy_uuid_to_bytebuf(char *buf, pg_uuid_t *uuid, size_t bufsize)
+{
+	if (bufsize < UUID_LEN)
+		/* In case UUID_LEN changes */
+		elog(ERROR, "Expected at least %d byte buffer, got %d", UUID_LEN, bufsize);
+
+	memcpy(buf, (void*)uuid, UUID_LEN);
+}
+
+/*
+ * Create a pg_uuid_t from a raw uuid in 16-byte binary form.
+ *
+ * This is just a raw memory copy for now, but keeps pg_uuid_t
+ * opaque in case it has to change.
+ */
+pg_uuid_t *pg_uuid_from_bytebuf(char *buf, size_t bufsize)
+{
+	if (bufsize != UUID_LEN)
+		/* In case UUID_LEN changes */
+		elog(ERROR, "Expected a %d byte buffer, got %d", UUID_LEN, bufsize);
+
+	pg_uuid_t *uuid = (pg_uuid_t*)palloc(UUID_LEN);
+	memcpy(uuid, buf, UUID_LEN);
+	return uuid;
+}
+
+Datum
+bytea_to_uuid(PG_FUNCTION_ARGS)
+{
+	bytea	   *inbytea;
+	pg_uuid_t  *uuid;
+
+	inbytea = PG_DETOAST_DATUM(PG_GETARG_BYTEA_P(0));
+	if (VARSIZE_ANY_EXHDR(inbytea) != UUID_LEN)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_STRING_DATA_LENGTH_MISMATCH),
+				 errmsg("Input of %d bytes was not exactly %d bytes (128 bits) in size", VARSIZE_ANY_EXHDR(inbytea), UUID_LEN)));
+	}
+
+	PG_RETURN_UUID_P(pg_uuid_from_bytebuf(VARDATA_ANY(inbytea), UUID_LEN));
+};
+
+Datum
+uuid_to_bytea(PG_FUNCTION_ARGS)
+{
+	bytea	   *outbytea;
+	pg_uuid_t  *uuid;
+
+	/* uuid isn't TOASTAble */
+	uuid = PG_GETARG_UUID_P(0);
+
+	outbytea = (bytea*)palloc(VARHDRSZ + UUID_LEN);
+    SET_VARSIZE(outbytea, VARHDRSZ + UUID_LEN);
+	pg_copy_uuid_to_bytebuf(VARDATA(outbytea), (void*)uuid, UUID_LEN);
+
+    PG_RETURN_BYTEA_P(outbytea);
+}
+
+
+
 Datum
 uuid_recv(PG_FUNCTION_ARGS)
 {

@@ -4274,6 +4274,10 @@ DATA(insert OID = 2962 (  uuid_send		   PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0
 DESCR("I/O");
 DATA(insert OID = 2963 (  uuid_hash		   PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 23 "2950" _null_ _null_ _null_ _null_ uuid_hash _null_ _null_ _null_ ));
 DESCR("hash");
+DATA(insert OID = 3255 (  uuid_to_bytea	   PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 17 "2950" _null_ _null_ _null_ _null_ uuid_to_bytea _null_ _null_ _null_ ));
+DESCR("Convert a uuid into a 16-byte bytea")
+DATA(insert OID = 3256 (  bytea_to_uuid	   PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 2950 "17" _null_ _null_ _null_ _null_ bytea_to_uuid _null_ _null_ _null_ ));
+DESCR("Read a uuid from a 16-byte bytea")
 
 /* pg_lsn */
 DATA(insert OID = 3229 (  pg_lsn_in		PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 3220 "2275" _null_ _null_ _null_ _null_ pg_lsn_in _null_ _null_ _null_ ));

@@ -26,4 +26,18 @@ typedef struct pg_uuid_t pg_uuid_t;
 #define DatumGetUUIDP(X)		((pg_uuid_t *) DatumGetPointer(X))
 #define PG_GETARG_UUID_P(X)		DatumGetUUIDP(PG_GETARG_DATUM(X))
 
+/*
+ * Write a uuid to a UUID_LEN sized buffer. For use with code that
+ * handles UUIDs in raw binary form.
+ */
+void pg_copy_uuid_to_bytebuf(char *buf, pg_uuid_t *uuid, size_t bufsize);
+
+/*
+ * Create a palloc'd pg_uuid_t from a UUID_LEN sized buffer. For use with
+ * code that handles UUIDs in raw binary form.
+ */
+pg_uuid_t *pg_uuid_from_bytebuf(char *buf, size_t bufsize);
+
+/* Note that all Datum handling functions are in builtins.h */
+
 #endif   /* UUID_H */
