@@ -191,8 +191,15 @@ gets_fromFile(FILE *source)
 		{
 			if (ferror(source))
 			{
-				psql_error("could not read from input file: %s\n",
-						   strerror(errno));
+				/*
+				 * Could the user be trying to restore a directory
+				 * format dump?
+				 */
+				if (errno == EISDIR)
+					psql_error("Input path is a directory. Use pg_restore to restore directory-format database dumps.\n");
+				else
+					psql_error("could not read from input file: %s\n",
+							   strerror(errno));
 				return NULL;
 			}
 			break;
