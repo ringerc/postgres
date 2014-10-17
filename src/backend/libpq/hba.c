@@ -28,12 +28,14 @@
 #include "catalog/pg_collation.h"
 #include "libpq/ip.h"
 #include "libpq/libpq.h"
+#include "libpq/auth.h"
 #include "postmaster/postmaster.h"
 #include "regex/regex.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
@@ -2106,7 +2108,8 @@ check_usermap(const char *usermap_name,
 		}
 		ereport(LOG,
 				(errmsg("provided user name (%s) and authenticated user name (%s) do not match",
-						pg_role, auth_user)));
+						pg_role, auth_user),
+				 errhint_if_ident_conf_stale()));
 		return STATUS_ERROR;
 	}
 	else
@@ -2126,7 +2129,8 @@ check_usermap(const char *usermap_name,
 	{
 		ereport(LOG,
 				(errmsg("no match in usermap \"%s\" for user \"%s\" authenticated as \"%s\"",
-						usermap_name, pg_role, auth_user)));
+						usermap_name, pg_role, auth_user),
+				 errhint_if_ident_conf_stale()));
 	}
 	return found_entry ? STATUS_OK : STATUS_ERROR;
 }

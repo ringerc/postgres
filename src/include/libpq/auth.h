@@ -22,6 +22,8 @@ extern char *pg_krb_realm;
 
 extern void ClientAuthentication(Port *port);
 
+extern int errhint_if_ident_conf_stale(void);
+
 /* Hook for plugins to get control in ClientAuthentication() */
 typedef void (*ClientAuthentication_hook_type) (Port *, int);
 extern PGDLLIMPORT ClientAuthentication_hook_type ClientAuthentication_hook;

@@ -16,9 +16,11 @@
 #include "postgres.h"
 
 #include <sys/param.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "libpq/auth.h"
@@ -30,6 +32,8 @@
 #include "miscadmin.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
+#include "utils/guc.h"
+#include "utils/timestamp.h"
 
 
 /*----------------------------------------------------------------
@@ -40,6 +44,8 @@ static void sendAuthRequest(Port *port, AuthRequest areq);
 static void auth_failed(Port *port, int status, char *logdetail);
 static char *recv_password_packet(Port *port);
 static int	recv_and_check_password_packet(Port *port, char **logdetail);
+
+static int errhint_if_hba_conf_stale(void);
 
 
 /*----------------------------------------------------------------
@@ -282,11 +288,11 @@ auth_failed(Port *port, int status, char *logdetail)
 	ereport(FATAL,
 			(errcode(errcode_return),
 			 errmsg(errstr, port->user_name),
-			 logdetail ? errdetail_log("%s", logdetail) : 0));
+			 logdetail ? errdetail_log("%s", logdetail) : 0,
+			 errhint_if_hba_conf_stale()));
 
 	/* doesn't return */
 }
-
 
 /*
  * Client authentication starts here.  If there is an error, this
@@ -334,7 +340,8 @@ ClientAuthentication(Port *port)
 		{
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-				  errmsg("connection requires a valid client certificate")));
+				  errmsg("connection requires a valid client certificate"),
+				  errhint_if_hba_conf_stale()));
 		}
 #else
 
@@ -378,12 +385,14 @@ ClientAuthentication(Port *port)
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("pg_hba.conf rejects replication connection for host \"%s\", user \"%s\", %s",
 							   hostinfo, port->user_name,
-							   port->ssl_in_use ? _("SSL on") : _("SSL off"))));
+							   port->ssl_in_use ? _("SSL on") : _("SSL off")),
+						errhint_if_hba_conf_stale()));
 #else
 					ereport(FATAL,
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("pg_hba.conf rejects replication connection for host \"%s\", user \"%s\"",
-							   hostinfo, port->user_name)));
+							   hostinfo, port->user_name),
+						errhint_if_hba_conf_stale()));
 #endif
 				}
 				else
@@ -394,13 +403,15 @@ ClientAuthentication(Port *port)
 						errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
 							   hostinfo, port->user_name,
 							   port->database_name,
-							   port->ssl_in_use ? _("SSL on") : _("SSL off"))));
+							   port->ssl_in_use ? _("SSL on") : _("SSL off")),
+						errhint_if_hba_conf_stale()));
 #else
 					ereport(FATAL,
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\"",
 							   hostinfo, port->user_name,
-							   port->database_name)));
+							   port->database_name),
+						errhint_if_hba_conf_stale()));
 #endif
 				}
 				break;
@@ -453,12 +464,14 @@ ClientAuthentication(Port *port)
 						errmsg("no pg_hba.conf entry for replication connection from host \"%s\", user \"%s\", %s",
 							   hostinfo, port->user_name,
 							   port->ssl_in_use ? _("SSL on") : _("SSL off")),
+						errhint_if_hba_conf_stale(),
 						HOSTNAME_LOOKUP_DETAIL(port)));
 #else
 					ereport(FATAL,
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("no pg_hba.conf entry for replication connection from host \"%s\", user \"%s\"",
 							   hostinfo, port->user_name),
+						errhint_if_hba_conf_stale(),
 						HOSTNAME_LOOKUP_DETAIL(port)));
 #endif
 				}
@@ -471,6 +484,7 @@ ClientAuthentication(Port *port)
 							   hostinfo, port->user_name,
 							   port->database_name,
 							   port->ssl_in_use ? _("SSL on") : _("SSL off")),
+						errhint_if_hba_conf_stale(),
 						HOSTNAME_LOOKUP_DETAIL(port)));
 #else
 					ereport(FATAL,
@@ -478,6 +492,7 @@ ClientAuthentication(Port *port)
 						errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\"",
 							   hostinfo, port->user_name,
 							   port->database_name),
+						errhint_if_hba_conf_stale(),
 						HOSTNAME_LOOKUP_DETAIL(port)));
 #endif
 				}
@@ -682,6 +697,45 @@ recv_password_packet(Port *port)
 	 * encoding, there wouldn't be much point.
 	 */
 	return buf.data;
+}
+
+/* See errhint_if_hba_conf_stale */
+static int
+errhint_if_cfg_stale(const char * cfgpath, const char * cfgfile)
+{
+	struct stat	statbuf;
+
+	if (stat(cfgpath, &statbuf) == 0)
+	{
+		if (difftime(statbuf.st_mtime, timestamptz_to_time_t(PgReloadTime)) > 0)
+		{
+			errhint("See the server error log for additional information.");
+			return errhint_log("%s has been changed since last server configuration reload. Reload the server configuration to apply the changes.",
+				cfgfile);
+		}
+	}
+	return 0;
+}
+
+/*
+ * If pg_hba.conf has been modified since the last reload, emit a HINT
+ * to the client suggesting that they check the server error log, and
+ * a HINT to the server error log informing the user that pg_hba.conf
+ * has changed since the last reload.
+ */
+static int
+errhint_if_hba_conf_stale()
+{
+	return errhint_if_cfg_stale(HbaFileName, "pg_hba.conf");
+}
+
+/*
+ * Like errhint_if_hba_conf_stale but for pg_ident.conf
+ */
+int
+errhint_if_ident_conf_stale()
+{
+	return errhint_if_cfg_stale(IdentFileName, "pg_ident.conf");
 }
 
 
