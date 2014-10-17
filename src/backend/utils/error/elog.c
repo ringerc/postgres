@@ -1015,6 +1015,26 @@ errhint(const char *fmt,...)
 	return 0;					/* return value does not matter */
 }
 
+/*
+ * errhint_log --- add a hint_log error message text to the current error
+ */
+int
+errhint_log(const char *fmt,...)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+	MemoryContext oldcontext;
+
+	recursion_depth++;
+	CHECK_STACK_DEPTH();
+	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
+
+	EVALUATE_MESSAGE(edata->domain, hint_log, false, true);
+
+	MemoryContextSwitchTo(oldcontext);
+	recursion_depth--;
+	return 0;					/* return value does not matter */
+}
+
 
 /*
  * errcontext_msg --- add a context error message text to the current error
@@ -1498,6 +1518,8 @@ CopyErrorData(void)
 		newedata->detail_log = pstrdup(newedata->detail_log);
 	if (newedata->hint)
 		newedata->hint = pstrdup(newedata->hint);
+	if (newedata->hint_log)
+		newedata->hint_log = pstrdup(newedata->hint_log);
 	if (newedata->context)
 		newedata->context = pstrdup(newedata->context);
 	if (newedata->schema_name)
@@ -1536,6 +1558,8 @@ FreeErrorData(ErrorData *edata)
 		pfree(edata->detail_log);
 	if (edata->hint)
 		pfree(edata->hint);
+	if (edata->hint_log)
+		pfree(edata->hint_log);
 	if (edata->context)
 		pfree(edata->context);
 	if (edata->schema_name)
@@ -1618,6 +1642,8 @@ ReThrowError(ErrorData *edata)
 		newedata->detail_log = pstrdup(newedata->detail_log);
 	if (newedata->hint)
 		newedata->hint = pstrdup(newedata->hint);
+	if (newedata->hint_log)
+		newedata->hint_log = pstrdup(newedata->hint_log);
 	if (newedata->context)
 		newedata->context = pstrdup(newedata->context);
 	if (newedata->schema_name)
@@ -2659,8 +2685,11 @@ write_csvlog(ErrorData *edata)
 		appendCSVLiteral(&buf, edata->detail);
 	appendStringInfoChar(&buf, ',');
 
-	/* errhint */
-	appendCSVLiteral(&buf, edata->hint);
+	/* errhint or errhint_log */
+	if (edata->hint_log)
+		appendCSVLiteral(&buf, edata->hint_log);
+	else
+		appendCSVLiteral(&buf, edata->hint);
 	appendStringInfoChar(&buf, ',');
 
 	/* internal query */
@@ -2777,25 +2806,22 @@ send_message_to_server_log(ErrorData *edata)
 
 	if (Log_error_verbosity >= PGERROR_DEFAULT)
 	{
-		if (edata->detail_log)
+		const char * const detail 
+			= edata->detail_log != NULL ? edata->detail_log : edata->detail;
+		const char * const hint
+			= edata->hint_log != NULL ? edata->hint_log : edata->hint;
+		if (detail)
 		{
 			log_line_prefix(&buf, edata);
 			appendStringInfoString(&buf, _("DETAIL:  "));
-			append_with_tabs(&buf, edata->detail_log);
+			append_with_tabs(&buf, detail);
 			appendStringInfoChar(&buf, '\n');
 		}
-		else if (edata->detail)
-		{
-			log_line_prefix(&buf, edata);
-			appendStringInfoString(&buf, _("DETAIL:  "));
-			append_with_tabs(&buf, edata->detail);
-			appendStringInfoChar(&buf, '\n');
-		}
-		if (edata->hint)
+		if (hint)
 		{
 			log_line_prefix(&buf, edata);
 			appendStringInfoString(&buf, _("HINT:  "));
-			append_with_tabs(&buf, edata->hint);
+			append_with_tabs(&buf, hint);
 			appendStringInfoChar(&buf, '\n');
 		}
 		if (edata->internalquery)
@@ -3078,6 +3104,8 @@ send_message_to_frontend(ErrorData *edata)
 			pq_sendbyte(&msgbuf, PG_DIAG_MESSAGE_HINT);
 			err_sendstring(&msgbuf, edata->hint);
 		}
+
+		/* hint_log is intentionally not used here */
 
 		if (edata->context)
 		{

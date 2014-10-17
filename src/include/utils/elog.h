@@ -203,6 +203,12 @@ errhint(const char *fmt,...)
    the supplied arguments. */
 __attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
 
+extern int
+errhint_log(const char *fmt,...)
+/* This extension allows gcc to check the format string for consistency with
+   the supplied arguments. */
+__attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
+
 /*
  * errcontext() is typically called in error context callback functions, not
  * within an ereport() invocation. The callback function can be in a different
@@ -395,6 +401,7 @@ typedef struct ErrorData
 	char	   *detail;			/* detail error message */
 	char	   *detail_log;		/* detail error message for server log only */
 	char	   *hint;			/* hint message */
+	char	   *hint_log;		/* hint message for server log only */
 	char	   *context;		/* context message */
 	char	   *schema_name;	/* name of schema */
 	char	   *table_name;		/* name of table */
