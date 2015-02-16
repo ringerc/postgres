@@ -136,6 +136,7 @@ CREATE EXTENSION <replaceable>module_name</> FROM unpackaged;
  &seg;
  &sepgsql;
  &contrib-spi;
+ &example-worker-spi;
  &sslinfo;
  &tablefunc;
  &tcn;

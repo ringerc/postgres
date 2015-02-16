@@ -142,6 +142,7 @@
 <!ENTITY postgres-fdw    SYSTEM "postgres-fdw.sgml">
 <!ENTITY seg             SYSTEM "seg.sgml">
 <!ENTITY contrib-spi     SYSTEM "contrib-spi.sgml">
+<!ENTITY example-worker-spi     SYSTEM "example-worker-spi.sgml">
 <!ENTITY sepgsql         SYSTEM "sepgsql.sgml">
 <!ENTITY sslinfo         SYSTEM "sslinfo.sgml">
 <!ENTITY tablefunc       SYSTEM "tablefunc.sgml">

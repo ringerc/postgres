@@ -1,0 +1,26 @@
+<!-- doc/src/sgml/example-worker-spi.sgml -->
+
+<sect1 id="example-worker-spi" xreflabel="worker-spi">
+ <title>worker-spi example</title>
+
+ <indexterm zone="example-worker-spi">
+  <primary>Background worker with SPI</primary>
+  <secondary>SPI in background worker</secondary>
+ </indexterm>
+
+ <para>
+  The <application>worker-spi</> module provides a complete and working
+  example of a background worker that uses the SPI to query databases and
+  uses shared memory for communication. It is not intended for use except
+  as an example for developers.
+ </para>
+
+ <para>
+  It is located in <filename>src/test/modules/worker_spi</filename>.
+ </para>
+
+ <para>
+  Relevant documentation for this example module is in <xref linkend="bgworker"/>, <xref linkend="spi"/>, <xref linkend="xfunc"/> and <xref linkend="extend"/>.
+ </para>
+
+</sect1>

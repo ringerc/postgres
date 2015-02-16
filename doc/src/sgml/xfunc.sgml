@@ -3357,6 +3357,60 @@ if (!ptr)
 }
 </programlisting>
     </para>
+
+    <para>
+     Extensions registered to run at startup
+     using <xref linkend="guc-shared-preload-libraries"> should instead install a
+     <literal>shmem_startup_hook</> from <function>_PG_init</>.  This will be
+     invoked once shared memory is ready but before user backends or background
+     workers get launched. The hook function invoked should use a pattern like
+     that shown for shared memory initialization above then call the next hook
+     function, e.g. declare:
+<programlisting>
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+</programlisting>
+     then from <function>_PG_init</>, after any
+     <function>RequestAddinShmemSpace</> and <function>RequestAddinLWLocks</>
+     install the hook:
+<programlisting>
+     prev_shmem_startup_hook = shmem_startup_hook;
+     shmem_startup_hook = my_worker_shmem_startup;
+</programlisting>
+     where <function>my_worker_shmem_startup</function> is a <type>void</> function
+     with <type>void</> arguments that calls the next hook (if any):
+<programlisting>
+     if (prev_shmem_startup_hook != NULL)
+         prev_shmem_startup_hook();
+</programlisting>
+     then calls <function>ShmemInitStruct</> per the example shown above. An
+     example of this usage can be found in the initialisation of the <xref
+     linkend="pgstatstatements"> extension.
+    </para>
+
+     <caution>
+      <title>Shared memory is zeroed on postmaster restart</title>
+      <para>
+       If the postmaster restarts - usually due to the crash of a backend
+       process like a user backend or a background worker - then it zeroes
+       shared memory on restart then re-invokes any shared memory setup hooks
+       that have been installed by extensions. Extensions using shared memory
+       must be prepared for this.
+      </para>
+      <para>
+       Background workers are not unregistered if the postmaster restarts
+       due to the crash of a background worker or user backend. This can lead
+       to background workers accessing shared memory that has been reinitialized.
+       Care must be taken to ensure that initialisation of shared memory produces
+       stable results when re-run or workers must detect the postmaster restart
+       using a generation counter and exit. In particular if parameters are being
+       passed to a bgworker via shared memory the background worker
+       <structfield>bgw_main_arg</structfield> should always be an index into an
+       array allocated in shared memory, rather than a pointer, and repeated
+       initialisations of the shared memory segment must produce the same range
+       of valid indexes in the same order.
+      </para>
+     </caution>
+
    </sect2>
 
    <sect2 id="extend-Cpp" xreflabel="using C++ for extensibility">

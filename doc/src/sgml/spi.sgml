@@ -10,7 +10,8 @@
  <para>
   The <firstterm>Server Programming Interface</firstterm>
   (<acronym>SPI</acronym>) gives writers of user-defined
-  <acronym>C</acronym> functions the ability to run
+  <acronym>C</acronym> functions and <xref linkend="bgworker"/>
+  the ability to run
   <acronym>SQL</acronym> commands inside their functions.
   <acronym>SPI</acronym> is a set of
   interface functions to simplify access to the parser, planner,
@@ -363,6 +364,7 @@ SPI_execute("INSERT INTO foo SELECT * FROM bar RETURNING *", false, 5);
    or the command counter, and it allows only plain <command>SELECT</>
    commands to appear in the command string.  The commands are executed
    using the snapshot previously established for the surrounding query.
+   Additional steps are required for <xref linkend="spi-bgworker"/>.
    This execution mode is somewhat faster than the read/write mode due
    to eliminating per-command overhead.  It also allows genuinely
    <firstterm>stable</> functions to be built: since successive executions
@@ -822,7 +824,9 @@ int SPI_execute_with_args(const char *<parameter>command</parameter>,
    <varlistentry>
     <term><literal>bool <parameter>read_only</parameter></literal></term>
     <listitem>
-     <para><literal>true</> for read-only execution</para>
+     <para><literal>true</> for read-only execution with no snapshot
+     or command counter management. See <function>SPI_execute</function>
+     for details.</para>
     </listitem>
    </varlistentry>
 
@@ -3361,7 +3365,8 @@ char * SPI_getnspname(Relation <parameter>rel</parameter>)
    <quote>upper executor context</quote>, that is, the memory context
    that was current when <function>SPI_connect</function> was called,
    which is precisely the right context for a value returned from your
-   procedure.
+   procedure. For direct control over the context used for allocation,
+   <function>MemoryContextAlloc</function> may be used.
   </para>
 
   <para>
@@ -4092,6 +4097,143 @@ INSERT INTO a SELECT * FROM a;
   </para>
  </sect1>
 
+ <sect1 id="spi-bgworker" xreflabel="SPI in background workers">
+  <title>Using the SPI from background workers</title>
+
+  <para>
+   Using the SPI from <link linkend="bgworker">background workers</>
+   requires some additional steps that are not required from SPI-using
+   procedures invoked via SQL from normal user backends. When using the SPI
+   from an SQL-callable function it is safe to assume that a transaction is
+   already open, there is already a snapshot, and that PostgreSQL's statistics
+   have been updated. None of these things may be assumed for use of the SPI
+   from a bgworker.
+  </para>
+
+  <para>
+   To safely use the SPI from a bgworker you must ensure that:
+  <itemizedlist>
+   <listitem><para>A transaction is open (in progress)</para></listitem>
+   <listitem><para>The SPI is connected</para></listitem>
+   <listitem><para>There is an active snapshot or <parameter>read_only</parameter> is set to <literal>false</literal> in SPI calls</para></listitem>
+  </itemizedlist>
+   You should also update the statement start and end timestamps for use in
+   <literal>pg_stat_activity</> using <function>pgstat_report_activity</>.
+  </para>
+
+  <para>
+   Attempting to use the SPI without an open transaction or using the SPI
+   in <parameter>read_only</parameter> mode without setting a snapshot will
+   generally <emphasis>not</emphasis> cause obvious failures or, in a
+   <literal>--enable-cassert</literal> build, assertions. Instead it will
+   usually appear to work for simple cases but may produce incorrect
+   results or be unstable. Users of background workers should generally
+   prefix SPI use with
+<programlisting>
+Assert(IsTransactionState());
+</programlisting>
+   if the function does not its self establish a transaction.
+  </para>
+
+  <para>
+   Typical SPI use from a background worker involves setting up a transaction,
+   setting the statement start timestamp, connecting to the SPI, updating
+   pg_stat_activity, establishing a snapshot, running the query/queries,
+   then performing matching cleanup actions. For example:
+  </para>
+
+<programlisting>
+const char * some_sql = "SELECT 1;";
+
+/* setup */
+StartTransactionCommand();
+SetCurrentStatementStartTimestamp();
+SPI_connect();
+PushActiveSnapshot(GetTransactionSnapshot());
+
+pgstat_report_activity(STATE_RUNNING, some_sql);
+
+/* Run queries with SPI, read_only = false ... */
+spi_ret = SPI_execute(some_sql, false);
+if (spi_ret != SPI_OK_TUPLES)
+    elog(ERROR, "SPI error: %d", spi_ret);
+
+/* ... process results, run more queries, etc ... */
+
+/* cleanup */
+SPI_finish();
+PopActiveSnapshot();
+CommitTransactionCommand();
+pgstat_report_activity(STATE_IDLE, NULL);
+</programlisting>
+
+  <para>
+   In more complex cases the function may need to check if a transaction is
+   already open with <function>IsTransactionState()</function> and only perform
+   transaction management if there is no current transaction. If the SPI may
+   already connected by the caller the function should use
+   <function>SPI_push_conditional</function> before <function>SPI_connect</function> and
+   <function>SPI_pop_conditional</function> after <function>SPI_finish</function>. Snapshot
+   state may also be conditionally handled. The resulting procedure will
+   look more like:
+  </para>
+
+<programlisting>
+const char * some_sql = "SELECT 1;";
+bool tx_started = false,
+     snapshot_pushed = false,
+     spi_pushed;
+
+/* setup */
+if (!IsTransactionCommand())
+{
+  StartTransactionCommand();
+  tx_started = true;
+}
+SetCurrentStatementStartTimestamp();
+if (!ActiveSnapshotSet())
+{
+  PushActiveSnapshot(GetTransactionSnapshot());
+  snapshot_pushed = true;
+}
+spi_pushed = SPI_push_conditional();
+SPI_connect();
+
+pgstat_report_activity(STATE_RUNNING, some_sql);
+
+/* Run queries with SPI, read_only = false... */
+spi_ret = SPI_execute(some_sql, false);
+if (spi_ret != SPI_OK_TUPLES)
+    elog(ERROR, "SPI error: %d", spi_ret);
+
+/* ... process results, run more queries, etc ... */
+
+/* cleanup */
+SPI_finish();
+if (snapshot_pushed)
+  PopActiveSnapshot();
+SPI_pop_conditional(spi_pushed);
+if (tx_started)
+  CommitTransactionCommand();
+pgstat_report_activity(STATE_IDLE, NULL);
+</programlisting>
+
+  <para>
+   If <parameter>read_only</parameter> is <literal>true</literal> for the SPI
+   execution functions then the caller should also manage the snapshot using
+   <function>PushActiveSnapshot</function> and
+   <function>PopActiveSnapshot</function>. If only <literal>read_only =
+   false</literal> SPI procedures are used then there is generally no need for
+   SPI users to explicitly manage snapshots.
+  </para>
+
+  <para>
+   See the <xref linkend="example-worker-spi"> module for a more detailed example of
+   SPI use in background workers.
+  </para>
+
+</sect1>
+
  <sect1 id="spi-examples">
   <title>Examples</title>
 
@@ -4103,7 +4245,8 @@ INSERT INTO a SELECT * FROM a;
    that were processed by the command.  You can find more complex
    examples for SPI in the source tree in
    <filename>src/test/regress/regress.c</filename> and in the
-   <xref linkend="contrib-spi"> module.
+   <xref linkend="contrib-spi"> module. For background-worker
+   specific SPI examples see <xref linkend="spi-bgworker"/>.
   </para>
 
 <programlisting>
