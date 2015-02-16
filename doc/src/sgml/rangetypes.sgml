@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/rangetypes.sgml -->
 
-<sect1 id="rangetypes">
+<sect1 id="rangetypes" xreflabel="Range Types">
  <title>Range Types</title>
 
  <indexterm>

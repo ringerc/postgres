@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/high-availability.sgml -->
 
-<chapter id="high-availability">
+<chapter id="high-availability" xreflabel="High Availability, Load Balancing, and Replication">
  <title>High Availability, Load Balancing, and Replication</title>
 
  <indexterm><primary>high availability</></>

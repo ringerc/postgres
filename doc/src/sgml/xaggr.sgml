@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/xaggr.sgml -->
 
- <sect1 id="xaggr">
+ <sect1 id="xaggr" xreflabel="User-defined Aggregates">
   <title>User-defined Aggregates</title>
 
   <indexterm zone="xaggr">

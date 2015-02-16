@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/xplang.sgml -->
 
- <chapter id="xplang">
+ <chapter id="xplang" xreflabel="Procedural Languages">
   <title>Procedural Languages</title>
 
   <indexterm zone="xplang">

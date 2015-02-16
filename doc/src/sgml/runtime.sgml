@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/runtime.sgml -->
 
-<chapter id="runtime">
+<chapter id="runtime" xreflabel="Server Setup and Operation">
  <title>Server Setup and Operation</title>
 
  <para>

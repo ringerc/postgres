@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/xoper.sgml -->
 
- <sect1 id="xoper">
+ <sect1 id="xoper" xreflabel="User-defined Operators">
   <title>User-defined Operators</title>
 
   <indexterm zone="xoper">

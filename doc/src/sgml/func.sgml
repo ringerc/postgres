@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/func.sgml -->
 
- <chapter id="functions">
+ <chapter id="functions" xreflabel="Functions and Operators">
   <title>Functions and Operators</title>
 
   <indexterm zone="functions">

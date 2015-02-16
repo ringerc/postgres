@@ -3,7 +3,7 @@
  Documentation of the system catalogs, directed toward PostgreSQL developers
  -->
 
-<chapter id="catalogs">
+<chapter id="catalogs" xreflabel="System Catalogs">
  <title>System Catalogs</title>
 
   <para>

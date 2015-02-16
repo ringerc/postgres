@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/regress.sgml -->
 
- <chapter id="regress">
+ <chapter id="regress" xreflabel="Regression Tests">
   <title>Regression Tests</title>
 
   <indexterm zone="regress">

@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/xfunc.sgml -->
 
- <sect1 id="xfunc">
+ <sect1 id="xfunc" xreflabel="user-defined functions">
   <title>User-defined Functions</title>
 
   <indexterm zone="xfunc">
@@ -3304,7 +3304,7 @@ CREATE FUNCTION make_array(anyelement) RETURNS anyarray
     </para>
    </sect2>
 
-   <sect2>
+   <sect2 id="xfunc-shmem-lwlocks" xreflabel="shared memory and LWLocks in user-defined C functions">
     <title>Shared Memory and LWLocks</title>
 
     <para>
@@ -3350,7 +3350,7 @@ if (!ptr)
     </para>
    </sect2>
 
-   <sect2 id="extend-Cpp">
+   <sect2 id="extend-Cpp" xreflabel="using C++ for extensibility">
     <title>Using C++ for Extensibility</title>
 
     <indexterm zone="extend-Cpp">

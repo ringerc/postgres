@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/event-trigger.sgml -->
 
- <chapter id="event-triggers">
+ <chapter id="event-triggers" xreflabel="Event Triggers">
   <title>Event Triggers</title>
 
   <indexterm zone="event-triggers">

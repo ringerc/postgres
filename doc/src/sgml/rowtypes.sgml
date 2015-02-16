@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/rowtypes.sgml -->
 
-<sect1 id="rowtypes">
+<sect1 id="rowtypes" xreflabel="Composite Types">
  <title>Composite Types</title>
 
  <indexterm>

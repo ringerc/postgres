@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/information_schema.sgml -->
 
-<chapter id="information-schema">
+<chapter id="information-schema" xreflabel="The Information Schema">
  <title>The Information Schema</title>
 
  <indexterm zone="information-schema">

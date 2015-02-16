@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/manage-ag.sgml -->
 
-<chapter id="managing-databases">
+<chapter id="managing-databases" xreflabel="Managing Databases">
  <title>Managing Databases</title>
 
  <indexterm zone="managing-databases"><primary>database</></>

@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/syntax.sgml -->
 
-<chapter id="sql-syntax">
+<chapter id="sql-syntax" xreflabel="SQL Syntax">
  <title>SQL Syntax</title>
 
  <indexterm zone="sql-syntax">

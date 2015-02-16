@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/monitoring.sgml -->
 
-<chapter id="monitoring">
+<chapter id="monitoring" xreflabel="Monitoring Database Activity">
  <title>Monitoring Database Activity</title>
 
  <indexterm zone="monitoring">

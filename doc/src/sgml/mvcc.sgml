@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/mvcc.sgml -->
 
- <chapter id="mvcc">
+ <chapter id="mvcc" xreflabel="Concurrency Control">
   <title>Concurrency Control</title>
 
   <indexterm>

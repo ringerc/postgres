@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/typeconv.sgml -->
 
-<chapter id="typeconv">
+<chapter id="typeconv" xreflabel="Type Conversion">
 <title>Type Conversion</title>
 
 <indexterm zone="typeconv">

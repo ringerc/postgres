@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/errcodes.sgml -->
 
-<appendix id="errcodes-appendix">
+<appendix id="errcodes-appendix" xreflabel="Error Codes">
  <title><productname>PostgreSQL</productname> Error Codes</title>
 
  <indexterm zone="errcodes-appendix">

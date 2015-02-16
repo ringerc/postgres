@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/xtypes.sgml -->
 
- <sect1 id="xtypes">
+ <sect1 id="xtypes" xreflabel="User-defined Types">
   <title>User-defined Types</title>
 
   <indexterm zone="xtypes">

@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/ddl.sgml -->
 
-<chapter id="ddl">
+<chapter id="ddl" xreflabel="Data Definition">
  <title>Data Definition</title>
 
  <para>

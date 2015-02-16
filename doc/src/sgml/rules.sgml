@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/rules.sgml -->
 
-<chapter id="rules">
+<chapter id="rules" xreflabel="The Rule System">
 <title>The Rule System</title>
 
  <indexterm zone="rules">

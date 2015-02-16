@@ -1,5 +1,5 @@
 <!-- doc/src/sgml/logicaldecoding.sgml -->
- <chapter id="logicaldecoding">
+ <chapter id="logicaldecoding" xreflabel="Logical Decoding">
   <title>Logical Decoding</title>
   <indexterm zone="logicaldecoding">
    <primary>Logical Decoding</primary>

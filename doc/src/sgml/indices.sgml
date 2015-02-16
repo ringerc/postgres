@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/indices.sgml -->
 
-<chapter id="indexes">
+<chapter id="indexes" xreflabel="Indexes">
  <title>Indexes</title>
 
  <indexterm zone="indexes">

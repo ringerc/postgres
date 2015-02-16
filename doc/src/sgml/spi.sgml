@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/spi.sgml -->
 
-<chapter id="spi">
- <title>Server Programming Interface</title>
+<chapter id="spi" xreflabel="Server Programming Interface (SPI)">
+ <title>Server Programming Interface (<acronym>SPI</acronym>)</title>
 
  <indexterm zone="spi">
   <primary>SPI</primary>

@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/json.sgml -->
 
-<sect1 id="datatype-json">
+<sect1 id="datatype-json" xreflabel="JSON types">
  <title><acronym>JSON</> Types</title>
 
  <indexterm zone="datatype-json">

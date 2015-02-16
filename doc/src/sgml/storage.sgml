@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/storage.sgml -->
 
-<chapter id="storage">
+<chapter id="storage" xreflabel="Database Physical Storage">
 
 <title>Database Physical Storage</title>
 

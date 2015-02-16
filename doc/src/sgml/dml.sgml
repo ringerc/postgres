@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/dml.sgml -->
 
-<chapter id="dml">
+<chapter id="dml" xreflabel="Data Manipulation">
  <title>Data Manipulation</title>
 
  <remark>

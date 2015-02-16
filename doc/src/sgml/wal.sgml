@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/wal.sgml -->
 
-<chapter id="wal">
+<chapter id="wal" xreflabel="Reliability and the Write-Ahead Log">
  <title>Reliability and the Write-Ahead Log</title>
 
  <para>

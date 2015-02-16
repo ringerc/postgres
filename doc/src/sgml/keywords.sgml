@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/keywords.sgml -->
 
-<appendix id="sql-keywords-appendix">
+<appendix id="sql-keywords-appendix" xreflabel="SQL Key Words">
  <title><acronym>SQL</acronym> Key Words</title>
 
  <indexterm zone="sql-keywords-appendix">

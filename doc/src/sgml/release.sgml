@@ -38,7 +38,7 @@ For new features, add links to the documentation sections.
 
 -->
 
-<appendix id="release">
+<appendix id="release" xreflabel="Release Notes">
  <title>Release Notes</title>
 
   <para>

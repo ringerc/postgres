@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/textsearch.sgml -->
 
-<chapter id="textsearch">
+<chapter id="textsearch" xreflabel="Full Text Search">
  <title>Full Text Search</title>
 
   <indexterm zone="textsearch">

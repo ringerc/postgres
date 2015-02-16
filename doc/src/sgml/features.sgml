@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/features.sgml -->
 
-<appendix id="features">
+<appendix id="features" xreflabel="SQL Conformance">
  <title>SQL Conformance</title>
 
  <para>

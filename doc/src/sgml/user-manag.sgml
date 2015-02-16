@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/user-manag.sgml -->
 
-<chapter id="user-manag">
+<chapter id="user-manag" xreflabel="Database Roles">
  <title>Database Roles</title>
 
  <para>

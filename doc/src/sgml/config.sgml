@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/config.sgml -->
 
-<chapter id="runtime-config">
+<chapter id="runtime-config" xreflabel="Server Configuration">
   <title>Server Configuration</title>
 
   <indexterm>

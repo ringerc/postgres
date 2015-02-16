@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/client-auth.sgml -->
 
-<chapter id="client-authentication">
+<chapter id="client-authentication" xreflabel="Client Authentication">
  <title>Client Authentication</title>
 
  <indexterm zone="client-authentication">

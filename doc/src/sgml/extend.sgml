@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/extend.sgml -->
 
- <chapter id="extend">
+ <chapter id="extend" xreflabel="Extending SQL">
   <title>Extending <acronym>SQL</acronym></title>
 
   <indexterm zone="extend">

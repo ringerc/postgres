@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/maintenance.sgml -->
 
-<chapter id="maintenance">
+<chapter id="maintenance" xreflabel="Routine Database Maintenance Tasks">
  <title>Routine Database Maintenance Tasks</title>
 
  <indexterm zone="maintenance">

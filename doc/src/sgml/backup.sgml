@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/backup.sgml -->
 
-<chapter id="backup">
+<chapter id="backup" xreflabel="Backup and Restore">
  <title>Backup and Restore</title>
 
  <indexterm zone="backup"><primary>backup</></>

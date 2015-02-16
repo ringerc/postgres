@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/datatype.sgml -->
 
- <chapter id="datatype">
+ <chapter id="datatype" xreflabel="Data Types">
   <title>Data Types</title>
 
   <indexterm zone="datatype">

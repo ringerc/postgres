@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/perform.sgml -->
 
- <chapter id="performance-tips">
+ <chapter id="performance-tips" xreflabel="Peformance Tips">
   <title>Performance Tips</title>
 
   <indexterm zone="performance-tips">

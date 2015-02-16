@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/diskusage.sgml -->
 
-<chapter id="diskusage">
+<chapter id="diskusage" xreflabel="Monitoring Disk Usage">
  <title>Monitoring Disk Usage</title>
 
  <para>

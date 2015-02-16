@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/pltcl.sgml -->
 
- <chapter id="pltcl">
+ <chapter id="pltcl" xreflabel="PL/TCL">
   <title>PL/Tcl - Tcl Procedural Language</title>
 
   <indexterm zone="pltcl">
