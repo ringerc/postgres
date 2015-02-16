@@ -3307,6 +3307,15 @@ CREATE FUNCTION make_array(anyelement) RETURNS anyarray
    <sect2 id="xfunc-shmem-lwlocks" xreflabel="shared memory and LWLocks in user-defined C functions">
     <title>Shared Memory and LWLocks</title>
 
+    <indexterm zone="xfunc-shmem-lwlocks">
+     <primary>Shared memory in extensions</primary>
+    </indexterm>
+
+    <indexterm zone="xfunc-shmem-lwlocks">
+     <primary>LWLocks (extensions)</primary>
+     <secondary>Lightweight locks (extensions)</secondary>
+    </indexterm>
+
     <para>
      Add-ins can reserve LWLocks and an allocation of shared memory on server
      startup.  The add-in's shared library must be preloaded by specifying
