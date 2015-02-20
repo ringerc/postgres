@@ -3595,8 +3595,26 @@ PostmasterStateMachine(void)
 	 */
 	if (FatalError && pmState == PM_NO_CHILDREN)
 	{
+		slist_mutable_iter siter;
+
 		ereport(LOG,
 				(errmsg("all server processes terminated; reinitializing")));
+
+		/*
+		 * Unregister any bgworkers that asked not to be resurrected after
+		 * the postmaster crashes and restarts.
+		 */
+		slist_foreach_modify(siter, &BackgroundWorkerList)
+		{
+			RegisteredBgWorker *rw;
+
+			rw = slist_container(RegisteredBgWorker, rw_lnode, siter.cur);
+
+			Assert(rw->rw_pid == 0); /* because PM_NO_CHILDREN */
+
+			if (rw->rw_worker->bgw_flags & BGWORKER_UNREGISTER_ON_POSTMASTER_RESTART)
+				ForgetBackgroundWorker(siter);
+		}
 
 		/* allow background workers to immediately restart */
 		ResetBackgroundWorkerCrashTimes();

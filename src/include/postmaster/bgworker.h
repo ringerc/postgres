@@ -58,6 +58,15 @@
  */
 #define BGWORKER_BACKEND_DATABASE_CONNECTION		0x0002
 
+/*
+ * This flag tells the postmaster that the bgworker should be automatically
+ * unregistered if the postmaster restarts (say, due to the crash of a user
+ * backend or a background worker). Normally the postmaster kills and restarts
+ * background workers (unless BGW_NEVER_RESTART) but does not unregister
+ * them.
+ */
+#define BGWORKER_UNREGISTER_ON_POSTMASTER_RESTART	0x0004
+
 
 typedef void (*bgworker_main_type) (Datum main_arg);
 
