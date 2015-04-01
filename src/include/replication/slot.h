@@ -84,12 +84,14 @@ typedef struct ReplicationSlot
 	/* is this slot defined */
 	bool		in_use;
 
-	/* is somebody streaming out changes for this slot */
-	bool		active;
+    /* field 'active' removed in 9.5; see 'active_pid' instead */
 
 	/* any outstanding modifications? */
 	bool		just_dirtied;
 	bool		dirty;
+
+	/* Who is streaming out changes for this slot? 0 for nobody */
+	pid_t		active_pid;
 
 	/*
 	 * For logical decoding, it's extremely important that we never remove any

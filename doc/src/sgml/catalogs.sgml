@@ -5401,6 +5401,19 @@
      </row>
 
      <row>
+      <entry><structfield>pid</structfield></entry>
+      <entry><type>integer</type></entry>
+      <entry></entry>
+      <entry>The process ID of the session or WALsender using this slot if the
+      slot is currently actively being used.  <literal>NULL</literal> if
+      inactive. Corresponds to
+      <structname>pg_stat_activity</structname>.<structfield>pid</structfield>
+      (for normal backends) or
+      <structname>pg_stat_replication</structname>.<structfield>pid</structfield>
+      (for WALsenders). (Since: 9.5)</entry>
+     </row>
+
+     <row>
       <entry><structfield>xmin</structfield></entry>
       <entry><type>xid</type></entry>
       <entry></entry>

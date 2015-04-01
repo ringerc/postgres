@@ -262,7 +262,7 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	 * be doing that.  So it's safe to initialize the slot.
 	 */
 	Assert(!slot->in_use);
-	Assert(!slot->active);
+	Assert(slot->active_pid == 0);
 	slot->data.persistency = persistency;
 	slot->data.xmin = InvalidTransactionId;
 	slot->effective_xmin = InvalidTransactionId;
@@ -291,8 +291,8 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 		volatile ReplicationSlot *vslot = slot;
 
 		SpinLockAcquire(&slot->mutex);
-		Assert(!vslot->active);
-		vslot->active = true;
+		Assert(vslot->active_pid == 0);
+		vslot->active_pid = MyProcPid;
 		SpinLockRelease(&slot->mutex);
 		MyReplicationSlot = slot;
 	}
@@ -331,8 +331,8 @@ ReplicationSlotAcquire(const char *name)
 			volatile ReplicationSlot *vslot = s;
 
 			SpinLockAcquire(&s->mutex);
-			active = vslot->active;
-			vslot->active = true;
+			active = vslot->active_pid != 0;
+			vslot->active_pid = MyProcPid;
 			SpinLockRelease(&s->mutex);
 			slot = s;
 			break;
@@ -363,7 +363,7 @@ ReplicationSlotRelease(void)
 {
 	ReplicationSlot *slot = MyReplicationSlot;
 
-	Assert(slot != NULL && slot->active);
+	Assert(slot != NULL && slot->active_pid != 0);
 
 	if (slot->data.persistency == RS_EPHEMERAL)
 	{
@@ -380,7 +380,7 @@ ReplicationSlotRelease(void)
 		volatile ReplicationSlot *vslot = slot;
 
 		SpinLockAcquire(&slot->mutex);
-		vslot->active = false;
+		vslot->active_pid = 0;
 		SpinLockRelease(&slot->mutex);
 	}
 
@@ -460,7 +460,7 @@ ReplicationSlotDropAcquired(void)
 		bool		fail_softly = slot->data.persistency == RS_EPHEMERAL;
 
 		SpinLockAcquire(&slot->mutex);
-		vslot->active = false;
+		vslot->active_pid = 0;
 		SpinLockRelease(&slot->mutex);
 
 		ereport(fail_softly ? WARNING : ERROR,
@@ -477,7 +477,7 @@ ReplicationSlotDropAcquired(void)
 	 * scanning the array.
 	 */
 	LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
-	slot->active = false;
+	slot->active_pid = 0;
 	slot->in_use = false;
 	LWLockRelease(ReplicationSlotControlLock);
 
@@ -749,7 +749,7 @@ ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive)
 		/* count slots with spinlock held */
 		SpinLockAcquire(&s->mutex);
 		(*nslots)++;
-		if (s->active)
+		if (s->active_pid != 0)
 			(*nactive)++;
 		SpinLockRelease(&s->mutex);
 	}
@@ -1227,7 +1227,7 @@ RestoreSlotFromDisk(const char *name)
 		slot->candidate_restart_valid = InvalidXLogRecPtr;
 
 		slot->in_use = true;
-		slot->active = false;
+		slot->active_pid = 0;
 
 		restored = true;
 		break;
