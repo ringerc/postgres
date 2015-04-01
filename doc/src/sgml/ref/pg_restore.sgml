@@ -405,9 +405,28 @@
       <term><option>--table=<replaceable class="parameter">table</replaceable></option></term>
       <listitem>
        <para>
-        Restore definition and/or data of named table only. Multiple tables
-        may be specified with multiple <option>-t</> switches. This can be
-        combined with the <option>-n</option> option to specify a schema.
+        Restore definition and/or data of the named table (or other relation)
+        only. This flag matches views, materialized views and foreign tables as
+        well as ordinary tables. Multiple relations may be specified with
+        multiple <option>-t</> switches. This can be combined with the
+        <option>-n</option> option to specify a schema.
+        <note>
+         <para>
+          When <literal>-t</literal> is specified,
+          <application>pg_restore</application> makes no attempt to restore any
+          other database objects that the selected table(s) might depend upon.
+          Therefore, there is no guarantee that the results of a specific-table
+          restore into a clean database will succeed.
+         </para>
+        </note>
+        <note>
+         <para>
+          This flag is not entirely compatible with versions prior to
+          PostgreSQL 9.5. In 9.4 and below this flag matched only tables. It
+          also behaves differently to the flag with the same name in
+          <application>pg_dump</application>.
+         </para>
+        </note>
        </para>
       </listitem>
      </varlistentry>
