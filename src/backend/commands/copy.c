@@ -1708,7 +1708,9 @@ BeginCopyTo(Relation rel,
 			if (!is_absolute_path(filename))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_NAME),
-					  errmsg("relative path not allowed for COPY to file")));
+					  errmsg("relative path not allowed for COPY to file"),
+					  errhint("COPY uses server-side paths. You might be looking for "
+						  "psql's \\copy command")));
 
 			oumask = umask(S_IWGRP | S_IWOTH);
 			cstate->copy_file = AllocateFile(cstate->filename, PG_BINARY_W);
