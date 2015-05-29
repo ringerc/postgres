@@ -58,7 +58,7 @@ typedef struct FmgrInfo
 	bool		fn_strict;		/* function is "strict" (NULL in => NULL out) */
 	bool		fn_retset;		/* function returns a set */
 	unsigned char fn_stats;		/* collect stats if track_functions > this */
-	void	   *fn_extra;		/* extra space for use by handler */
+	void	   *fn_extra;		/* extra space for use by function or handler */
 	MemoryContext fn_mcxt;		/* memory context to store fn_extra in */
 	fmNodePtr	fn_expr;		/* expression parse tree for call, or NULL */
 } FmgrInfo;

@@ -71,7 +71,7 @@ typedef struct
     bool        fn_strict;  /* function is "strict" (NULL in => NULL out) */
     bool        fn_retset;  /* function returns a set (over multiple calls) */
     unsigned char fn_stats; /* collect stats if track_functions > this */
-    void       *fn_extra;   /* extra space for use by handler */
+    void       *fn_extra;   /* extra space for use by function or handler */
     MemoryContext fn_mcxt;  /* memory context to store fn_extra in */
     Node       *fn_expr;    /* expression parse tree for call, or NULL */
 } FmgrInfo;
@@ -98,6 +98,10 @@ field really is information about the arguments rather than information
 about the function, but it's proven to be more convenient to keep it in
 FmgrInfo than in FunctionCallInfoData where it might more logically go.
 
+Functions with signature PGFunction (those that are callable directly from the
+fmgr without a handler) may also use fn_extra to cache expensive-to-generate
+information across calls. Handlers that wrap direct function calls must leave
+fn_extra untouched or save and restore it around calls to the wrapped function.
 
 During a call of a function, the following data structure is created
 and passed to the function:
