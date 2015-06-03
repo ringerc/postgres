@@ -203,6 +203,24 @@ LOAD 'auto_explain';
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry>
+    <term>
+     <varname>auto_explain.sample_ratio</varname> (<type>integer</type>)
+     <indexterm>
+      <primary><varname>auto_explain.sample_ratio</> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      <varname>auto_explain.sample_ratio</varname> causes auto_explain to only
+      explain every n'th statement in each session.  The number of statements
+      before the first is explained is between 1 and n, randomized to ensure
+      that short sessions still sometimes get explained. Only superusers can
+      change this setting.
+     </para>
+    </listitem>
+   </varlistentry>
   </variablelist>
 
   <para>

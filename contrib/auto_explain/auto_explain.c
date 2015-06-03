@@ -29,6 +29,7 @@ static bool auto_explain_log_triggers = false;
 static bool auto_explain_log_timing = true;
 static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static bool auto_explain_log_nested_statements = false;
+static int  auto_explain_sample_ratio = 1;
 
 static const struct config_enum_entry format_options[] = {
 	{"text", EXPLAIN_FORMAT_TEXT, false},
@@ -47,9 +48,14 @@ static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
+/* per-backend counter used for ratio sampling */
+static int  auto_explain_sample_counter = 0;
+
 #define auto_explain_enabled() \
 	(auto_explain_log_min_duration >= 0 && \
-	 (nesting_level == 0 || auto_explain_log_nested_statements))
+	 (nesting_level == 0 || auto_explain_log_nested_statements)) && \
+	 (auto_explain_sample_ratio == 1 || auto_explain_sample_counter == 0)
+
 
 void		_PG_init(void);
 void		_PG_fini(void);
@@ -60,6 +66,19 @@ static void explain_ExecutorRun(QueryDesc *queryDesc,
 					long count);
 static void explain_ExecutorFinish(QueryDesc *queryDesc);
 static void explain_ExecutorEnd(QueryDesc *queryDesc);
+
+static void
+auto_explain_sample_ratio_assign_hook(int newval, void *extra)
+{
+	if (auto_explain_sample_ratio != newval)
+	{
+		/* Schedule a counter reset when the sample ratio changed */
+		auto_explain_sample_counter = -1;
+	}
+
+	auto_explain_sample_ratio = newval;
+}
+
 
 
 /*
@@ -159,6 +178,18 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomIntVariable("auto_explain.sample_ratio",
+		"Only explain one in approx. every sample_ratio queries, or 1 for all",
+							NULL,
+							&auto_explain_sample_ratio,
+							1,
+							1, INT_MAX - 1,
+							PGC_SUSET,
+							0,
+							NULL,
+							auto_explain_sample_ratio_assign_hook,
+							NULL);
+
 	EmitWarningsOnPlaceholders("auto_explain");
 
 	/* Install hooks. */
@@ -191,6 +222,29 @@ _PG_fini(void)
 static void
 explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	/*
+	 * For ratio sampling, only increment the counter for top-level
+	 * statements. Either all nested statements will be explained
+	 * or none will, because we need to know at ExecutorEnd hook time
+	 * whether or not we explained any given statement.
+	 */
+	if (nesting_level == 0 && auto_explain_sample_ratio > 1)
+	{
+		if (auto_explain_sample_counter == -1)
+		{
+			/*
+			 * First time the hook ran in this backend, seed the counter. This
+			 * might be zero and cause the first statement to be explained.
+			 */
+			auto_explain_sample_counter = pg_lrand48() % auto_explain_sample_ratio;
+		}
+		else if ((++auto_explain_sample_counter) == auto_explain_sample_ratio)
+		{
+			/* Wrap the counter and explain this statement */
+			auto_explain_sample_counter = 0;
+		}
+	}
+
 	if (auto_explain_enabled())
 	{
 		/* Enable per-node instrumentation iff log_analyze is required. */
