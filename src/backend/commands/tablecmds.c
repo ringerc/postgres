@@ -6647,22 +6647,20 @@ ATExecAlterConstraint(Relation rel, AlterTableCmd *cmd,
 				 errmsg("constraint \"%s\" of relation \"%s\" does not exist",
 						cmdcon->conname, RelationGetRelationName(rel))));
 
-	if (currcon->contype != CONSTRAINT_FOREIGN)
+	if (currcon->contype != CONSTRAINT_FOREIGN &&
+		currcon->contype != CONSTRAINT_PRIMARY &&
+		currcon->contype != CONSTRAINT_UNIQUE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("constraint \"%s\" of relation \"%s\" is not a foreign key constraint",
+				 errmsg("constraint \"%s\" of relation \"%s\" must be FOREIGN KEY, PRIMARY KEY or UNIQUE",
 						cmdcon->conname, RelationGetRelationName(rel))));
 
 	if (currcon->condeferrable != cmdcon->deferrable ||
 		currcon->condeferred != cmdcon->initdeferred)
 	{
 		HeapTuple	copyTuple;
-		HeapTuple	tgtuple;
 		Form_pg_constraint copy_con;
 		List	   *otherrelids = NIL;
-		ScanKeyData tgkey;
-		SysScanDesc tgscan;
-		Relation	tgrel;
 		ListCell   *lc;
 
 		/*
@@ -6682,44 +6680,52 @@ ATExecAlterConstraint(Relation rel, AlterTableCmd *cmd,
 
 		/*
 		 * Now we need to update the multiple entries in pg_trigger that
-		 * implement the constraint.
+		 * implement the constraint if it's a foreign key constraint.
 		 */
-		tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
-
-		ScanKeyInit(&tgkey,
-					Anum_pg_trigger_tgconstraint,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(HeapTupleGetOid(contuple)));
-
-		tgscan = systable_beginscan(tgrel, TriggerConstraintIndexId, true,
-									NULL, 1, &tgkey);
-
-		while (HeapTupleIsValid(tgtuple = systable_getnext(tgscan)))
+		if (currcon->contype == CONSTRAINT_FOREIGN)
 		{
-			Form_pg_trigger copy_tg;
+			HeapTuple	tgtuple;
+			ScanKeyData tgkey;
+			SysScanDesc tgscan;
+			Relation	tgrel;
 
-			copyTuple = heap_copytuple(tgtuple);
-			copy_tg = (Form_pg_trigger) GETSTRUCT(copyTuple);
+			tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
 
-			/* Remember OIDs of other relation(s) involved in FK constraint */
-			if (copy_tg->tgrelid != RelationGetRelid(rel))
-				otherrelids = list_append_unique_oid(otherrelids,
-													 copy_tg->tgrelid);
+			ScanKeyInit(&tgkey,
+						Anum_pg_trigger_tgconstraint,
+						BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(HeapTupleGetOid(contuple)));
 
-			copy_tg->tgdeferrable = cmdcon->deferrable;
-			copy_tg->tginitdeferred = cmdcon->initdeferred;
-			simple_heap_update(tgrel, &copyTuple->t_self, copyTuple);
-			CatalogUpdateIndexes(tgrel, copyTuple);
+			tgscan = systable_beginscan(tgrel, TriggerConstraintIndexId, true,
+										NULL, 1, &tgkey);
 
-			InvokeObjectPostAlterHook(TriggerRelationId,
-									  HeapTupleGetOid(tgtuple), 0);
+			while (HeapTupleIsValid(tgtuple = systable_getnext(tgscan)))
+			{
+				Form_pg_trigger copy_tg;
 
-			heap_freetuple(copyTuple);
+				copyTuple = heap_copytuple(tgtuple);
+				copy_tg = (Form_pg_trigger) GETSTRUCT(copyTuple);
+
+				/* Remember OIDs of other relation(s) involved in FK constraint */
+				if (copy_tg->tgrelid != RelationGetRelid(rel))
+					otherrelids = list_append_unique_oid(otherrelids,
+														 copy_tg->tgrelid);
+
+				copy_tg->tgdeferrable = cmdcon->deferrable;
+				copy_tg->tginitdeferred = cmdcon->initdeferred;
+				simple_heap_update(tgrel, &copyTuple->t_self, copyTuple);
+				CatalogUpdateIndexes(tgrel, copyTuple);
+
+				InvokeObjectPostAlterHook(TriggerRelationId,
+										  HeapTupleGetOid(tgtuple), 0);
+
+				heap_freetuple(copyTuple);
+			}
+
+			systable_endscan(tgscan);
+
+			heap_close(tgrel, RowExclusiveLock);
 		}
-
-		systable_endscan(tgscan);
-
-		heap_close(tgrel, RowExclusiveLock);
 
 		/*
 		 * Invalidate relcache so that others see the new attributes.  We must
