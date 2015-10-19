@@ -45,6 +45,7 @@ typedef struct
 	bool		skip_empty_xacts;
 	bool		xact_wrote_changes;
 	bool		only_local;
+	bool		include_origins;
 } TestDecodingData;
 
 static void pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
@@ -63,6 +64,9 @@ static void pg_decode_change(LogicalDecodingContext *ctx,
 				 ReorderBufferChange *change);
 static bool pg_decode_filter(LogicalDecodingContext *ctx,
 				 RepOriginId origin_id);
+
+static void appendOrigin(LogicalDecodingContext *ctx,
+				TestDecodingData *data, ReorderBufferTXN *txn);
 
 void
 _PG_init(void)
@@ -103,6 +107,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 	data->include_timestamp = false;
 	data->skip_empty_xacts = false;
 	data->only_local = false;
+	data->include_origins = false;
 
 	ctx->output_plugin_private = data;
 
@@ -172,6 +177,17 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 				  errmsg("could not parse value \"%s\" for parameter \"%s\"",
 						 strVal(elem->arg), elem->defname)));
 		}
+		else if (strcmp(elem->defname, "include-origins") == 0)
+		{
+
+			if (elem->arg == NULL)
+				data->include_origins = true;
+			else if (!parse_bool(strVal(elem->arg), &data->include_origins))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				  errmsg("could not parse value \"%s\" for parameter \"%s\"",
+						 strVal(elem->arg), elem->defname)));
+		}
 		else
 		{
 			ereport(ERROR,
@@ -203,6 +219,8 @@ pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 	if (data->skip_empty_xacts)
 		return;
 
+	Assert(txn->origin_id != DoNotReplicateId);
+
 	pg_output_begin(ctx, data, txn, true);
 }
 
@@ -210,10 +228,14 @@ static void
 pg_output_begin(LogicalDecodingContext *ctx, TestDecodingData *data, ReorderBufferTXN *txn, bool last_write)
 {
 	OutputPluginPrepareWrite(ctx, last_write);
+
+	appendStringInfoString(ctx->out, "BEGIN");
+
 	if (data->include_xids)
-		appendStringInfo(ctx->out, "BEGIN %u", txn->xid);
-	else
-		appendStringInfoString(ctx->out, "BEGIN");
+		appendStringInfo(ctx->out, " %u", txn->xid);
+
+	appendOrigin(ctx, data, txn);
+
 	OutputPluginWrite(ctx, last_write);
 }
 
@@ -236,6 +258,10 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	if (data->include_timestamp)
 		appendStringInfo(ctx->out, " (at %s)",
 						 timestamptz_to_str(txn->commit_time));
+
+	appendOrigin(ctx, data, txn);
+
+	Assert(txn->origin_id != DoNotReplicateId);
 
 	OutputPluginWrite(ctx, true);
 }
@@ -469,5 +495,23 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(data->context);
 
+	appendOrigin(ctx, data, txn);
+
 	OutputPluginWrite(ctx, true);
+}
+
+static void
+appendOrigin(LogicalDecodingContext *ctx, TestDecodingData *data, ReorderBufferTXN *txn)
+{
+	char *origin;
+
+	if (data->include_origins && txn->origin_id != InvalidRepOriginId)
+	{
+		if (!replorigin_by_oid(txn->origin_id, true, &origin))
+			origin = "[unknown]";
+		appendStringInfo(ctx->out, " -- origin:'%s'@%X/%X",
+				origin,
+				(uint32)(txn->origin_lsn >> 32),
+				(uint32)(txn->origin_lsn));
+	}
 }
