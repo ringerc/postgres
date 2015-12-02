@@ -45,7 +45,7 @@
 #include "postgres.h"
 
 #include <unistd.h>
-
+#include <pgstat.h>
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "replication/syncrep.h"
@@ -151,6 +151,18 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 		set_ps_display(new_status, false);
 		new_status[len] = '\0'; /* truncate off " waiting ..." */
 	}
+
+	/*
+	 * Alter 'state' in pg_stat before entering the loop.
+	 *
+	 * As with updating the ps display it is safe to assume that we'll wait
+	 * at least for a short time so we just set the state without bothering
+	 * to check if we're really going to have to wait for the standby.
+	 *
+	 * We don't set the 'waiting' flag because that's documented as waiting
+	 * on a lock.
+	 */
+	pgstat_report_activity(STATE_WAITINGFORREPLICATION,NULL);
 
 	/*
 	 * Wait for specified LSN to be confirmed.

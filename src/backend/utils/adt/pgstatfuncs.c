@@ -663,6 +663,9 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 				case STATE_IDLEINTRANSACTION_ABORTED:
 					values[4] = CStringGetTextDatum("idle in transaction (aborted)");
 					break;
+				case STATE_WAITINGFORREPLICATION:
+					values[4] = CStringGetTextDatum("waiting for synchronous replication");
+					break;
 				case STATE_DISABLED:
 					values[4] = CStringGetTextDatum("disabled");
 					break;

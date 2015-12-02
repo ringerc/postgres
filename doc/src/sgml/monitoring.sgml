@@ -642,6 +642,11 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
          </listitem>
          <listitem>
           <para>
+           <literal>waiting for synchronous replication</>: The backend is waiting for its transaction to be flushed on a synchronous standby.
+          </para>
+         </listitem>
+         <listitem>
+          <para>
            <literal>idle</>: The backend is waiting for a new client command.
           </para>
          </listitem>
