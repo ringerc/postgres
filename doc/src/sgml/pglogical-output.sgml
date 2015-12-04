@@ -1,0 +1,1925 @@
+<!-- doc/src/sgml/pglogical_output.sgml -->
+
+<sect1 id="pglogical-output" xreflabel="pglogical_output">
+ <title>pglogical_output</title>
+
+ <para>
+  <application>pglogical_output</application> is a general purpose
+  <link linkend="logicaldecoding">logical decoding</link>
+  <link linkend="logicaldecoding-output-plugin">output plugin</link>.
+  It extracts a change stream from a PostgreSQL database and sends it to a
+  client over a network connection using a well-defined, efficient protocol
+  that multiple different applications can consume.
+ </para>
+
+ <para>
+  While the primary goal of <application>pglogical_output</application> is
+  use in logical replication, it can also be used to drive any application
+  that needs to see a stream of changes from a database in commit order.
+  Applications include audit logging, archival, search, intrusion detection
+  and more.
+ </para>
+
+ <para>
+  No triggers are required to collect the change stream and no external ticker or
+  other daemon is required. It's accumulated using
+  <link linkend="logicaldecoding-replication-slots">replication slots</link>
+  as supported in PostgreSQL 9.4 or newer. The data is sent over the <link
+  linkend="protocol-replication">walsender replication protocol</link> over a
+  replication connection or over the regular <link linkend="protocol">fe/be
+  protocol</link> using the SQL interface.
+ </para>
+
+ <para>
+  The use of a replication slot means that the change stream is reliable and
+  crash-safe. If the client disconnects or crashes it can reconnect and resume
+  replay from the last message that client processed. Server-side changes that
+  occur while the client is disconnected are accumulated in the queue to be
+  sent when the client reconnects. This reliability also means that server-side
+  resources are consumed whether or not a client is connected.
+ </para>
+
+ <sect2 id="pglogical-output-differences">
+  <title>Differences from block-level streaming</title>
+
+  <para>
+   Only one database is streamed by a replication slot using
+   <application>pglogical_output</application>. This differs from built-in
+   WAL-based streaming replication ("physical replication"), which must send
+   data for all databases in a PostgreSQL instance ("cluster").  A subset of
+   that database may be selected for replication based on <link
+   linkend="replication-origins">replication origin</link>, table name, row
+   contents, etc, using application-provided <link
+   linkend="pglogical-output-hooks">hook callbacks</link>.
+  </para>
+
+  <para>
+   Note that both physical and logical streaming use WAL. Physical replication
+   can optionally use a replication slot; logical streaming requires one.
+   The main difference is that logical decoding reads the WAL on the server
+   side and transforms it into a more efficient and general purpose representation
+   before sending it to the client.
+  </para>
+
+  <para>
+   Unlike block-level ("physical") streaming replication, the change stream
+   from the <application>pglogical_output</application> is compatible across
+   different PostgreSQL versions and can even be consumed by non-PostgreSQL
+   clients. The default change stream uses text representation for row values
+   (in a binary protocol). A human-readable <acronym>JSON</acronym> protocol
+   is also available.
+  </para>
+
+  <para>
+   Because logical decoding is used, only the changed rows are sent on the wire.
+   There's no index change data, no vacuum activity, etc transmitted.
+  </para>
+
+  <para>
+   A client cannot connect and disconnect at will, starting replay at the point
+   in time at which it connects. A replication slot <emphasis>must</emphasis>
+   be created. This slot must be dropped if not in use to prevent unwanted
+   accumulation of WAL.
+  </para>
+
+ </sect2>
+
+ <sect2 id="pglogical-output-architecture"
+    xreflabel="pglogical_output architecture">
+  <title>Architecture and high-level interaction</title>
+
+  <para>
+   The output plugin is loaded by a PostgreSQL walsender process when a client
+   connects to PostgreSQL using the PostgreSQL wire protocol with connection
+   option <literal>replication=database</literal>, then uses <link
+   linkend="logicaldecoding-walsender">the <literal>CREATE_REPLICATION_SLOT ...
+   LOGICAL ...</literal> and <literal>START_REPLICATION SLOT ... LOGICAL
+   ...</literal> commands</link> to start streaming changes. It can also be
+   used via the <link linkend="logicaldecoding-sql">SQL-level logical decoding
+   functions</link> over a non-replication connection.
+  </para>
+
+  <para>
+   The client supplies parameters to the
+   <literal>START_REPLICATION SLOT ... LOGICAL ...</literal>
+   command to specify the version of the
+   <application>pglogical_output</application> protocol it supports, whether it
+   wants binary format, etc.
+  </para>
+
+  <para>
+   The output plugin processes the connection parameters and the connection enters
+   streaming replication protocol mode, sometimes called <link
+   linkend="protocol-copy-both">COPY BOTH</link> mode because
+   it's based on the protocol used for the <literal>COPY</literal> command.
+   PostgreSQL then calls functions in this plugin to send it a stream of
+   transactions to decode and translate into network messages. This stream of
+   changes continues until the client disconnects.
+  </para>
+
+  <para>
+   The only client-to-server interaction after startup is the sending of periodic
+   feedback messages that allow the replication slot to discard no-longer-needed
+   change history. The client <emphasis>must</emphasis> send feedback,
+   otherwise <filename>pg_xlog</filename> on the server will eventually fill up
+   and the server will stop working.
+  </para>
+
+ </sect2>
+
+ <sect2 id="pglogical-output-usage" xreflabel="pglogical_output usage">
+  <title>Usage</title>
+
+  <para>
+   There are two ways to use <application>pglogical_output</application>:
+   via a normal PostgreSQL protocol connection using SQL function calls,
+   or using the streaming replication protocol.
+  </para>
+
+  <para>
+   In either case the workflow is roughly the same. Connect. Create a
+   <link linkend="logicaldecoding-replication-slots">logical replication slot</link>
+   using the plugin name <literal>pglogical_output</literal>
+   if setting up streaming for the first time, then start streaming
+   replication. Consume changes indefinitely, or until no more are required. If
+   the connection is broken, reconnect and resume replication.
+  </para>
+
+  <para>
+   See <link linkend="logicaldecoding">logical decoding</link> for details.
+  </para>
+
+  <sect3 id="pglogical-output-usage-sql" xreflabel="pglogical_output usage (SQL)">
+   <title>SQL logical replication usage</title>
+
+   <para>
+    It is possible to use <application>pglogical_output</application> from a regular
+    PostgreSQL connection by using the <link linkend="functions-replication-table">
+    logical replication functions</link>. This approach may not perform as well
+    as using <link linkend="pglogical-output-usage-streaming">the streaming
+    logical replication protocol</link> but it doesn't require any special support
+    for the replication protocol in the PostgreSQL client driver/library used.
+   </para>
+
+   <para>
+    The SQL interface is mainly intended for testing, debugging, administration
+    and prototyping. The streaming replication interface should be preferred
+    for production applications.
+   </para>
+
+   <para>
+    <itemizedlist>
+     <listitem>
+      <para>
+       The client makes a regular PostgreSQL protocol connection to the
+       database it wishes to stream changes from. It authenticates as normal.
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       If this is the first time connecting, the client calls the
+       <link linkend="pg-create-logical-replication-slot"><function>pg_create_logical_replication_slot</function>
+       function to create a logical replication slot. The slot will be used to
+       keep track of replication progress and manage <acronym>WAL</acronym>
+       retention on the server.
+      </para>
+      <para>
+       e.g.:
+       <programlisting>
+        SELECT * FROM pg_create_logical_replication_slot('my_slot', 'pglogical_output');
+       </programlisting>
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       Once the slot is created the client calls the
+       <link linkend="pg-logical-slot-get-binary-changes"><function>pg_logical_slot_get_binary_changes</function></link>
+       or
+       <link linkend="pg-logical-slot-get-changes"><function>pg_logical_slot_get_changes</function></link>
+       functions to get a stream of changes. The functions return a stream of
+       changes until there are no more changes currently available. The client
+       should call it repeatedly to continue fetching changes.
+      </para>
+      <para>
+       At minimum <link linkend="pglogical-client-options-protoversion">
+       the protocol version parameters</link> must be sent as request options,
+       otherwise the request will be rejected.
+      </para>
+      <para>
+       Optionally the number of changes returned and/or the xlog position may
+       be limited so the client can control how many changes are fetched in
+       each call.
+      </para>
+      <para>
+       e.g.:
+       <programlisting>
+        SELECT *
+        FROM pg_logical_slot_get_binary_changes('my_slot', NULL, NULL,
+           min_proto_version, '1',
+           max_proto_version, '1',
+           startup_params_format, '1'
+         );
+       </programlisting>
+      </para>
+      <para>
+       If the client has requested the
+       <link linkend="pglogical-output-json-protocol"><acronym>JSON</acronym> protocol</link>
+       then it may use <function>pg_logical_slot_get_changes</function> to get
+       an easily-read text representation. Otherwise it must use
+       <function>pg_logical_slot_get_binary_changes</function> and decode the
+       streaming replication protocol copydata messages returned.
+      </para>
+      <para>
+       The slot position is updated automatically when the function that
+       fetched the changes returns, so a subsequent call will return new data.
+       There is no explicit feedback mechanism like that required for the
+       streaming replication protocol. A client that wishes to examine the slot's
+       queued contents without advancing the slot position may use the "peek"
+       versions of the get changes functions.
+      </para>
+      <important>
+        Because the server automatically advances the slot position it may do
+        so when the connection has broken but the server hasn't noticed yet.
+        This means that the client can miss changes, since it never received
+        them on the broken connection but the server already advanced the slot
+        position.  This makes it difficult to do totally reliable and
+        crash-safe logical replication using the streaming replication
+        interfaces.
+       </para>
+      </important>
+     </listitem>
+    </itemizedlist>
+   </para>
+
+  </sect3>
+
+  <sect3 id="pglogical-output-usage-streaming" xreflabel="pglogical_output usage (streaming)">
+   <title>Streaming logical replication usage</title>
+
+   <para>
+    If the client has access to a PostgreSQL client library that supports <link
+    linkend="protocol-replication"> the streaming replication protocol</link>,
+    such as <application>libpq</application>, it may choose to use this instead
+    of the SQL interface. There are efficiency advantages to using the streaming
+    replication protocol and it should be preferred where available.
+   </para>
+
+   <note>
+    <para>
+     <link linkend="logicaldecoding-exported-snapshots">Exported
+     snapshots</link> are only available when using the walsender interface to
+     logical decoding, not the SQL interface.
+    </para>
+   </para>
+
+   <para>
+    The overall flow of client/server interaction when using the streaming replication
+    protocol is:
+    <itemizedlist>
+
+     <listitem>
+      <para>
+       Client makes PostgreSQL fe/be protocol connection to server using the
+       walsender protocol by specifying the the
+       <literal>replication=database</literal> connection option in its libpq
+       connection string along with any other normal options, e.g.
+       <programlisting>
+       'dbname=mydb user=postgres replication=database sslmode=verify-full'
+       </programlisting>
+       <literal>replication=database</literal> should appear literally; do
+       not replace <literal>database</literal> with the name of the database
+       you are connecting to.
+      </para>
+      <para>
+       The connecting user must have a <literal>replication</literal> entry in
+       <link linkend="auth-pg-hba-conf"><filename>pg_hba.conf</filename></link>
+       <emphasis>and</emphasis> the <literal>REPLICATION</literal> option <link
+       linkend="sql-grant"><literal>GRANT</literal></link>ed to it.  Superuser
+       access is not required.
+      </para>
+      <para>
+       The same mechanisms (md5, etc) are used for authentication and protocol
+       encryption as for a normal non-replication connection.
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       The client optionally issues a <link
+       linkend="protocol-replication-identifysystem"><literal>IDENTIFY_SYSTEM</literal></link>
+       command.  The server responds with a single row containing system
+       identity information. e.g.
+       <programlisting>
+             systemid       | timeline |  xlogpos  | dbname | dboid
+       ---------------------+----------+-----------+--------+-------
+        6153224364663410513 |        1 | 0/C429C48 | testd  | 16385
+       (1 row)
+       </programlisting>
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       The client issues a <link
+       linkend="protocol-replication-createslot"><literal>CREATE_REPLICATION_SLOT</literal>
+       <replaceable>slotname</replaceable> <literal>LOGICAL
+       'pglogical'</literal> command if it's setting up for the first time. Subsequent
+       connections can and should re-use the same slot.
+      </para>
+      <para>
+       The server responds with confirmation of success and a snapshot identifier that can be
+       used with <literal>SET TRANSACTION SNAPSHOT</literal> on regular connections. See
+       <link linkend="logicaldecoding-exported-snapshots">exported snapshots</link>.
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       The client issues <link
+       linkend="protocol-replication-startlogical"><literal>START_REPLICATION
+       SLOT</literal> <replaceable>slotname</replaceable>
+       <literal>LOGICAL</literal> <replaceable>0/0</replaceable>
+       <replaceable>(...options...)</replaceable> to start streaming. This
+       enters <link linkend="protocol-copy-both">COPY BOTH</link> mode, which
+       loops indefinitely until the client disconnects.
+      </para.
+      <para>
+       The first time the client connects it passes <literal>0/0</literal> as
+       the LSN to start replay at. For subsequent connections it passes the LSN
+       of the last changeit replayed and saved persistently before it was
+       disconnected.
+      </para>
+      <para>
+       In COPY BOTH mode The server emits a <link
+       linkend="pglogical-protocol"><applicatoin>pglogical_output</application>
+       protocol</link> message block encapsulated in a replication protocol
+       CopyData message.  The client receives and unwraps the message then
+       decodes the contained pglogical_output message block.
+      </para>
+      <para>
+       The client must periodically send a <link
+       linkend="protocol-replication-standbystatusupdate">standby status update
+       message</link> to server to confirm replay progress, otherwise it may be
+       disconnected by the walsender timeout. Failure to send progress messages
+       will also cause <acronym>WAL</acronym> to accumulate unnecessarily on
+       the server.
+      </para>
+      <important>
+       <para>
+        The server <emphasis>may send the same data to the client a second
+        time</emphasis> if a connection is lost and then re-established. The
+        client should not rely on standby status updates to prevent data from
+        being replayed twice. The <emphasis>client</emphasis> must keep track
+        of the exact xlog position it has replayed up to on the slot and send
+        that to the server to cause replay to resume at that position. Do
+        not pass <literal>0/0</literal> as the LSN position to replay from
+        when reconnecting unless your client doesn't care about getting duplicate
+        data.
+       </para>
+       <para>
+        The replication slot's <literal>restart_lsn</literal> is
+        <emphasis>not</emphasis> kept up to date with the last position sent
+        to the client. It is updated lazily based on replay feedback.
+       </para>
+      </important>
+      <para>
+       The client library generally takes care of the details of handling COPY
+       management; see for example <link linkend="libpq-copy">libpq's COPY
+       support routines</link>.
+      </para>
+     </listitem>
+
+    <itemizedlist>
+   </para>
+
+ </sect2>
+
+ <sect2>
+  <title>...</title>
+
+  <sect3 id="pglogical-output-changeset-forwarding" xreflabel="Changeset Forwarding">
+   <title>Changeset Forwarding</title>
+
+   <para>
+    TODO
+   </para>
+
+  </sect3>
+
+ </sect2>
+
+ <sect2 id="pglogical-output-protocol"
+        xreflabel="pglogical_output binary network protocol">
+  <title>pglogical_output binary network protocol</title>
+
+   <indexterm zone="pglogical-output">
+    <primary>pglogical_output binary network protocol</primary>
+   </indexterm>
+
+   <para>
+    <filename>pglogical_output</filename> defines a libpq subprocotol for
+    streaming tuples, metadata, etc, from the decoding plugin to receivers.
+   </para>
+
+   <para>
+    This protocol is the inner layer in a stack. From outer to inner:
+
+    <itemizedlist>
+     <listitem>
+      <para>
+      tcp or unix sockets
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       <link linkend="protocol">libpq protocol</link>
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       <link linkend="protocol-replication">libpq replication subprotocol</link> (COPY BOTH etc)
+      </para>
+     </listitem>
+
+     <listitem>
+      <para>
+       pg_logical output plugin => consumer protocol
+      </para>
+     </listitem>
+    </itemizedlist>
+
+    ... so clients can simply use libpq's existing replication protocol support,
+    directly or via their libpq-wrapper driver.
+   </para>
+
+   <para>
+    This is a binary protocol intended for compact representation not human
+    readability and easy parsing in scripting languages.
+   </para>
+
+   <para>
+    <filename>pglogical-output</filename> also supports a json-based text
+    protocol (<xref linkend="pglogical-output-json-protocol">) with json
+    representations of the same changesets, supporting all the same hooks etc,
+    intended mainly for tracing/debugging/diagnostics.  That protocol uses the
+    same startup parameters and message flow but is structurally different to
+    the binary protocol documented here.
+   </para>
+
+   <sect3>
+    <title>Protocol flow</title>
+
+    <para>
+     The protocol flow is primarily from upstream walsender/decoding plugin to
+     the downstream receiver.
+    </para>
+
+    <para>
+     The only information the flows downstream-to-upstream is:
+    </para>
+
+    <itemizedlist>
+     <listitem>
+      <para>
+       The initial parameter list sent to <literal>START_REPLICATION</literal>; and
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       Replay progress messages
+      </para>
+     </listitem>
+    </itemizedlist>
+
+    <para>
+     We can accept an arbitrary list of params to
+     <literal>START_REPLICATION</literal>. After that we have no general
+     purpose channel for information to flow upstream.  That means we can't do
+     a multi-step negotiation/handshake for determining the replication options
+     to use, binary protocol, etc.
+    </para>
+
+    <para>
+     The main form of negotiation is the client getting a "take it or leave it"
+     set of settings from the server in an initial startup message sent before
+     any replication data (see below) and, if it doesn't like them,
+     reconnecting with different startup options.
+    </para>
+
+    <para>
+     Except for the negotiation via initial parameter list and then startup
+     message the protocol flow is the same as any other walsender-based logical
+     replication plugin. The data stream is sent in <literal>COPY
+     BOTH</literal> mode as a series of <literal>CopyData</literal> messages
+     encapsulating replication data, and ends when the client disconnects.
+     There's no facility for ending the <literal>COPY BOTH</literal> mode and
+     returning to the walsender command parser to issue new commands. This is a
+     limiation of the walsender interface, not pglogical_output.
+    </para>
+   </sect3>
+
+   <sect3>
+    <title>Protocol messages</title>
+
+    <para>
+     Absolutely all top-level protocol messages begin with a message type byte.
+     While represented in code as a character, this is a signed byte with no
+     associated encoding.
+    </para>
+
+    <para>
+     Since the PostgreSQL libpq <literal>COPY</literal> protocol supplies a
+     message length there's no need for top-level protocol messages to embed a
+     length in their header.
+    </para>
+
+    <para>
+     The individual protocol messages are discussed in the following
+     sub-sections.
+    </para>
+
+    <sect4 id="pglogical-m-b">
+     <title>BEGIN message</title>
+
+     <para>
+      A stream of rows starts with a <literal>BEGIN</literal> message. Rows may
+      only be sent after a <literal>BEGIN</literal> and before a
+      <literal>COMMIT</literal>.
+     </para>
+
+     <table id="pglogical-m-b-t">
+      <title>BEGIN Message</title>
+      <tgroup cols="3">
+       <thead>
+        <row>
+         <entry>Message</entry>
+         <entry>Type/Size</entry>
+         <entry>Notes</entry>
+        </row>
+       </thead>
+
+       <tbody>
+        <row>
+         <entry>Message Type</entry>
+         <entry>signed char</entry>
+         <entry>Literal '<emphasis role="bold">B</>' (0x42)</entry>
+        </row>
+        <row>
+         <entry>flags</entry>
+         <entry><literal>uint8</literal></entry>
+         <entry>0-3: Reserved, client <emphasis>must</emphasis> ERROR if set and not recognised.</entry>
+        </row>
+        <row>
+         <entry>LSN</entry>
+         <entry><literal>uint64</literal></entry>
+         <entry><literal>final_lsn</literal> in decoding context - currently it means lsn of commit</entry>
+        </row>
+        <row>
+         <entry>commit time</entry>
+         <entry><literal>uint64</literal></entry>
+         <entry><literal>commit_time</literal> in decoding context</entry>
+        </row>
+        <row>
+         <entry>remote XID</entry>
+         <entry><literal>uint32</literal></entry>
+         <entry>"xid" in decoding context</entry>
+        </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-m-o">
+     <title>Forwarded transaction origin message</title>
+
+     <para>
+      The message after the <literal>BEGIN</literal> may be a
+      <emphasis>forwarded transaction origin</> message indicating what
+      upstream node the transaction came from.
+     </para>
+
+     <para>
+      Sent if the immediately prior message was a <literal>BEGIN</literal>
+      message, the upstream transaction was forwarded from another node, and
+      replication origin forwarding is enabled, i.e.
+      <literal>forward_changeset_origins</literal> is <literal>t</literal> in
+      the startup reply message.
+     </para>
+
+     <para>
+      A "node" could be another host, another DB on the same host, or pretty
+      much anything. Whatever origin name is found gets forwarded. The origin
+      identifier is of arbitrary and application-defined format.  Applications
+      <emphasis>should</emphasis> prefix their origin identifier with a fixed
+      application name part, like <literal>bdr_</literal>,
+      <literal>myapp_</literal>, etc. It is application-defined what an
+      application does with forwarded transactions from other applications.
+     </para>
+
+     <para>
+      An origin message with a zero-length origin name indicates that the
+      origin could not be identified but was (probably) not the local node. It
+      is client-defined what action is taken in this case.
+     </para>
+
+     <para>
+      It is a protocol error to send/receive a forwarded transaction origin
+      message at any time other than immediately after a
+      <literal>BEGIN</literal> message.
+     </para>
+
+     <para>
+      The origin identifier is typically closely related to replication slot
+      names and replication origins' names in an application system.
+     </para>
+
+     <para>
+      For more detail see <xref linkend="pglogical-output-changeset-forwarding">
+     </para>
+
+     <table id="pglogical-m-o-t">
+      <title>Forwarded transaction origin message</title>
+      <tgroup cols="3">
+       <thead>
+        <row>
+         <entry>Message</entry>
+         <entry>Type/Size</entry>
+         <entry>Notes</entry>
+        </row>
+       </thead>
+       <tbody>
+        <row>
+         <entry>Message type</entry>
+         <entry>signed char</entry>
+         <entry>Literal '<emphasis role="bold"><literal>O</literal></emphasis>' (0x4f)</entry>
+        </row>
+        <row>
+         <entry>flags</entry>
+         <entry><literal>uint8</literal></entry>
+         <entry>0-3: Reserved, application <emphasis>must</> ERROR if set and not recognised</entry>
+        </row>
+        <row>
+         <entry>origin_lsn</entry>
+         <entry><literal>uint64</literal></entry>
+         <entry>Log sequence number (LSN, XLogRecPtr) of the transaction's commit record on its origin node (as opposed to the forwarding node's commit LSN, which is <literal>lsn</literal> in the BEGIN message)</entry>
+        </row>
+        <row>
+         <entry>origin_identifier_length</entry>
+         <entry><literal>uint8</literal></entry>
+         <entry>Length in bytes of <literal>origin_identifier</literal></entry>
+        </row>
+        <row>
+         <entry>origin_identifier</entry>
+         <entry><literal>signed char[origin_identifier_length]</literal></entry>
+         <entry>An origin identifier of arbitrary, upstream-application-defined structure. <emphasis>Should</> be text in the same encoding as the upstream database. NULL-terminated. <emphasis>Should</> be 7-bit ASCII.</entry>
+        </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-m-c">
+     <title>COMMIT message</title>
+
+     <para>
+      Indicates that the current transaction has committed and puts the
+      connection in a state where it's ready for the next transaction to start.
+     </para>
+
+     <para>
+      There is no <literal>ROLLBACK</literal> message because aborted
+      transactions are not sent by the upstream.
+     </para>
+
+     <table id="pglogical-m-c-t">
+      <title>COMMIT message</title>
+      <tgroup cols="3">
+       <thead>
+        <row>
+         <entry>Message</entry>
+         <entry>Type/Size</entry>
+         <entry>Notes</entry>
+        </row>
+       </thead>
+       <tbody>
+        <row>
+         <entry>Message type</entry>
+         <entry><literal>signed char</literal></entry>
+         <entry>Literal '<emphasis role="bold"><literal>C</literal></emphasis>' (0x43)</entry>
+        </row>
+        <row>
+         <entry>flags</entry>
+         <entry><literal>uint8</literal></entry>
+         <entry>0-3: Reserved, client <emphasis>must</emphasis> ERROR if set and not recognised</entry>
+        </row>
+        <row>
+         <entry>Commit LSN</entry>
+         <entry><literal>uint64</literal></entry>
+         <entry><literal>commit_lsn</literal> in decoding commit decode callback. This is the same value as in the <literal>BEGIN</literal> message, and marks the end of the transaction.</entry>
+        </row>
+        <row>
+         <entry>End LSN</entry>
+         <entry><literal>uint64</literal></entry>
+         <entry>end_lsn in decoding transaction context</entry>
+        </row>
+        <row>
+         <entry>Commit time</entry>
+         <entry><literal>uint64</literal></entry>
+         <entry>commit_time in decoding transaction context</entry>
+        </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-m-iud">
+     <title><literal>INSERT</literal>, <literal>UPDATE</literal> or <literal>DELETE</literal> message</title>
+
+     <para>
+      After a <literal>BEGIN</literal> or metadata message, the downstream
+      should expect to receive zero or more row change messages, composed of an
+      insert/update/delete message with zero or more tuple fields, each of which
+      has one or more tuple field values.
+     </para>
+
+     <para>
+      The row's relidentifier <emphasis>must</emphasis> match that of the most
+      recently preceding metadata message. All consecutive row messages must
+      currently have the same relidentifier. (<emphasis>Later extensions to add
+      metadata caching will relax these requirements for clients that advertise
+      caching support; see the documentation on metadata messages for more
+      detail</emphasis>).
+     </para>
+
+     <para>
+      It is an error to decode rows using metadata received after the row was
+      received, or using metadata that is not the most recently received
+      metadata revision that still predates the row. I.e. in the sequence M1,
+      R1, R2, M2, R3, M4: R1 and R2 must be decoded using M1, and R3  must be
+      decoded using M2. It is an error to use M4 to decode any of the rows, to
+      use M1 to decode R3, or to use M2 to decode R1 and R2.
+     </para>
+
+     <para>
+      Row messages <emphasis>may not</emphasis> arrive except during a
+      transaction as delimited by <literal>BEGIN</literal> and
+      <literal>COMMIT</literal> messages. It is an error to receive a row
+      message outside a transaction.
+     </para>
+
+     <para>
+      Any unrecognised tuple type or tuple part type is an error on the
+      downstream that must result in a client disconnect and error message.
+      Downstreams are expected to negotiate compatibility, and upstreams must
+      not add new tuple types or tuple field types without negotiation.
+     </para>
+
+     <para>
+      The downstream reads rows until the next non-row message is received.
+      There is no other end marker or any indication of how many rows to expect
+      in a sequence.
+     </para>
+
+     <sect5>
+      <title>Row message header</title>
+
+      <table id="pglogical-m-iud-t">
+       <title>Row message header</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>Message type</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry>
+           Literal '<emphasis role="bold"><literal>I</literal></emphasis>'nsert (0x49),
+           '<emphasis role="bold"><literal>U</literal></emphasis>'pdate (0x55)
+           or '<emphasis role="bold"><literal>D</literal></emphasis>'elete (0x44)
+          </entry>
+         </row>
+         <row>
+          <entry>flags</entry>
+          <entry><literal>uint8</literal></entry>
+          <entry>Row flags (reserved)</entry>
+         </row>
+         <row>
+          <entry>relidentifier</entry>
+          <entry><literal>uint32</literal></entry>
+          <entry>relidentifier that matches the table metadata message sent for this row</entry>
+         </row>
+         <row>
+          <entry>[tuple parts]</entry>
+          <entry>[composite]</entry>
+          <entry></entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+
+      <para>
+       One or more tuple-parts fields follow.
+      </para>
+     </sect5>
+
+     <sect5 id="pglogical-m-iud-fields-t">
+      <title>Tuple fields</title>
+      <table id="tuple-fields">
+       <title>Tuple fields</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>Tuple type</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry>Identifies the kind of tuple being sent.</entry>
+         </row>
+         <row>
+          <entry>tupleformat</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry>'<emphasis role="bold"><literal>T</literal></emphasis>' (0x54)</entry>
+         </row>
+         <row>
+          <entry>natts</entry>
+          <entry><literal>uint16</literal></entry>
+          <entry>Number of fields sent in this tuple part</entry>
+         </row>
+         <row>
+          <entry>[tuple field values]</entry>
+          <entry>[composite]</entry>
+          <entry></entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+
+      <simplesect>
+       <title>Tuple tupleformat compatibility</title>
+       <para>
+        Unrecognised <emphasis>tupleformat</emphasis> kinds are a protocol
+        error for the downstream.
+       </para>
+      </simplesect>
+
+     </sect5>
+
+     <sect5 id="pglogical-m-iud-fieldvalues">
+      <title>Tuple field value fields</title>
+      <para>
+       These message parts describe individual fields within a tuple.
+      </para>
+
+      <para>
+       There are two kinds of tuple value fields, abbreviated and full. Which
+       is being read is determined based on the first field,
+       <emphasis>kind</emphasis>.
+      </para>
+
+      <table id="pglogical-m-iud-fieldvalues-abbrev-t">
+       <title>Abbreviated tuple value fields are nothing but the message kind:</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>kind</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry>'<emphasis role="bold"><literal>n</literal></emphasis>'ull (0x6e) field</entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+
+      <table id="pglogical-m-iud-fieldvalues-full-t">
+       <title>Full tuple value fields have a length and datum:</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>kind</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry>'<emphasis role="bold"><literal>i</literal></emphasis>'nternal binary (0x62) field</entry>
+         </row>
+         <row>
+          <entry>length</entry>
+          <entry><literal>int4</literal></entry>
+          <entry>Only defined for kind = <literal>i</literal>|<literal>b</literal>|<literal>t</literal></entry>
+         </row>
+         <row>
+          <entry>data</entry>
+          <entry>[length]</entry>
+          <entry>Data in a format defined by the table metadata and column <emphasis>kind</emphasis>.</entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+      <simplesect>
+       <title>Tuple field values kind compatibility</title>
+       <para>
+        Unrecognised field <emphasis>kind</emphasis> values are a protocol error
+        for the downstream. The downstream may not continue processing the
+        protocol stream after this point.
+       </para>
+       <para>
+        The upstream may not send <emphasis
+        role="bold"><literal>i</literal></emphasis>nternal or <emphasis
+        role="bold"><literal>b</literal></emphasis>inary format values to the
+        downstream without the downstream negotiating acceptance of such
+        values. The downstream will also generally negotiate to receive type
+        information to use to decode the values. See the section on startup
+        parameters and the startup message for details.
+       </para>
+      </simplesect>
+     </sect5>
+    </sect4>
+
+    <sect4 id="pglogical-m-metadata">
+     <title>Table/row metadata messages</title>
+
+     <para>
+      Before sending changed rows for a relation, a metadata message for the
+      relation must be sent so the downstream knows the namespace, table name,
+      column names, optional column types, etc. A
+      <literal>relidentifier</literal> field, an arbitrary numeric value unique
+      for that relation on that upstream connection, maps the metadata to
+      following rows.
+     </para>
+
+     <para>
+      A client should not assume that relation metadata will be followed
+      immediately (or at all) by rows, since future changes may lead to
+      metadata messages being delivered at other times. Metadata messages may
+      arrive during or between transactions.
+     </para>
+
+     <para>
+      The upstream may not assume that the downstream retains more metadata
+      than the one most recent table metadata message. This applies across all
+      tables, so a client is permitted to discard metadata for table x when
+      getting metadata for table y. The upstream must send a new metadata
+      message before sending rows for a different table, even if that metadata
+      was already sent in the same session or even same transaction.
+      <emphasis>This requirement will later be weakened by the addition of
+      client metadata caching, which will be advertised to the upstream with an
+      output plugin parameter.</>
+     </para>
+
+     <para>
+      Columns in metadata messages are numbered from 0 to
+      <literal>natts</literal>-1, reading consecutively from start to finish.
+      The column numbers do not have to be a complete description of the
+      columns in the upstream relation, so long as all columns that will later
+      have row values sent are described. The upstream may choose to omit
+      columns it doesn't expect to send changes for in any given series of
+      rows. Column numbers are not necessarily stable across different sets of
+      metadata for the same table, even if the table hasn't changed
+      structurally.
+     </para>
+
+     <para>
+      A metadata message may not be used to decode rows received before that
+      metadata message.
+     </para>
+
+     <table id="pglogical-m-metadata-header-t">
+      <title>Table metadata header</title>
+      <tgroup cols="3">
+       <thead>
+       <row>
+        <entry>Message</entry>
+        <entry>Type/Size</entry>
+        <entry>Notes</entry>
+       </row>
+       </thead>
+       <tbody>
+       <row>
+        <entry>Message type</entry>
+        <entry><literal>signed char</literal></entry>
+        <entry>Literal <emphasis role="bold"><literal>R</literal></emphasis> (0x52)</entry>
+       </row>
+       <row>
+        <entry>flags</entry>
+        <entry><literal>uint8</literal></entry>
+        <entry>0-6: Reserved, client <emphasis>must</> ERROR if set and not recognised.</entry>
+       </row>
+       <row>
+        <entry>relidentifier</entry>
+        <entry><literal>uint32</literal></entry>
+        <entry>Arbitrary relation id, unique for this upstream. In practice this will probably be the upstream table's oid, but the downstream can't assume anything.</entry>
+       </row>
+       <row>
+        <entry>nspnamelength</entry>
+        <entry><literal>uint8</literal></entry>
+        <entry>Length of namespace name</entry>
+       </row>
+       <row>
+        <entry>nspname</entry>
+        <entry><literal>signed char[nspnamelength]</literal></entry>
+        <entry>Relation namespace (null terminated)</entry>
+       </row>
+       <row>
+        <entry>relnamelength</entry>
+        <entry><literal>uint8</literal></entry>
+        <entry>Length of relation name</entry>
+       </row>
+       <row>
+        <entry>relname</entry>
+        <entry><literal>char[relname]</literal></entry>
+        <entry>Relation name (null terminated)</entry>
+       </row>
+       <row>
+        <entry>attrs block</entry>
+        <entry><literal>signed char</literal></entry>
+        <entry>Literal: <emphasis role="bold"><literal>A</literal></emphasis> (0x41)</entry>
+       </row>
+       <row>
+        <entry>natts</entry>
+        <entry><literal>uint16</literal></entry>
+        <entry>number of attributes</entry>
+       </row>
+       <row>
+        <entry>[fields]</entry>
+        <entry>[composite]</entry>
+        <entry>Sequence of 'natts' column metadata blocks, each of which begins with a column delimiter followed by zero or more column metadata blocks, each with the same column metadata block header.</entry>
+       </row>
+       </tbody>
+      </tgroup>
+     </table>
+
+     <para>
+      This chunked format is used so that new metadata messages can be added without breaking existing clients.
+     </para>
+
+     <sect5 id="pglogical-m-metadata-coldelim">
+      <title>Column delimiter</title>
+      <para>
+       Each column's metadata begins with a column metadata header. This comes
+       immediately after the natts field in the table metadata header or after
+       the last metadata block in the prior column.
+      </para>
+      <para>
+       It has the same char header as all the others, and the flags field is the
+       same size as the length field in other blocks, so it's safe to read this
+       as a column metadata block header.
+      </para>
+
+      <table id="pglogical-m-metadata-coldelim-t">
+       <title>Column delimiter</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>blocktype</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry><emphasis role="bold"><literal>C</literal></emphasis> (0x43) - column</entry>
+         </row>
+         <row>
+          <entry>flags</entry>
+          <entry><literal>uint8</literal></entry>
+          <entry>Column info flags</entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+     </sect5>
+
+     <sect5 id="pglogical-m-metadata-blockheader">
+      <title>Column metadata block header</title>
+      <para>
+       All column metadata blocks share the same header, which is the same length as a column delimiter:
+      </para>
+
+      <table id="pglogical-m-metadata-blockheader-t">
+       <title>Column metadata block header"</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>blocktype</entry>
+          <entry><literal>signed char</literal></entry>
+          <entry>Identifies the kind of metadata block that follows.</entry>
+         </row>
+         <row>
+          <entry>blockbodylength</entry>
+          <entry><literal>uint16</literal></entry>
+          <entry>Length of block in bytes, excluding blocktype char and length field.</entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+     </sect5>
+
+     <sect5 id="pglogical-m-metadata-nameblock">
+      <title>Column name block</title>
+
+      <para>
+       This block just carries the name of the column, nothing more. It begins
+       with a column metadata block, and the rest of the message is the column
+       name.
+      </para>
+
+      <table id="pglogical-m-metadata-nameblock-t">
+       <title>Column name block</title>
+       <tgroup cols="3">
+        <thead>
+         <row>
+          <entry>Message</entry>
+          <entry>Type/Size</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry>[column metadata block header]</entry>
+          <entry>[composite]</entry>
+          <entry>blocktype = <emphasis role="bold"><literal>N</literal></emphasis> (0x4e)</entry>
+         </row>
+         <row>
+          <entry>colname</entry>
+          <entry><literal>char[blockbodylength]</literal></entry>
+          <entry>Column name.</entry>
+         </row>
+        </tbody>
+       </tgroup>
+      </table>
+     </sect5>
+
+     <sect5 id="pglogical-m-metadata-typeblock">
+      <title>Column type block</title>
+
+      <para>
+       T.B.D.
+      </para>
+
+      <para>
+       Not defined in first protocol revision. Clients will need to send a startup
+       parameter to request type information if they want it, so old clients won't
+       ever see type info messages and don't have to care.
+      </para>
+
+     </sect5>
+    </sect4>
+
+    <sect4 id="pglogical-m-purge">
+     <title>Table metadata purge request</title>
+
+     <para>
+      If a caching downstream has informed the upstream of a limit to its cache
+      size, or if the upstream knows metadata for a relation will never be
+      referenced again, it the upstream may send a metadata cache purge
+      request.
+     </para>
+
+     <para>
+      If the downstream does metadata caching it should purge this entry from
+      its cache. The upstream will send a new metadata message if the relation
+      is touched again.
+     </para>
+
+     <para>
+      Note that purge requests aren't normally sent when a relation's structure
+      changes upstream. The upstream doesn't guarantee that it'll send a purge
+      at any particular time, or send timely metadata updates when a table's
+      structure changes. It only guarantees to send new metadata before the
+      next row affecting that table, if any.
+     </para>
+
+     <table id="pglogical-m-purge-t">
+      <title>Metadata purge request structure</title>
+      <tgroup cols="3">
+       <thead>
+       <row>
+        <entry>Message</entry>
+        <entry>Type/Size</entry>
+        <entry>Notes</entry>
+       </row>
+       </thead>
+       <tbody>
+       <row>
+        <entry>Message type</entry>
+        <entry><literal>signed char</literal></entry>
+        <entry>Literal '<emphasis role="bold"><literal>P</literal></emphasis>' (0x50)</entry>
+       </row>
+       <row>
+        <entry>flags</entry>
+        <entry><literal>uint8</literal></entry>
+        <entry>0-6: Reserved, client <emphasis>must</> ERROR if set and not recognised.</entry>
+       </row>
+       <row>
+        <entry>relidentifier</entry>
+        <entry><literal>uint32</literal></entry>
+        <entry>relation identifier for cached relation to purge</entry>
+       </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-m-startup">
+     <title>Startup message</title>
+
+     <para>
+      After processing output plugin arguments, the upstream output plugin must
+      send a startup message as its first message on the wire (unless it sends a
+      libpq protocol error message instead). It is a trivial header followed by
+      alternating key and value strings represented as null-terminated unsigned
+      char strings.
+     </para>
+
+     <para>
+      This message specifies the capabilities the output plugin enabled and
+      describes the upstream server and plugin. This may change how the client
+      decodes the data stream, and/or permit the client to disconnect and report
+      an error to the user if the result isn't acceptable.
+     </para>
+
+     <para>
+      If replication is rejected because the client is incompatible or the
+      server is unable to satisfy required options, the startup message may be
+      followed by a libpq protocol <literal>FATAL</literal> message that
+      terminates the session.  See "Startup errors" below.
+     </para>
+
+     <para>
+      The parameter names and values are sent as alternating key/value pairs as
+      null-terminated strings, e.g.
+     </para>
+     <synopsis>key1\0parameter1\0key2\0value2\0</synopsis>
+
+     <table id="pglogical-m-startup-t">
+      <title>Startup message</title>
+      <tgroup cols="3">
+       <thead>
+          <row>
+           <entry>Message</entry>
+           <entry>Type/Size</entry>
+           <entry>Notes</entry>
+          </row>
+       </thead>
+       <tbody>
+          <row>
+           <entry>Message type</entry>
+           <entry><literal>signed char</literal></entry>
+           <entry><emphasis role="bold"><literal>S</literal></emphasis> (0x53) - startup</entry>
+          </row>
+          <row>
+           <entry>Startup message version</entry>
+           <entry><literal>uint8</literal></entry>
+           <entry>Value is always "1".</entry>
+          </row>
+          <row>
+           <entry>(parameters)</entry>
+           <entry>null-terminated key/value pairs</entry>
+           <entry>See table below for parameter definitions.</entry>
+          </row>
+       </tbody>
+      </tgroup>
+     </table>
+
+     <sect5 id="pglogical-m-startup-params">
+      <title>Startup message parameters</title>
+
+      <para>
+      Since all parameter values are sent as strings, the value types given below specify what the value must be reasonably interpretable as.
+      </para>
+
+      <table id="pglogical-m-startup-params-t">
+       <title>Startup message parameters</title>
+       <tgroup cols="3">
+        <thead>
+          <row>
+           <entry>Key name</entry>
+           <entry>Value type</entry>
+           <entry>Description</entry>
+          </row>
+        </thead>
+        <tbody>
+          <row>
+           <entry><literal>max_proto_version</literal></entry>
+           <entry><literal>integer</literal></entry>
+           <entry>Newest version of the protocol supported by output plugin.</entry>
+          </row>
+          <row>
+           <entry><literal>min_proto_version</literal></entry>
+           <entry><literal>integer</literal></entry>
+           <entry>Oldest protocol version supported by server.</entry>
+          </row>
+          <row>
+           <entry><literal>proto_format</literal></entry>
+           <entry><literal>text</literal></entry>
+           <entry>Protocol format requested. native (documented here) or json. Default is native.</entry>
+          </row>
+          <row>
+           <entry><literal>coltypes</literal></entry>
+           <entry><literal>boolean</literal></entry>
+           <entry>Column types will be sent in table metadata.</entry>
+          </row>
+          <row>
+           <entry><literal>pg_version_num</literal></entry>
+           <entry><literal>integer</literal></entry>
+           <entry>PostgreSQL <literal>server_version_num</literal> of server, if it's PostgreSQL. e.g. <literal>090400</literal></entry>
+          </row>
+          <row>
+           <entry><literal>pg_version</literal></entry>
+           <entry><literal>string</literal></entry>
+           <entry>PostgreSQL <literal>server_version</literal> of server, if it's PostgreSQL.</entry>
+          </row>
+          <row>
+           <entry><literal>pg_catversion</literal></entry>
+           <entry><literal>uint32</literal></entry>
+           <entry>Version of the PostgreSQL system catalogs on the upstream server, if it's PostgreSQL.</entry>
+          </row>
+          <row>
+           <entry>binary</entry>
+           <entry><emphasis>set of parameters, specified separately</></entry>
+           <entry>See <xref linkend="pglogical-output-binary-parameters"/> below, and <emphasis>"Parameters relating to exchange of binary values"</emphasis></entry>
+          </row>
+          <row>
+           <entry><literal>database_encoding</literal></entry>
+           <entry><literal>string</literal></entry>
+           <entry>The native text encoding of the database the plugin is running in</entry>
+          </row>
+          <row>
+           <entry><literal>encoding</literal></entry>
+           <entry><literal>string</literal></entry>
+           <entry>
+            Field values for textual data will be in this encoding in native
+            protocol text, binary or internal representation. For the native
+            protocol this is currently always the same as
+            <literal>database_encoding</literal>.  For text-mode json protocol
+            this is always the same as <literal>client_encoding</literal>.
+           </entry>
+          </row>
+          <row>
+           <entry><literal>forward_changeset_origins</literal></entry>
+           <entry><literal>bool</literal></entry>
+           <entry>Tells the client that the server will send changeset origin information. See <emphasis>"Changeset forwarding"</> for details.</entry>
+          </row>
+          <row>
+           <entry><literal>no_txinfo</literal></entry>
+           <entry><literal>bool</literal></entry>
+           <entry>
+            Requests that variable transaction info such as XIDs, LSNs, and
+            timestamps be omitted from output. Mainly for tests. Currently
+            ignored for protos other than json.
+           </entry>
+          </row>
+        </tbody>
+       </tgroup>
+      </table>
+
+      <table id="pglogical-output-binary-parameters" xreflabel="the 'binary' parameters">
+       <title>The 'binary' parameter set</title>
+       <tgroup cols="3">
+         <thead>
+          <row>
+           <entry>Key name</entry>
+           <entry>Value type</entry>
+           <entry>Description</entry>
+          </row>
+         </thead>
+         <tbody>
+           <row>
+            <entry><literal>binary.internal_basetypes</literal></entry>
+            <entry><literal>boolean</literal></entry>
+            <entry>
+             If true, PostgreSQL internal binary representations for row field
+             data may be used for some or all row fields, if here the type is
+             appropriate and the binary compatibility parameters of upstream and
+             downstream match. See
+             <literal>binary.want_internal_basetypes</literal> in the output
+             plugin parameters for details. May only be true if
+             <literal>binary.want_internal_basetypes</literal> was set to true by
+             the client in the parameters and the client's accepted binary format
+             matches that of the server.
+            </entry>
+           </row>
+           <row>
+            <entry><literal>binary.binary_basetypes</literal></entry>
+            <entry><literal>boolean</literal></entry>
+            <entry>
+             If true, external binary format (send/recv format) may be used for
+             some or all row field data where the field type is a built-in base
+             type whose send/recv format is compatible with
+             <literal>binary.binary_pg_version</literal>. May only be set if
+             <literal>binary.want_binary_basetypes</literal> was set to true by
+             the client in the parameters and the client's accepted send/recv
+             format matches that of the server.
+            </entry>
+           </row>
+           <row>
+            <entry><literal>binary.binary_pg_version</literal></entry>
+            <entry><literal>uint16</literal></entry>
+            <entry>
+             The PostgreSQL major version that binary send/recv format values
+             will be compatible with. This is not necessarily the actual
+             upstream PostgreSQL version.
+            </entry>
+           </row>
+           <row>
+            <entry><literal>binary.sizeof_int</literal></entry>
+            <entry><literal>uint8</literal></entry>
+            <entry>sizeof(int) on the upstream.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.sizeof_long</literal></entry>
+            <entry><literal>uint8</literal></entry>
+            <entry>sizeof(long) on the upstream.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.sizeof_datum</literal></entry>
+            <entry><literal>uint8</literal></entry>
+            <entry>Same as sizeof_int, but for the PostgreSQL Datum typedef.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.maxalign</literal></entry>
+            <entry><literal>uint8</literal></entry>
+            <entry>Upstream PostgreSQL server's MAXIMUM_ALIGNOF value - platform dependent, determined at build time.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.bigendian</literal></entry>
+            <entry><literal>bool</literal></entry>
+            <entry>True iff the upstream is big-endian.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.float4_byval</literal></entry>
+            <entry><literal>bool</literal></entry>
+            <entry>Upstream PostgreSQL's float4_byval compile option.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.float8_byval</literal></entry>
+            <entry><literal>bool</literal></entry>
+            <entry>Upstream PostgreSQL's float8_byval compile option.</entry>
+           </row>
+           <row>
+            <entry><literal>binary.integer_datetimes</literal></entry>
+            <entry><literal>bool</literal></entry>
+            <entry>
+             Whether <literal>TIME</literal>, <literal>TIMESTAMP</literal> and
+             <literal>TIMESTAMP WITH TIME ZONE</literal> will be sent using
+             integer or floating point representation. Usually this is the value
+             of the upstream PostgreSQL's integer_datetimes compile
+             option.
+            </entry>
+           </row>
+         </tbody>
+       </tgroup>
+      </table>
+     </sect5>
+    </sect4>
+   </sect3>
+
+   <sect3 id="pglogical-startup-errors">
+    <title>Startup errors</title>
+
+    <para>
+     If the server rejects the client's connection - due to non-overlapping
+     protocol support, unrecognised parameter formats, unsupported required
+     parameters like hooks, etc - then it will send a normal libpq error
+     message.  The startup reply message <emphasis>may</emphasis> be sent prior
+     to the error with information on the upstream and possibly information
+     on the error.
+    </para>
+
+    <para>
+     The output plugin <emphasis>may</emphasis> send the error immediately
+     or may wait until the first transaction is decoded on the upstream.
+    </para>
+
+   </sect3>
+
+   <sect3 id="pglogical-client-options">
+    <title>Arguments client supplies to output plugin</title>
+
+    <para>
+     The one opportunity for the downstream client to send information (other
+     than replay feedback) to the upstream is at connect-time, as an array of
+     arguments to the output plugin supplied to
+     <emphasis>START LOGICAL REPLICATION</emphasis>.
+    </para>
+
+    <para>
+     There is no back-and-forth, no handshake.
+    </para>
+
+    <para>
+     As a result, the client mainly announces capabilities and makes requests
+     of the output plugin. The output plugin will ERROR if required parameters
+     are unset, or where incompatibilities that cannot be resolved are found.
+     Otherwise the output plugin reports what it could and could not honour in
+     the startup message it sends as the first message on the wire down to the
+     client. The client chooses whether to continue replay or to disconnect and
+     report an error to the user, then possibly reconnect with different
+     options.
+    </para>
+
+    <para>
+     All parameters are passed in text form. They _should_ be limited to 7-bit
+     ASCII, since the server's text encoding is not known, but
+     <emphasis>may</emphasis> be normalized precomposed UTF-8. The types
+     specified for parameters indicate what the output plugin should attempt
+     to convert the text into. Clients should not send text values that are
+     outside the range for that type.
+    </para>
+
+    <para>
+     Many values are capabilities flags for the client, indicating that it
+     understands optional features like metadata caching, binary format
+     transfers, etc. In general the output plugin <emphasis>may</emphasis>
+     disregard capabilities the client advertises as supported and act as if
+     they are not supported. If a capability is advertised as unsupported or
+     is not advertised the output plugin <emphasis>must not</emphasis> enable
+     the corresponding features.
+    </para>
+
+    <para>
+     In other words, don't send the client something it's not expecting.
+    </para>
+
+    <sect4 id="pglogical-client-options-protoversion">
+     <title>Protocol versioning</title>
+
+     <para>
+      Two parameters <literal>max_proto_version</literal> and
+      <literal>min_proto_version</literal>, which clients must always send,
+      allow negotiation of the protocol version. The output plugin must ERROR
+      if the client protocol support does not overlap its own protocol support
+      range.
+     </para>
+
+     <para>
+      The protocol version is only incremented when there are major breaking
+      changes that all or most clients must be modified to accommodate. Most
+      changes are done by adding new optional messages and/or by having
+      clients advertise capabilities to opt in to features.
+     </para>
+
+     <para>
+      Because these versions are expected to be incremented, to make it clear
+      that the format of the startup parameters themselves haven't changed,
+      the first key/value pair <emphasis>must</emphasis> be the parameter
+      <emphasis>startup_params_format</emphasis> with value "1".
+     </para>
+
+     <table id="pglogical-client-options-protoversion-t">
+      <title>Protocol versioning</title>
+       <tgroup cols="4">
+        <thead>
+         <row>
+          <entry>Key</entry>
+          <entry>Type</entry>
+          <entry>Value(s)</entry>
+          <entry>Notes</entry>
+         </row>
+        </thead>
+        <tbody>
+         <row>
+          <entry><literal>startup_params_format</literal></entry>
+          <entry><literal>int8</literal></entry>
+          <entry><literal>1</literal></entry>
+          <entry>The format version of this startup parameter set. Always the digit 1 (0x31), null terminated.</entry>
+         </row>
+         <row>
+          <entry><literal>max_proto_version</literal></entry>
+          <entry><literal>int32</literal></entry>
+          <entry><literal>1</literal></entry>
+          <entry>Newest version of the protocol supported by client. Output plugin must ERROR if supported version too old. *Required*, ERROR if missing.</entry>
+         </row>
+         <row>
+          <entry><literal>min_proto_version</literal></entry>
+          <entry><literal>int32</literal></entry>
+          <entry><literal>1</literal></entry>
+          <entry>Oldest version of the protocol supported by client. Output plugin must ERROR if supported version too old. *Required*, ERROR if missing.</entry>
+         </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-client-options-capabilities">
+     <title>Client requirements and capabilities</title>
+
+     <table id="pglogical-client-options-capabilities-t">
+      <title>Client requirements and capabilites</title>
+      <tgroup cols="4">
+       <thead>
+        <row>
+         <entry>Key</entry>
+         <entry>Type</entry>
+         <entry>Default</entry>
+         <entry>Notes</entry>
+        </row>
+       </thead>
+       <tbody>
+        <row>
+         <entry><literal>expected_encoding</literal></entry>
+         <entry><literal>string</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>
+          The text encoding the downstream expects field values to be in.
+          Applies to text, binary and internal representations of field values
+          in native format. Has no effect on other protocol content. If
+          specified, the upstream must honour it or ERROR. For json protocol,
+          must be unset or match <literal>client_encoding</literal>. (Current
+          plugin versions ERROR if this is set for the native protocol and not
+          equal to the upstream database's encoding).
+         </entry>
+        </row>
+        <row>
+         <entry><literal>want_coltypes</literal></entry>
+         <entry><literal>boolean</literal></entry>
+         <entry><literal>false</literal></entry>
+         <entry>The client wants to receive data type information about columns.</entry>
+        </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-client-options-clientinfo">
+     <title>General client information</title>
+
+     <para>
+      These keys tell the output plugin about the client. They're mainly for
+      informational purposes. In particular, the versions must
+      <emphasis>not</emphasis> be used to determine compatibility for internal
+      or binary format, as non-PostgreSQL clients will simply not send them
+      at all but may still understand internal-format or binary-format
+      (send/recv) format fields.
+     </para>
+
+     <table id="pglogical-client-options-clientinfo-t">
+      <title>General client information</title>
+      <tgroup cols="4">
+       <thead>
+        <row>
+         <entry>Key</entry>
+         <entry>Type</entry>
+         <entry>Default</entry>
+         <entry>Notes</entry>
+        </row>
+       </thead>
+       <tbody>
+        <row>
+         <entry><literal>pg_version_num</literal></entry>
+         <entry><literal>integer</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>PostgreSQL server_version_num of client, if it's PostgreSQL. e.g. 090400</entry>
+        </row>
+        <row>
+         <entry><literal>pg_version</literal></entry>
+         <entry><literal>string</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>PostgreSQL <literal>server_version</literal> of client, if it's PostgreSQL.</entry>
+        </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+
+    <sect4 id="pglogical-client-options-binary">
+     <title>Parameters relating to exchange of binary values</title>
+
+     <para>
+      The downstream may specify to the upstream that it is capable of
+      understanding <literal>binary</literal> (send/recv binary interchange)
+      and/or <literal>internal</literal> (raw PostgreSQL internal data
+      structure) data formats by setting the
+      <literal>binary.want_binary_basetypes</literal> and/or
+      <literal>binary.want_internal_basetypes</literal> options, or other
+      yet-to-be-defined options.
+     </para>
+
+     <para>
+      An upstream output plugin that does not support one or both formats
+      <emphasis>may</emphasis> ignore the downstream's binary support and send text
+      format, in which case it may ignore all binary. parameters. All
+      downstreams <emphasis>must</emphasis> support text format. An upstream output
+      plugin <emphasis>must not</emphasis> send internal binary format or
+      send/recv binary format unless the downstream has announced it can
+      receive it. If both upstream and downstream support both formats an
+      upstream should prefer binary format and fall back to send/recv, then to
+      text, if compatibility requires.
+     </para>
+
+     <para>
+      Internal and binary format selection should be done on a type-by-type
+      basis. It is quite normal to send 'text' format for extension types
+      while sending binary for built-in types.
+     </para>
+
+     <para>
+      The downstream <emphasis>must</emphasis> specify its compatibility
+      requirements for internal and binary data if it requests either or both
+      formats. The upstream <emphasis>must</emphasis> honour these by falling
+      back from internal to binary, and from binary to text, where the
+      upstream and downstream are not compatible.
+     </para>
+
+     <para>
+      An unspecified compatibility field <emphasis>must</emphasis> presumed to
+      be unsupported by the downstream so that older clients that don't know
+      about a change in a newer version don't receive unexpected data. For
+      example, in the unlikely event that some hypothetical future version
+      like PostgreSQL 99.8 switched to 128-bit DPD (Densely Packed Decimal)
+      representations of NUMERIC instead of the current arbitrary-length BCD
+      (Binary Coded Decimal) format, a new binary.dpd_numerics parameter would
+      be added. Clients that didn't know about the change wouldn't know to set
+      it, so the upstream would presume it unsupported and send text format
+      NUMERIC to those clients. This also means that clients that support the
+      new format wouldn't be able to receive the old format in binary from
+      older servers since they'd specify dpd_numerics = true in their
+      compatibility parameters.
+     </para>
+
+     <para>
+      At this time a downstream may specify compatibility with only one value
+      for a given option; i.e. a downstream cannot say it supports both 4-byte
+      and 8-byte sizeof(int). Leaving it unspecified means the upstream must
+      assume the downstream supports neither. (A future protocol extension may
+      allow clients to specify alternative sets of supported formats).
+     </para>
+
+     <para>
+      The <literal>pg_version</literal> option <emphasis>must not</emphasis>
+      be used to decide compatibility. Use
+      <literal>binary.basetypes_major_version</literal> instead.
+     </para>
+
+     <para>
+      The upstream sends similar parameters to the downstream in the startup
+      reply message; see <xref linkend="pglogical-output-binary-parameters"/>.
+      A client may use these to determine what the server's configuration is.
+     </para>
+
+     <table id="pglogical-client-options-binary-t">
+      <title>Parameters relating to exchange of binary values</title>
+      <tgroup cols="4">
+       <thead>
+        <row>
+         <entry>Key name</entry>
+         <entry>Value type</entry>
+         <entry>Default</entry>
+         <entry>Description</entry>
+        </row>
+       </thead>
+       <tbody>
+        <row>
+         <entry><literal>binary.want_binary_basetypes</literal></entry>
+         <entry><literal>boolean</literal></entry>
+         <entry><literal>false</literal></entry>
+         <entry>True if the client accepts binary interchange (send/recv) format rows for PostgreSQL built-in base types.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.want_internal_basetypes</literal></entry>
+         <entry><literal>boolean</literal></entry>
+         <entry><literal>false</literal></entry>
+         <entry>True if the client accepts PostgreSQL internal-format binary output for base PostgreSQL types not otherwise specified elsewhere.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.basetypes_major_version</literal></entry>
+         <entry><literal>uint16</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>
+          The PostgreSQL major version (x.y) the downstream expects binary and
+          send/recv format values to be in. Represented as an integer in XXYY
+          format (no leading zero since it's an integer), e.g. 9.5 is 905.
+          This corresponds to <literal>PG_VERSION_NUM</literal>/100 in PostgreSQL.
+         </entry>
+        </row>
+        <row>
+         <entry><literal>binary.sizeof_int</literal></entry>
+         <entry><literal>uint8</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry><literal>sizeof(int)</literal> on the downstream.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.sizeof_long</literal></entry>
+         <entry><literal>uint8</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry><literal>sizeof(long)</literal> on the downstream.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.sizeof_datum</literal></entry>
+         <entry><literal>uint8</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>Same as <literal>sizeof_int</literal>, but for the PostgreSQL Datum typedef.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.maxalign</literal></entry>
+         <entry><literal>uint8</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>Downstream PostgreSQL server's maxalign value - platform dependent, determined at build time.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.bigendian</literal></entry>
+         <entry><literal>bool</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>True iff the downstream is big-endian.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.float4_byval</literal></entry>
+         <entry><literal>bool</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>Downstream PostgreSQL's <literal>float4_byval</literal> compile option.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.float8_byval</literal></entry>
+         <entry><literal>bool</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>Downstream PostgreSQL's <literal>float8_byval</literal> compile option.</entry>
+        </row>
+        <row>
+         <entry><literal>binary.integer_datetimes</literal></entry>
+         <entry><literal>bool</literal></entry>
+         <entry><literal>null</literal></entry>
+         <entry>Downstream PostgreSQL's <literal>integer_datetimes</literal> compile option.</entry>
+        </row>
+       </tbody>
+      </tgroup>
+     </table>
+    </sect4>
+   </sect3>
+
+   <sect3 id="pglogical-extensibility">
+    <title>Extensibility</title>
+
+    <para>
+     Because of the use of optional parameters in output plugin arguments, and
+     the confirmation/response sent in the startup packet, a basic handshake is
+     possible between upstream and downstream, allowing negotiation of
+     capabilities.
+    </para>
+
+    <para>
+     The output plugin must never send non-optional data or change its wire
+     format without confirmation from the client that it can understand the new
+     data. It may send optional data without negotiation.
+    </para>
+
+    <para>
+      When extending the output plugin arguments, add-ons are expected to
+      prefix all keys with the extension name, and should preferably use a
+      single top level key with a json object value to carry their extension
+      information. Additions to the startup message should follow the same
+      pattern.
+    </para>
+
+    <para>
+     Hooks and plugins can be used to add functionality specific to a client.
+    </para>
+   </sect3>
+
+   <sect3 id="pglogical-output-json-protocol" xreflabel="pglogical JSON protocol">
+    <title>JSON protocol</title>
+
+    <para>
+     If <literal>proto_format</literal> is set to <literal>json</literal> then
+     the output plugin will emit <acronym>JSON</acronym> instead of the custom
+     binary protocol.  <acroynm>JSON</acronym> support is intended mainly for
+     debugging and diagnostics.
+    </para>
+
+    <para>
+     The <acronym>JSON</acronym> format supports all the same hooks.
+    </para>
+  </sect3>
+ </sect2>
+</sect1>

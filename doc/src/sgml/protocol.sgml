@@ -1018,7 +1018,7 @@
     CopyData or CopyDone may be treated as terminating copy-out mode.
    </para>
 
-   <para>
+   <para id="protocol-copy-both" xreflabel="COPY BOTH">
     There is another Copy-related mode called copy-both, which allows
     high-speed bulk data transfer to <emphasis>and</> from the server.
     Copy-both mode is initiated when a backend in walsender mode
@@ -1328,7 +1328,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
 <para>
 The commands accepted in walsender mode are:
 <variablelist>
-  <varlistentry>
+  <varlistentry id="protocol-replication-identifysystem" xreflabel="IDENTIFY_SYSTEM">
     <term><literal>IDENTIFY_SYSTEM</literal>
      <indexterm><primary>IDENTIFY_SYSTEM</primary></indexterm>
     </term>
@@ -1393,7 +1393,7 @@ The commands accepted in walsender mode are:
     </listitem>
   </varlistentry>
 
-  <varlistentry>
+  <varlistentry id="protocol-replication-timelinehistory" xreflabel="TIMELINE_HISTORY">
     <term><literal>TIMELINE_HISTORY</literal> <replaceable class="parameter">tli</replaceable>
      <indexterm><primary>TIMELINE_HISTORY</primary></indexterm>
     </term>
@@ -1433,7 +1433,7 @@ The commands accepted in walsender mode are:
     </listitem>
   </varlistentry>
 
-  <varlistentry>
+  <varlistentry id="protocol-replication-createslot" xreflabel="CREATE_REPLICATION_SLOT">
    <term><literal>CREATE_REPLICATION_SLOT</literal> <replaceable class="parameter">slot_name</> { <literal>PHYSICAL</> [ <literal>RESERVE_WAL</> ] | <literal>LOGICAL</> <replaceable class="parameter">output_plugin</> }
      <indexterm><primary>CREATE_REPLICATION_SLOT</primary></indexterm>
     </term>
@@ -1468,17 +1468,67 @@ The commands accepted in walsender mode are:
        <term><literal>RESERVE_WAL</></term>
        <listitem>
         <para>
-         Specify that this physical replication reserves <acronym>WAL</>
-         immediately.  Otherwise, <acronym>WAL</> is only reserved upon
-         connection from a streaming replication client.
+         Specify that this <literal>PHYSICAL</literal> replication slot
+         reserves <acronym>WAL</> immediately.  Otherwise, <acronym>WAL</> is
+         only reserved upon connection from a streaming replication client. Has
+         no effect for <literal>LOGICAL</literal> connections.
         </para>
        </listitem>
       </varlistentry>
      </variablelist>
+
+     <para>
+      On success the command returns a result-set containing a single row.
+      <variablelist>
+       <varlistentry>
+        <term>slot_name</term>
+        <listitem>
+         <para>
+          The name of the slot that was created
+         </para>
+        </listitem>
+       </varlistentry>
+       <varlistentry>
+        <term>consistent_point</term>
+        <listitem>
+         <para>
+          The LSN (xlog position) at which the slot became consistent.
+         </para>
+        </listitem>
+       </varlistentry>
+       <varlistentry>
+        <term>snapshot_name</term>
+        <listitem>
+         <para>
+          For <literal>LOGICAL</literal> slots, the name of the snapshot
+          exported by this slot creation command. See
+          <link linkend="logicaldecoding-exported-snapshots"> exported
+          snapshots</link> for details.
+         </para>
+         <para>
+          For <literal>PHYSICAL</literal> slots, null or the empty string.
+         </para>
+        </listitem>
+       </varlistentry>
+       <varlistentry>
+        <term>output_plugin</term>
+        <listitem>
+         <para>
+          For <literal>LOGICAL</literal> slots, the logical decoding output
+          plugin name.
+         </para>
+         <para>
+          For <literal>PHYSICAL</literal> slots, null or the empty string.
+         </para>
+        </listitem>
+       </varlistentry>
+      </variablelist>
+     </para>
+
     </listitem>
   </varlistentry>
 
-  <varlistentry>
+  <varlistentry id="protocol-replication-startphysical" xreflabel="START_REPLICATION">
     <term><literal>START_REPLICATION</literal> [ <literal>SLOT</literal> <replaceable class="parameter">slot_name</> ] [ <literal>PHYSICAL</literal> ] <replaceable class="parameter">XXX/XXX</> [ <literal>TIMELINE</literal> <replaceable class="parameter">tli</> ]
      <indexterm><primary>START_REPLICATION</primary></indexterm>
     </term>
@@ -1668,7 +1718,7 @@ The commands accepted in walsender mode are:
 
      <para>
       <variablelist>
-      <varlistentry>
+      <varlistentry id="protocol-replication-standbystatusupdate">
       <term>
           Standby status update (F)
       </term>
@@ -1808,7 +1858,8 @@ The commands accepted in walsender mode are:
      </para>
     </listitem>
   </varlistentry>
-  <varlistentry>
+
+  <varlistentry id="protocol-replication-startlogical" xreflabel="START_REPLICATION ... LOGICAL">
     <term><literal>START_REPLICATION</literal> <literal>SLOT</literal> <replaceable class="parameter">slot_name</> <literal>LOGICAL</literal> <replaceable class="parameter">XXX/XXX</> [ ( <replaceable>option_name</replaceable> [ <replaceable>option_value</replaceable> ] [, ...] ) ]</term>
     <listitem>
      <para>
@@ -1870,7 +1921,7 @@ The commands accepted in walsender mode are:
     </listitem>
   </varlistentry>
 
-  <varlistentry>
+  <varlistentry id="protocol-replication-dropslot" xreflabel="DROP_REPLICATION_SLOT">
     <term><literal>DROP_REPLICATION_SLOT</literal> <replaceable class="parameter">slot_name</>
      <indexterm><primary>DROP_REPLICATION_SLOT</primary></indexterm>
     </term>
@@ -1892,7 +1943,7 @@ The commands accepted in walsender mode are:
     </listitem>
   </varlistentry>
 
-  <varlistentry>
+  <varlistentry id="protocol-replication-basebackup" xreflabel="BASE_BACKUP">
     <term><literal>BASE_BACKUP</literal> [ <literal>LABEL</literal> <replaceable>'label'</replaceable> ] [ <literal>PROGRESS</literal> ] [ <literal>FAST</literal> ] [ <literal>WAL</literal> ] [ <literal>NOWAIT</literal> ] [ <literal>MAX_RATE</literal> <replaceable>rate</replaceable> ] [ <literal>TABLESPACE_MAP</literal> ]
      <indexterm><primary>BASE_BACKUP</primary></indexterm>
     </term>

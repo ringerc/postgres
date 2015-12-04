@@ -192,8 +192,9 @@ $ pg_recvlogical -d postgres --slot test --drop-slot
     </para>
    </sect2>
 
-   <sect2>
-    <title>Replication Slots</title>
+   <sect2 id="logicaldecoding-replication-slots"
+        xreflabel="Logical Replication slots">
+    <title>Logical Replication Slots</title>
 
     <indexterm>
      <primary>replication slot</primary>
@@ -236,7 +237,12 @@ $ pg_recvlogical -d postgres --slot test --drop-slot
      may consume changes from a slot at any given time.
     </para>
 
-    <note>
+    <important id="logicaldecoding-replication-slots-walretention">
+     <para>
+      Unused replication slots can cause <filename>pg_xlog</filename>
+      to fill up and the system catalogs to grow. This can cause the database
+      to stop working.
+     </para>
      <para>
       Replication slots persist across crashes and know nothing about the state
       of their consumer(s). They will prevent removal of required resources
@@ -245,7 +251,18 @@ $ pg_recvlogical -d postgres --slot test --drop-slot
       can be removed by <command>VACUUM</command> as long as they are required by a replication
       slot.  So if a slot is no longer required it should be dropped.
      </para>
-    </note>
+     <para>It is important to drop a replication slot if the client
+      using it will not be used anymore or will be inactive for a very long
+      period. Dropping a replication slot discards information about
+      replication progress, so clients usually have to be reinitialized as if
+      connecting for the first time.
+     </para>
+     <para>
+      If the original client is no longer available the server administrator
+      may drop the slot with <xref linkend="func-pg-drop-replication-slot"/>
+      instead.
+     </para>
+    </important>
    </sect2>
 
    <sect2>
@@ -256,10 +273,10 @@ $ pg_recvlogical -d postgres --slot test --drop-slot
     </para>
    </sect2>
 
-   <sect2>
+   <sect2 id="logicaldecoding-exported-snapshots">
     <title>Exported Snapshots</title>
     <para>
-     When a new replication slot is created using the streaming replication interface,
+     When a new logical replication slot is created using the streaming replication interface,
      a snapshot is exported
      (see <xref linkend="functions-snapshot-synchronization">), which will show
      exactly the state of the database after which all changes will be
@@ -269,6 +286,15 @@ $ pg_recvlogical -d postgres --slot test --drop-slot
      the slot was created. This transaction can then be used to dump the
      database's state at that point in time, which afterwards can be updated
      using the slot's contents without losing any changes.
+    </para>
+    <para>
+     The snapshot may be attached to only until another command is executed on
+     the replication protocol connection that created it or the connection is
+     closed. There is no way to re-export the snapshot from a slot.
+    </para>
+    <para>
+     The function interface to slot creation does not allow access to the
+     exported snapshot.
     </para>
    </sect2>
   </sect1>

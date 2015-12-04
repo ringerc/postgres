@@ -17279,7 +17279,7 @@ postgres=# SELECT * FROM pg_xlogfile_name_offset(pg_stop_backup());
        </entry>
       </row>
       <row>
-       <entry>
+       <entry id="func-pg-drop-replication-slot" xreflabel="pg_drop_replication_slot">
         <indexterm>
          <primary>pg_drop_replication_slot</primary>
         </indexterm>
@@ -17296,7 +17296,7 @@ postgres=# SELECT * FROM pg_xlogfile_name_offset(pg_stop_backup());
       </row>
 
       <row>
-       <entry>
+       <entry id="func-pg-create-logical-replication-slot" xreflabel="pg_create_logical_replication_slot">
         <indexterm>
          <primary>pg_create_logical_replication_slot</primary>
         </indexterm>
