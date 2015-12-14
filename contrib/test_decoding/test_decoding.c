@@ -45,6 +45,7 @@ typedef struct
 	bool		skip_empty_xacts;
 	bool		xact_wrote_changes;
 	bool		only_local;
+	bool		include_sequences;
 } TestDecodingData;
 
 static void pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
@@ -64,6 +65,9 @@ static void pg_decode_change(LogicalDecodingContext *ctx,
 static bool pg_decode_filter(LogicalDecodingContext *ctx,
 				 RepOriginId origin_id);
 
+static void pg_decode_seq_advance(LogicalDecodingContext *ctx,
+		const char * seq_name, uint64 last_value);
+
 void
 _PG_init(void)
 {
@@ -82,6 +86,7 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->commit_cb = pg_decode_commit_txn;
 	cb->filter_by_origin_cb = pg_decode_filter;
 	cb->shutdown_cb = pg_decode_shutdown;
+	cb->seq_advance_cb = pg_decode_seq_advance;
 }
 
 
@@ -172,6 +177,17 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 				  errmsg("could not parse value \"%s\" for parameter \"%s\"",
 						 strVal(elem->arg), elem->defname)));
 		}
+		else if (strcmp(elem->defname, "include-sequences") == 0)
+		{
+
+			if (elem->arg == NULL)
+				data->include_sequences = true;
+			else if (!parse_bool(strVal(elem->arg), &data->include_sequences))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				  errmsg("could not parse value \"%s\" for parameter \"%s\"",
+						 strVal(elem->arg), elem->defname)));
+		}
 		else
 		{
 			ereport(ERROR,
@@ -249,6 +265,23 @@ pg_decode_filter(LogicalDecodingContext *ctx,
 	if (data->only_local && origin_id != InvalidRepOriginId)
 		return true;
 	return false;
+}
+
+static void
+pg_decode_seq_advance(LogicalDecodingContext *ctx, const char * seq_name,
+		uint64 last_value)
+{
+	TestDecodingData *data = ctx->output_plugin_private;
+
+	if (!data->include_sequences)
+		return;
+
+	OutputPluginPrepareWrite(ctx, true);
+
+	appendStringInfo(ctx->out, "sequence %s advanced to "UINT64_FORMAT,
+			seq_name, last_value);
+
+	OutputPluginWrite(ctx, true);
 }
 
 /*

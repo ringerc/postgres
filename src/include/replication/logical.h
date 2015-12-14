@@ -99,4 +99,7 @@ extern void LogicalConfirmReceivedLocation(XLogRecPtr lsn);
 
 extern bool filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id);
 
+extern void seq_advance_cb_wrapper(LogicalDecodingContext *ctx,
+		XLogRecPtr change_lsn, const char * seq_name, uint64 last_value);
+
 #endif

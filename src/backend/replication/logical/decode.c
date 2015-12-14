@@ -37,6 +37,8 @@
 
 #include "catalog/pg_control.h"
 
+#include "commands/sequence.h"
+
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/reorderbuffer.h"
@@ -58,6 +60,7 @@ static void DecodeHeapOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeHeap2Op(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeXactOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeStandbyOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
+static void DecodeSeqOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -70,6 +73,9 @@ static void DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 			 xl_xact_parsed_commit *parsed, TransactionId xid);
 static void DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 			xl_xact_parsed_abort *parsed, TransactionId xid);
+
+static void DecodeSeqAdvance(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
+			Form_pg_sequence seq);
 
 /* common function to decode tuples */
 static void DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tup);
@@ -107,6 +113,10 @@ LogicalDecodingProcessRecord(LogicalDecodingContext *ctx, XLogReaderState *recor
 			DecodeStandbyOp(ctx, &buf);
 			break;
 
+		case RM_SEQ_ID:
+			DecodeSeqOp(ctx, &buf);
+			break;
+
 		case RM_HEAP2_ID:
 			DecodeHeap2Op(ctx, &buf);
 			break;
@@ -130,7 +140,6 @@ LogicalDecodingProcessRecord(LogicalDecodingContext *ctx, XLogReaderState *recor
 		case RM_HASH_ID:
 		case RM_GIN_ID:
 		case RM_GIST_ID:
-		case RM_SEQ_ID:
 		case RM_SPGIST_ID:
 		case RM_BRIN_ID:
 		case RM_COMMIT_TS_ID:
@@ -301,6 +310,30 @@ DecodeStandbyOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		default:
 			elog(ERROR, "unexpected RM_STANDBY_ID record type: %u", info);
 	}
+}
+
+static void
+DecodeSeqOp(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+{
+	SnapBuild  *builder = ctx->snapshot_builder;
+	uint8       info = XLogRecGetInfo(buf->record) & ~XLR_INFO_MASK;
+	xl_seq_rec *xlrec = (xl_seq_rec *) XLogRecGetData(buf->record);
+	HeapTuple   item;
+	Form_pg_sequence seq;
+
+	/* no point in doing anything yet */
+	if (SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT)
+		return;
+
+	if (info != XLOG_SEQ_LOG)
+		elog(PANIC, "DecodeSeqOp: unknown sequence xlog op code %u", info);
+
+	/* nextval_internal etc write a xl_seq_rec immediately followed by a HeapTupleData */
+	item = (HeapTuple)((char*)xlrec + sizeof(xl_seq_rec));
+
+	seq = (Form_pg_sequence)((char*)item + HEAPTUPLESIZE);
+
+	DecodeSeqAdvance(ctx, buf, seq);
 }
 
 /*
@@ -836,6 +869,31 @@ DecodeSpecConfirm(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	change->data.tp.clear_toast_afterwards = true;
 
 	ReorderBufferQueueChange(ctx->reorder, XLogRecGetXid(r), buf->origptr, change);
+}
+
+static void
+DecodeSeqAdvance(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
+		Form_pg_sequence seq)
+{
+	XLogReaderState *r = buf->record;
+	RelFileNode target_node;
+
+	/* If the output plugin isn't interested, don't waste any time */
+	if (ctx->callbacks.seq_advance_cb == NULL)
+		return;
+
+	/* only interested in our database */
+	XLogRecGetBlockTag(r, 0, &target_node, NULL, NULL);
+	if (target_node.dbNode != ctx->slot->data.database)
+		return;
+
+	/*
+	 * Because sequences are updated outside transaction boundaries there
+	 * is no need to use a reorder buffer here. We invoke the logical
+	 * decoding plugin callback immediately.
+	 */
+	seq_advance_cb_wrapper(ctx, buf->origptr, NameStr(seq->sequence_name),
+			seq->last_value);
 }
 
 

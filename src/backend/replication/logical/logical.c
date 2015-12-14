@@ -560,7 +560,7 @@ shutdown_cb_wrapper(LogicalDecodingContext *ctx)
 
 	/* Push callback + info on the error context stack */
 	state.ctx = ctx;
-	state.callback_name = "shutdown";
+	state.callback_name = "filter_by_origin";
 	state.report_location = InvalidXLogRecPtr;
 	errcallback.callback = output_plugin_error_callback;
 	errcallback.arg = (void *) &state;
@@ -701,6 +701,32 @@ filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id)
 
 	return ret;
 }
+
+void
+seq_advance_cb_wrapper(LogicalDecodingContext *ctx, XLogRecPtr change_lsn,
+		const char * seq_name, uint64 last_value)
+{
+	LogicalErrorCallbackState state;
+	ErrorContextCallback errcallback;
+
+	/* Push callback + info on the error context stack */
+	state.ctx = ctx;
+	state.callback_name = "advance_seq";
+	state.report_location = change_lsn;
+	errcallback.callback = output_plugin_error_callback;
+	errcallback.arg = (void *) &state;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	ctx->accept_writes = true;
+
+	/* do the actual work: call callback */
+	ctx->callbacks.seq_advance_cb(ctx, seq_name, last_value);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
+}
+
 
 /*
  * Set the required catalog xmin horizon for historic snapshots in the current

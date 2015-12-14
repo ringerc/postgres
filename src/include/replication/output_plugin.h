@@ -88,6 +88,21 @@ typedef void (*LogicalDecodeShutdownCB) (
 );
 
 /*
+ * A sequence has been advanced, with a new chunk allocated and written
+ * to WAL.
+ *
+ * This doesn't happen every time nextval() is called, there's caching.  It's
+ * guaranteed that the new sequence position will be at or ahead of the most
+ * recent value any committed xact has obtained when this callback is invoked.
+ */
+typedef void (*LogicalDecodeSeqAdvanceCB) (
+											struct LogicalDecodingContext *,
+											const char * seq_name,
+											uint64 last_value
+		);
+
+
+/*
  * Output plugin callbacks
  */
 typedef struct OutputPluginCallbacks
@@ -98,6 +113,7 @@ typedef struct OutputPluginCallbacks
 	LogicalDecodeCommitCB commit_cb;
 	LogicalDecodeFilterByOriginCB filter_by_origin_cb;
 	LogicalDecodeShutdownCB shutdown_cb;
+	LogicalDecodeSeqAdvanceCB seq_advance_cb;
 } OutputPluginCallbacks;
 
 void		OutputPluginPrepareWrite(struct LogicalDecodingContext *ctx, bool last_write);
