@@ -23,6 +23,7 @@ DROP SEQUENCE test_seq;
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1', 'include-sequences', '1');
 
 
+
 CREATE SEQUENCE test2_seq MINVALUE 100 MAXVALUE 200 START 200 INCREMENT BY -1 CYCLE;
 
 SELECT sum(nextval('test2_seq')) FROM generate_series(1, 300);
@@ -30,6 +31,20 @@ SELECT sum(nextval('test2_seq')) FROM generate_series(1, 300);
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1', 'include-sequences', '1');
 
 DROP SEQUENCE test2_seq;
+
+
+
+CREATE SEQUENCE renameseq;
+
+SELECT nextval('renameseq') FROM generate_series(1,100);
+
+ALTER SEQUENCE renameseq RENAME TO renamed;
+
+SELECT nextval('renamed') FROM generate_series(1,100);
+
+SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1', 'include-sequences', '1');
+
+DROP SEQUENCE renamed;
 
 
 SELECT pg_drop_replication_slot('regression_slot');
