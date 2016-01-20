@@ -988,12 +988,24 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 
 	/*
 	 * Initialize position to the last ack'ed one, then the xlog records begin
-	 * to be shipped from that position.
+	 * to be shipped from that position. Any decoding plugin startup callback
+	 * is invoked at this point.
 	 */
-	logical_decoding_ctx = CreateDecodingContext(
-											   cmd->startpoint, cmd->options,
-												 logical_read_xlog_page,
-										WalSndPrepareWrite, WalSndWriteData);
+	PG_TRY();
+	{
+		logical_decoding_ctx = CreateDecodingContext(
+												   cmd->startpoint, cmd->options,
+													 logical_read_xlog_page,
+											WalSndPrepareWrite, WalSndWriteData);
+	}
+	PG_CATCH();
+	{
+		pq_putmessage_noblock('c', NULL, 0);
+		pq_flush();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 
 	/* Start reading WAL from the oldest required WAL. */
 	logical_startptr = MyReplicationSlot->data.restart_lsn;
