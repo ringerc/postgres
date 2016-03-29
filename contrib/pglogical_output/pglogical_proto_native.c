@@ -11,41 +11,20 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include "miscadmin.h"
-
 #include "pglogical_output.h"
-#include "pglogical_relmetacache.h"
-#include "pglogical_proto_native.h"
 
 #include "access/sysattr.h"
 #include "access/tuptoaster.h"
-#include "access/xact.h"
-
-#include "catalog/catversion.h"
-#include "catalog/index.h"
-
-#include "catalog/namespace.h"
-#include "catalog/pg_class.h"
-#include "catalog/pg_database.h"
-#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
-
-#include "commands/dbcommands.h"
-
-#include "executor/spi.h"
-
 #include "libpq/pqformat.h"
-
-#include "mb/pg_wchar.h"
-
-#include "utils/builtins.h"
+#include "nodes/parsenodes.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/timestamp.h"
-#include "utils/typcache.h"
+
+#include "pglogical_output_internal.h"
+#include "pglogical_relmetacache.h"
+#include "pglogical_proto_native.h"
 
 #define IS_REPLICA_IDENTITY 1
 
@@ -62,17 +41,15 @@ static char decide_datum_transfer(Form_pg_attribute att,
  */
 void
 pglogical_write_rel(StringInfo out, PGLogicalOutputData *data, Relation rel,
-		struct PGLRelMetaCacheEntry *cache_entry)
+		PGLRelMetaCacheEntry *cache_entry)
 {
-	const char *nspname;
+	char	   *nspname;
 	uint8		nspnamelen;
 	const char *relname;
 	uint8		relnamelen;
 	uint8		flags = 0;
 
-	/* must not have cache entry if metacache off; must have entry if on */
-	Assert( (data->relmeta_cache_size == 0) == (cache_entry == NULL) );
-	/* if cache enabled must never be called with an already-cached rel */
+	/* must never be called with an already-cached rel */
 	Assert(cache_entry == NULL || !cache_entry->is_cached);
 
 	pq_sendbyte(out, 'R');		/* sending RELATION */
@@ -112,6 +89,8 @@ pglogical_write_rel(StringInfo out, PGLogicalOutputData *data, Relation rel,
 	 */
 	if (cache_entry != NULL)
 		cache_entry->is_cached = true;
+
+	pfree(nspname);
 }
 
 /*
@@ -165,6 +144,8 @@ pglogical_write_attrs(StringInfo out, Relation rel)
 		pq_sendint(out, len, 2);
 		pq_sendbytes(out, attname, len); /* data */
 	}
+
+	bms_free(idattrs);
 }
 
 /*

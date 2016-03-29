@@ -11,51 +11,24 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include "pglogical_output/compat.h"
-#include "pglogical_config.h"
 #include "pglogical_output.h"
-#include "pglogical_proto.h"
-#include "pglogical_hooks.h"
-#include "pglogical_relmetacache.h"
-
-#include "access/hash.h"
-#include "access/sysattr.h"
-#include "access/xact.h"
-
-#include "catalog/pg_class.h"
-#include "catalog/pg_proc.h"
-#include "catalog/pg_type.h"
 
 #include "mb/pg_wchar.h"
-
-#include "nodes/parsenodes.h"
-
-#include "parser/parse_func.h"
-
-#include "replication/output_plugin.h"
 #include "replication/logical.h"
 #ifdef HAVE_REPLICATION_ORIGINS
 #include "replication/origin.h"
 #endif
 
-#include "utils/builtins.h"
-#include "utils/catcache.h"
-#include "utils/guc.h"
-#include "utils/int8.h"
-#include "utils/inval.h"
-#include "utils/lsyscache.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
-#include "utils/relcache.h"
-#include "utils/syscache.h"
-#include "utils/typcache.h"
+#include "pglogical_config.h"
+#include "pglogical_output_internal.h"
+#include "pglogical_proto.h"
+#include "pglogical_hooks.h"
+#include "pglogical_relmetacache.h"
 
 PG_MODULE_MAGIC;
 
 extern void		_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
-/* These must be available to pg_dlsym() */
 static void pg_decode_startup(LogicalDecodingContext * ctx,
 							  OutputPluginOptions *opt, bool is_init);
 static void pg_decode_shutdown(LogicalDecodingContext * ctx);
@@ -102,7 +75,7 @@ check_binary_compatibility(PGLogicalOutputData *data)
 	if (data->client_binary_bigendian_set
 		&& data->client_binary_bigendian != server_bigendian())
 	{
-		elog(DEBUG1, "Binary mode rejected: Server and client endian mis-match");
+		elog(DEBUG1, "Binary mode rejected: Server and client endian mismatch");
 		return false;
 	}
 
@@ -300,7 +273,7 @@ pg_decode_startup(LogicalDecodingContext * ctx, OutputPluginOptions *opt,
 		}
 
 		/*
-		 * It's obviously not possible to send binary representatio of data
+		 * It's obviously not possible to send binary representation of data
 		 * unless we use the binary output.
 		 */
 		if (opt->output_type == OUTPUT_PLUGIN_BINARY_OUTPUT &&
@@ -331,7 +304,8 @@ pg_decode_startup(LogicalDecodingContext * ctx, OutputPluginOptions *opt,
 		if (data->hooks_setup_funcname != NIL)
 		{
 
-			data->hooks_mctxt = AllocSetContextCreate(ctx->context,
+			data->hooks_session_mctxt =
+				AllocSetContextCreate(ctx->context,
 					"pglogical_output hooks context",
 					ALLOCSET_SMALL_MINSIZE,
 					ALLOCSET_SMALL_INITSIZE,
@@ -341,49 +315,14 @@ pg_decode_startup(LogicalDecodingContext * ctx, OutputPluginOptions *opt,
 			call_startup_hook(data, ctx->output_plugin_options);
 		}
 
-		if (data->client_relmeta_cache_size < -1)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("relmeta_cache_size must be -1, 0, or positive")));
-		}
-
-		/*
-		 * Relation metadata cache configuration.
-		 *
-		 * TODO: support fixed size cache
-		 *
-		 * Need a LRU for eviction, and need to implement a new message type for
-		 * cache purge notifications for clients. In the mean time force it to 0
-		 * (off). The client will be told via a startup param and must respect
-		 * that.
-		 */
-		if (data->client_relmeta_cache_size != 0
-				&& data->client_relmeta_cache_size != -1)
-		{
-			ereport(INFO,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fixed size cache not supported, forced to off"),
-					 errdetail("only relmeta_cache_size=0 (off) or relmeta_cache_size=-1 (unlimited) supported")));
-
-			data->relmeta_cache_size = 0;
-		}
-		else
-		{
-			/* ack client request */
-			data->relmeta_cache_size = data->client_relmeta_cache_size;
-		}
-
-		/* if cache enabled, init it */
-		if (data->relmeta_cache_size != 0)
-			pglogical_init_relmetacache(ctx->context);
+		pglogical_init_relmetacache(ctx->context);
 	}
 }
 
 /*
  * BEGIN callback
  */
-void
+static void
 pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
 	PGLogicalOutputData* data = (PGLogicalOutputData*)ctx->output_plugin_private;
@@ -430,7 +369,7 @@ pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 /*
  * COMMIT callback
  */
-void
+static void
 pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					 XLogRecPtr commit_lsn)
 {
@@ -439,9 +378,16 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	OutputPluginPrepareWrite(ctx, true);
 	data->api->write_commit(ctx->out, data, txn, commit_lsn);
 	OutputPluginWrite(ctx, true);
+
+	/*
+	 * Now is a good time to get rid of invalidated relation
+	 * metadata entries since nothing will be referencing them
+	 * at the moment.
+	 */
+	pglogical_prune_relmetacache();
 }
 
-void
+static void
 pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				 Relation relation, ReorderBufferChange *change)
 {
@@ -550,7 +496,7 @@ send_startup_message(LogicalDecodingContext *ctx,
 	data->api->write_startup_message(ctx->out, msg);
 	OutputPluginWrite(ctx, last_message);
 
-	pfree(msg);
+	list_free_deep(msg);
 
 	startup_message_sent = true;
 }
@@ -564,7 +510,7 @@ static void pg_decode_shutdown(LogicalDecodingContext * ctx)
 	pglogical_destroy_relmetacache();
 
 	/*
-	 * no need to delete data->context or data->hooks_mctxt as they're children
-	 * of ctx->context which will expire on return.
+	 * no need to delete data->context or data->hooks_session_mctxt as they're
+	 * children of ctx->context which will expire on return.
 	 */
 }

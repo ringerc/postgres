@@ -1,23 +1,20 @@
 #include "postgres.h"
+#include "pglogical_output.h"
 
 #include "access/xact.h"
-
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-
+#include "miscadmin.h"
+#include "parser/parse_func.h"
 #ifdef HAVE_REPLICATION_ORIGINS
 #include "replication/origin.h"
 #endif
-
-#include "parser/parse_func.h"
-
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
 
-#include "miscadmin.h"
-
 #include "pglogical_hooks.h"
-#include "pglogical_output.h"
+#include "pglogical_output_internal.h"
+
 
 /*
  * Returns Oid of the hooks function specified in funcname.
@@ -36,20 +33,12 @@ get_hooks_function_oid(List *funcname)
 	/* find the the function */
 	funcid = LookupFuncName(funcname, 1, funcargtypes, false);
 
-	/* Validate that the function returns void */
-	if (get_func_rettype(funcid) != VOIDOID)
+	/* Validate that the function returns internal */
+	if (get_func_rettype(funcid) != INTERNALOID)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("function %s must return void",
-						NameListToString(funcname))));
-	}
-
-	if (func_volatile(funcid) == PROVOLATILE_VOLATILE)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("function %s must not be VOLATILE",
+				 errmsg("function %s must return internal",
 						NameListToString(funcname))));
 	}
 
@@ -90,10 +79,13 @@ load_hooks(PGLogicalOutputData *data)
 
 	if (data->hooks_setup_funcname != NIL)
 	{
+		PGLogicalHooks *hooks;
+
 		hooks_func = get_hooks_function_oid(data->hooks_setup_funcname);
 
-		old_ctxt = MemoryContextSwitchTo(data->hooks_mctxt);
-		(void) OidFunctionCall1(hooks_func, PointerGetDatum(&data->hooks));
+		old_ctxt = MemoryContextSwitchTo(data->hooks_session_mctxt);
+		hooks = (PGLogicalHooks*)DatumGetPointer(OidFunctionCall1(
+					hooks_func, PointerGetDatum(data->hooks_session_mctxt)));
 		MemoryContextSwitchTo(old_ctxt);
 
 		elog(DEBUG3, "pglogical_output: Loaded hooks from function %u. Hooks are: \n"
@@ -103,11 +95,17 @@ load_hooks(PGLogicalOutputData *data)
 				"\ttxn_filter_hook: %p\n"
 				"\thooks_private_data: %p\n",
 				hooks_func,
-				data->hooks.startup_hook,
-				data->hooks.shutdown_hook,
-				data->hooks.row_filter_hook,
-				data->hooks.txn_filter_hook,
-				data->hooks.hooks_private_data);
+				hooks->startup_hook,
+				hooks->shutdown_hook,
+				hooks->row_filter_hook,
+				hooks->txn_filter_hook,
+				hooks->hooks_private_data);
+
+			data->hooks.startup_hook = hooks->startup_hook;
+			data->hooks.shutdown_hook = hooks->shutdown_hook;
+			data->hooks.row_filter_hook = hooks->row_filter_hook;
+			data->hooks.txn_filter_hook = hooks->txn_filter_hook;
+			data->hooks.hooks_private_data = hooks->hooks_private_data;
 	}
 
 	if (txn_started)
@@ -136,7 +134,7 @@ call_startup_hook(PGLogicalOutputData *data, List *plugin_params)
 			StartTransactionCommand();
 		}
 
-		old_ctxt = MemoryContextSwitchTo(data->hooks_mctxt);
+		old_ctxt = MemoryContextSwitchTo(data->hooks_session_mctxt);
 		(void) (*data->hooks.startup_hook)(&args);
 		MemoryContextSwitchTo(old_ctxt);
 
@@ -163,7 +161,7 @@ call_shutdown_hook(PGLogicalOutputData *data)
 
 		elog(DEBUG3, "calling pglogical shutdown hook");
 
-		old_ctxt = MemoryContextSwitchTo(data->hooks_mctxt);
+		old_ctxt = MemoryContextSwitchTo(data->hooks_session_mctxt);
 		(void) (*data->hooks.shutdown_hook)(&args);
 		MemoryContextSwitchTo(old_ctxt);
 
@@ -182,21 +180,19 @@ call_row_filter_hook(PGLogicalOutputData *data, ReorderBufferTXN *txn,
 		Relation rel, ReorderBufferChange *change)
 {
 	struct  PGLogicalRowFilterArgs hook_args;
-	MemoryContext old_ctxt;
 	bool ret = true;
 
 	if (data->hooks.row_filter_hook != NULL)
 	{
 		hook_args.change_type = change->action;
 		hook_args.private_data = data->hooks.hooks_private_data;
+		hook_args.txn = txn;
 		hook_args.changed_rel = rel;
 		hook_args.change = change;
 
 		elog(DEBUG3, "calling pglogical row filter hook");
 
-		old_ctxt = MemoryContextSwitchTo(data->hooks_mctxt);
 		ret = (*data->hooks.row_filter_hook)(&hook_args);
-		MemoryContextSwitchTo(old_ctxt);
 
 		/* Filter hooks shouldn't change the private data ptr */
 		Assert(data->hooks.hooks_private_data == hook_args.private_data);
@@ -212,7 +208,6 @@ call_txn_filter_hook(PGLogicalOutputData *data, RepOriginId txn_origin)
 {
 	struct PGLogicalTxnFilterArgs hook_args;
 	bool ret = true;
-	MemoryContext old_ctxt;
 
 	if (data->hooks.txn_filter_hook != NULL)
 	{
@@ -221,9 +216,7 @@ call_txn_filter_hook(PGLogicalOutputData *data, RepOriginId txn_origin)
 
 		elog(DEBUG3, "calling pglogical txn filter hook");
 
-		old_ctxt = MemoryContextSwitchTo(data->hooks_mctxt);
 		ret = (*data->hooks.txn_filter_hook)(&hook_args);
-		MemoryContextSwitchTo(old_ctxt);
 
 		/* Filter hooks shouldn't change the private data ptr */
 		Assert(data->hooks.hooks_private_data == hook_args.private_data);
