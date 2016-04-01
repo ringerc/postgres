@@ -85,10 +85,33 @@ Datum
 test_slot_timelines_advance_logical_slot(PG_FUNCTION_ARGS)
 {
 	char	   *slotname = text_to_cstring(PG_GETARG_TEXT_P(0));
-	TransactionId new_xmin = (TransactionId) PG_GETARG_INT64(1);
-	TransactionId new_catalog_xmin = (TransactionId) PG_GETARG_INT64(2);
-	XLogRecPtr	restart_lsn = PG_GETARG_LSN(3);
-	XLogRecPtr	confirmed_lsn = PG_GETARG_LSN(4);
+	TransactionId new_xmin;
+	TransactionId new_catalog_xmin;
+	XLogRecPtr	restart_lsn;
+	XLogRecPtr	confirmed_lsn;
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "slot name may not be null");
+
+	if (PG_ARGISNULL(1))
+		new_xmin = InvalidTransactionId;
+	else
+		new_xmin = (TransactionId) DatumGetTransactionId(PG_GETARG_DATUM(1));
+
+	if (PG_ARGISNULL(2))
+		new_catalog_xmin = InvalidTransactionId;
+	else
+		new_catalog_xmin = (TransactionId) DatumGetTransactionId(PG_GETARG_DATUM(2));
+
+	if (PG_ARGISNULL(3))
+		restart_lsn = InvalidXLogRecPtr;
+	else
+		restart_lsn = PG_GETARG_LSN(3);
+
+	if (PG_ARGISNULL(4))
+		confirmed_lsn = InvalidXLogRecPtr;
+	else
+		confirmed_lsn = PG_GETARG_LSN(4);
 
 	CheckSlotRequirements();
 
