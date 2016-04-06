@@ -38,3 +38,9 @@ uninstall:
 
 clean distclean maintainer-clean:
 	rm -f pg_xlogdump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogreader.c
+
+check:
+	$(prove_check)
+
+installcheck:
+	$(prove_installcheck)
