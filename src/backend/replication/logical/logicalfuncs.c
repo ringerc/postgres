@@ -236,8 +236,10 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 	PG_TRY();
 	{
 		/*
-		 * Passing InvalidXLogRecPtr here causes decoding to start returning
-		 * commited xacts to the client at the slot's confirmed_flush.
+		 * Passing InvalidXLogRecPtr here causes logical decoding to
+		 * start calling the output plugin for transactions that commit
+		 * at or after the slot's confirmed_flush. This filters commits
+		 * out from the client but they're still decoded.
 		 */
 		ctx = CreateDecodingContext(InvalidXLogRecPtr,
 									options,
@@ -262,11 +264,9 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 		ctx->output_writer_private = p;
 
 		/*
-		 * We start reading xlog from the restart lsn, even though we won't
-		 * start returning decoded data to the user until the point set up in
-		 * CreateDecodingContext. The restart_lsn is far enough back that we'll
-		 * see the beginning of any xact we're expected to return to the client
-		 * so we can assemble a complete reorder buffer for it.
+		 * Reading and decoding of WAL must start at restart_lsn so that the
+		 * entirety of each of the xacts that commit after confimed_lsn can be
+		 * accumulated into reorder buffers.
 		 */
 		startptr = MyReplicationSlot->data.restart_lsn;
 

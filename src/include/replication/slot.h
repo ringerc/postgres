@@ -63,10 +63,24 @@ typedef struct ReplicationSlotPersistentData
 	 */
 	TransactionId catalog_xmin;
 
-	/* oldest LSN that might be required by this replication slot */
+	/*
+	 * oldest LSN that might be required by this replication slot.
+	 *
+	 * Points to the LSN of the most recent xl_running_xacts record where
+	 * no transaction that commits after confirmed_flush is already in
+	 * progress. At this point all xacts committing after confirmed_flush
+	 * can be read entirely into reorder buffers and all visibility
+	 * information can be reconstructed.
+	 */
 	XLogRecPtr	restart_lsn;
 
-	/* oldest LSN that the client has acked receipt for */
+	/*
+	 * oldest LSN that the client has acked receipt for
+	 *
+	 * Decoding will start calling output plugin callbacks for commits
+	 * after this LSN unless a different start point is specified by
+	 * the client.
+	 */
 	XLogRecPtr	confirmed_flush;
 
 	/* plugin name */
