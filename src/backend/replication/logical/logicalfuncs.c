@@ -236,8 +236,8 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 	PG_TRY();
 	{
 		/*
-		 * Passing InvalidXLogRecPtr here causes replay to start at the slot's
-		 * confirmed_flush.
+		 * Passing InvalidXLogRecPtr here causes decoding to start returning
+		 * commited xacts to the client at the slot's confirmed_flush.
 		 */
 		ctx = CreateDecodingContext(InvalidXLogRecPtr,
 									options,
@@ -262,13 +262,11 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 		ctx->output_writer_private = p;
 
 		/*
-		 * We start reading xlog from the restart lsn, even though in
-		 * CreateDecodingContext we set the snapshot builder up using the
-		 * slot's confirmed_flush. This means we might read xlog we don't
-		 * actually decode rows from, but the snapshot builder might need it
-		 * to get to a consistent point. The point we start returning data to
-		 * *users* at is the confirmed_flush lsn set up in the decoding
-		 * context.
+		 * We start reading xlog from the restart lsn, even though we won't
+		 * start returning decoded data to the user until the point set up in
+		 * CreateDecodingContext. The restart_lsn is far enough back that we'll
+		 * see the beginning of any xact we're expected to return to the client
+		 * so we can assemble a complete reorder buffer for it.
 		 */
 		startptr = MyReplicationSlot->data.restart_lsn;
 
