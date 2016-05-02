@@ -328,7 +328,10 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 		 * business..)
 		 */
 		if (ctx->reader->EndRecPtr != InvalidXLogRecPtr && confirm)
+		{
 			LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+			ReplicationSlotMarkDirty();
+		}
 
 		/* free context, call shutdown callback */
 		FreeDecodingContext(ctx);
