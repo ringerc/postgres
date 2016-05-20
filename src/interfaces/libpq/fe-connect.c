@@ -2949,6 +2949,7 @@ static void
 closePGconn(PGconn *conn)
 {
 	PGnotify   *notify;
+	PGcommandQueueEntry *queue;
 	pgParameterStatus *pstatus;
 
 	/*
@@ -2995,6 +2996,22 @@ closePGconn(PGconn *conn)
 		free(prev);
 	}
 	conn->notifyHead = conn->notifyTail = NULL;
+	queue = conn->cmd_queue_head;
+	while (queue != NULL)
+	{
+		PGcommandQueueEntry *prev = queue;
+		queue = queue->next;
+		free(prev);
+	}
+	conn->cmd_queue_head = conn->cmd_queue_tail = NULL;
+	queue = conn->cmd_queue_recycle;
+	while (queue != NULL)
+	{
+		PGcommandQueueEntry *prev = queue;
+		queue = queue->next;
+		free(prev);
+	}
+	conn->cmd_queue_recycle = NULL;
 	pstatus = conn->pstatus;
 	while (pstatus != NULL)
 	{

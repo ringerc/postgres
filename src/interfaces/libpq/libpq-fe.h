@@ -91,7 +91,9 @@ typedef enum
 	PGRES_NONFATAL_ERROR,		/* notice or warning message */
 	PGRES_FATAL_ERROR,			/* query failed */
 	PGRES_COPY_BOTH,			/* Copy In/Out data transfer in progress */
-	PGRES_SINGLE_TUPLE			/* single tuple from larger resultset */
+	PGRES_SINGLE_TUPLE,			/* single tuple from larger resultset */
+	PGRES_BATCH_END,			/* end of a batch of commands */
+	PGRES_BATCH_ABORTED,		/* Command didn't run because of an abort earlier in a batch */
 } ExecStatusType;
 
 typedef enum
@@ -420,6 +422,15 @@ extern PGresult *PQgetResult(PGconn *conn);
 /* Routines for managing an asynchronous query */
 extern int	PQisBusy(PGconn *conn);
 extern int	PQconsumeInput(PGconn *conn);
+
+/* Routines for batch mode management */
+extern int PQisInBatchMode(PGconn *conn);
+extern int PQbatchIsAborted(PGconn *conn);
+extern int PQqueriesInBatch(PGconn *conn);
+extern int PQbeginBatchMode(PGconn *conn);
+extern int PQendBatchMode(PGconn *conn);
+extern int PQsendEndBatch(PGconn *conn);
+extern int PQgetNextQuery(PGconn *conn);
 
 /* LISTEN/NOTIFY support */
 extern PGnotify *PQnotifies(PGconn *conn);

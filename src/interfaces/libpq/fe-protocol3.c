@@ -220,10 +220,18 @@ pqParseInput3(PGconn *conn)
 						return;
 					conn->asyncStatus = PGASYNC_READY;
 					break;
-				case 'Z':		/* backend is ready for new query */
+				case 'Z':		/* sync response, backend is ready for new query */
 					if (getReadyForQuery(conn))
 						return;
-					conn->asyncStatus = PGASYNC_IDLE;
+					if (conn->in_batch)
+					{
+						conn->batch_aborted = false;
+						conn->result = PQmakeEmptyPGresult(conn,
+								PGRES_BATCH_END);
+						conn->asyncStatus = PGASYNC_READY;
+					}
+					else
+						conn->asyncStatus = PGASYNC_IDLE;
 					break;
 				case 'I':		/* empty query */
 					if (conn->result == NULL)
@@ -305,7 +313,7 @@ pqParseInput3(PGconn *conn)
 						 * parsing until the application accepts the current
 						 * result.
 						 */
-						conn->asyncStatus = PGASYNC_READY;
+						conn->asyncStatus = PGASYNC_READY_MORE;
 						return;
 					}
 					break;
@@ -879,6 +887,9 @@ pqGetErrorNotice3(PGconn *conn, bool isError)
 	bool		have_position = false;
 	PQExpBufferData workBuf;
 	char		id;
+
+	if (isError && conn->in_batch)
+		conn->batch_aborted = true;
 
 	/*
 	 * Since the fields might be pretty long, we create a temporary

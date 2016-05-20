@@ -217,10 +217,13 @@ typedef enum
 {
 	PGASYNC_IDLE,				/* nothing's happening, dude */
 	PGASYNC_BUSY,				/* query in progress */
-	PGASYNC_READY,				/* result ready for PQgetResult */
+	PGASYNC_READY,				/* query done, waiting for client to fetch result */
+	PGASYNC_READY_MORE,			/* query done, waiting for client to fetch result,
+								   More results expected from this query */
 	PGASYNC_COPY_IN,			/* Copy In data transfer in progress */
 	PGASYNC_COPY_OUT,			/* Copy Out data transfer in progress */
-	PGASYNC_COPY_BOTH			/* Copy In/Out data transfer in progress */
+	PGASYNC_COPY_BOTH,			/* Copy In/Out data transfer in progress */
+	PGASYNC_QUEUED				/* Current query done, more in queue */
 } PGAsyncStatusType;
 
 /* PGQueryClass tracks which query protocol we are now executing */
@@ -229,7 +232,8 @@ typedef enum
 	PGQUERY_SIMPLE,				/* simple Query protocol (PQexec) */
 	PGQUERY_EXTENDED,			/* full Extended protocol (PQexecParams) */
 	PGQUERY_PREPARE,			/* Parse only (PQprepare) */
-	PGQUERY_DESCRIBE			/* Describe Statement or Portal */
+	PGQUERY_DESCRIBE,			/* Describe Statement or Portal */
+	PGQUERY_SYNC				/* A protocol sync to end a batch */
 } PGQueryClass;
 
 /* PGSetenvStatusType defines the state of the PQSetenv state machine */
@@ -291,6 +295,22 @@ typedef struct pgDataValue
 	int			len;			/* data length in bytes, or <0 if NULL */
 	const char *value;			/* data value, without zero-termination */
 } PGdataValue;
+
+/* An entry in the pending command queue. Used by batch mode to keep track
+ * of the expected results of future commands we've dispatched.
+ *
+ * Note that entries in this list are reused by being zeroed and appended to
+ * the tail when popped off the head. The entry with null next pointer is not
+ * the end of the list of expected commands, that's the tail pointer in
+ * pg_conn.
+ */
+typedef struct pgCommandQueueEntry
+{
+  PGQueryClass	queryclass;	/* Query type; PGQUERY_SYNC for sync msg */
+  char		   *query;		/* SQL command, or NULL if unknown */
+  struct pgCommandQueueEntry *next;
+} PGcommandQueueEntry;
+
 
 /*
  * PGconn stores all the state data associated with a single connection
@@ -356,12 +376,23 @@ struct pg_conn
 	bool		options_valid;	/* true if OK to attempt connection */
 	bool		nonblocking;	/* whether this connection is using nonblock
 								 * sending semantics */
+	bool		in_batch;		/* connection is in batch (pipelined) mode */
+	bool		batch_aborted;	/* current batch is aborted, discarding until next Sync */
 	bool		singleRowMode;	/* return current query result row-by-row? */
 	char		copy_is_binary; /* 1 = copy binary, 0 = copy text */
 	int			copy_already_done;		/* # bytes already returned in COPY
 										 * OUT */
 	PGnotify   *notifyHead;		/* oldest unreported Notify msg */
 	PGnotify   *notifyTail;		/* newest unreported Notify msg */
+
+	/* The command queue
+	 *
+	 * head is the next pending cmd, tail is where we append new commands.
+	 * Freed entries for recycling go on the recycle linked list.
+	 */
+	PGcommandQueueEntry *cmd_queue_head;
+	PGcommandQueueEntry *cmd_queue_tail;
+	PGcommandQueueEntry *cmd_queue_recycle;
 
 	/* Connection data */
 	/* See PQconnectPoll() for how we use 'int' and not 'pgsocket'. */
@@ -657,6 +688,8 @@ extern char *libpq_ngettext(const char *msgid, const char *msgid_plural, unsigne
 #define libpq_gettext(x) (x)
 #define libpq_ngettext(s, p, n) ((n) == 1 ? (s) : (p))
 #endif
+
+#define libpq_gettext_noop(x) (x)
 
 /*
  * These macros are needed to let error-handling code be portable between

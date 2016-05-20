@@ -22,3 +22,4 @@
 /encnames.c
 /wchar.c
 /libpq.rc
+/tmp_check

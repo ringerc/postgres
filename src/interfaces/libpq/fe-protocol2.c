@@ -412,6 +412,12 @@ pqParseInput2(PGconn *conn)
 {
 	char		id;
 
+	if (conn->asyncStatus == PGASYNC_QUEUED || conn->in_batch)
+	{
+		fprintf(stderr, "internal error, attempt to read v2 protocol in batch mode");
+		abort();
+	}
+
 	/*
 	 * Loop to parse successive complete messages available in the buffer.
 	 */

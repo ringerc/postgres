@@ -171,3 +171,10 @@ PQsslAttributeNames       168
 PQsslAttribute            169
 PQsetErrorContextVisibility 170
 PQresultVerboseErrorMessage 171
+PQisInBatchMode           172
+PQqueriesInBatch          173
+PQbeginBatchMode          174
+PQendBatchMode            175
+PQsendEndBatch            176
+PQgetNextQuery            177
+PQbatchIsAborted          178
