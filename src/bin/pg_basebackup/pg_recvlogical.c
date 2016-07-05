@@ -153,6 +153,17 @@ sendFeedback(PGconn *conn, int64 now, bool force, bool replyRequested)
 		return false;
 	}
 
+	/* XXX hack while we're at it, send a logical reply message, 1st char is 'l' for logical reply msg */
+	{
+		const char *msg = "lThis is a logical decoding reply message";
+		if (!PQputCopyData(conn, msg, strlen(msg)+1))
+		{
+			fprintf(stderr, "could not send logical reply message: %s", PQerrorMessage(conn));
+			return false;
+		}
+	}
+	
+
 	return true;
 }
 

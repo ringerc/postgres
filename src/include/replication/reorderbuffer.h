@@ -292,6 +292,11 @@ typedef void (*ReorderBufferMessageCB) (
 												 const char *prefix, Size sz,
 													const char *message);
 
+/* reply callback signature */
+typedef void (*ReorderBufferReplyCB) (
+													ReorderBuffer *rb,
+													StringInfo msg);
+
 struct ReorderBuffer
 {
 	/*
@@ -319,6 +324,12 @@ struct ReorderBuffer
 	ReorderBufferApplyChangeCB apply_change;
 	ReorderBufferCommitCB commit;
 	ReorderBufferMessageCB message;
+
+	/*
+	 * Callback to be invoked non-transactionally when reply data is received
+	 * from a downstream client.
+	 */
+	ReorderBufferReplyCB reply;
 
 	/*
 	 * Pointer that will be passed untouched to the callbacks.
@@ -372,6 +383,7 @@ void		ReorderBufferQueueChange(ReorderBuffer *, TransactionId, XLogRecPtr lsn, R
 void ReorderBufferQueueMessage(ReorderBuffer *, TransactionId, Snapshot snapshot, XLogRecPtr lsn,
 						  bool transactional, const char *prefix,
 						  Size message_size, const char *message);
+void ReorderBufferProcessReply(ReorderBuffer *rb, Snapshot snapshot, StringInfo msg);
 void ReorderBufferCommit(ReorderBuffer *, TransactionId,
 					XLogRecPtr commit_lsn, XLogRecPtr end_lsn,
 	  TimestampTz commit_time, RepOriginId origin_id, XLogRecPtr origin_lsn);

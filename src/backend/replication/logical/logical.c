@@ -66,6 +66,8 @@ static void message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 				   XLogRecPtr message_lsn, bool transactional,
 				 const char *prefix, Size message_size, const char *message);
 
+static void reply_cb_wrapper(ReorderBuffer *cache, StringInfo msg);
+
 static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin);
 
 /*
@@ -182,6 +184,7 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->reorder->apply_change = change_cb_wrapper;
 	ctx->reorder->commit = commit_cb_wrapper;
 	ctx->reorder->message = message_cb_wrapper;
+	ctx->reorder->reply = reply_cb_wrapper;
 
 	ctx->out = makeStringInfo();
 	ctx->prepare_write = prepare_write;
@@ -748,6 +751,38 @@ message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	error_context_stack = errcallback.previous;
 }
 
+static void
+reply_cb_wrapper(ReorderBuffer *cache, StringInfo msg)
+{
+	LogicalDecodingContext *ctx = cache->private_data;
+	LogicalErrorCallbackState state;
+	ErrorContextCallback errcallback;
+
+	if (ctx->callbacks.reply_cb == NULL)
+		return;
+
+	/* Push callback + info on the error context stack */
+	state.ctx = ctx;
+	state.callback_name = "reply";
+	state.report_location = InvalidXLogRecPtr;
+	errcallback.callback = output_plugin_error_callback;
+	errcallback.arg = (void *) &state;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = InvalidTransactionId;
+	ctx->write_location = InvalidXLogRecPtr;
+
+	/* do the actual work: call callback */
+	ctx->callbacks.reply_cb(ctx, msg);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
+}
+
+
 /*
  * Set the required catalog xmin horizon for historic snapshots in the current
  * replication slot.
@@ -964,4 +999,25 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 		MyReplicationSlot->data.confirmed_flush = lsn;
 		SpinLockRelease(&MyReplicationSlot->mutex);
 	}
+}
+
+void LogicalDecodingProcessReply(LogicalDecodingContext *ctx,
+								 StringInfo msgdata)
+{
+	SnapBuild  *builder = ctx->snapshot_builder;
+	Snapshot	snapshot;
+
+	/* We can't invoke callbacks before we have a consistent snapshot */
+	if (SnapBuildCurrentState(builder) < SNAPBUILD_CONSISTENT)
+		return;
+
+	/*
+	 * We're not processing WAL so there's no particular xid active. Use the xid
+	 * of the last xact processed or the last xact in the initial snapshot.
+	 *
+	 * XXX how do we do that?
+	 */
+	snapshot = SnapBuildGetOrBuildSnapshot(builder, InvalidTransactionId);
+
+	ReorderBufferProcessReply(ctx->reorder, snapshot, msgdata);
 }

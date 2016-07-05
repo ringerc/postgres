@@ -32,6 +32,8 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "libpq/pqformat.h"
+
 PG_MODULE_MAGIC;
 
 /* These must be available to pg_dlsym() */
@@ -68,6 +70,8 @@ static void pg_decode_message(LogicalDecodingContext *ctx,
 				  ReorderBufferTXN *txn, XLogRecPtr message_lsn,
 				  bool transactional, const char *prefix,
 				  Size sz, const char *message);
+static void pg_process_reply(LogicalDecodingContext *ctx,
+				  StringInfo msg);
 
 void
 _PG_init(void)
@@ -88,6 +92,7 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->filter_by_origin_cb = pg_decode_filter;
 	cb->shutdown_cb = pg_decode_shutdown;
 	cb->message_cb = pg_decode_message;
+	cb->reply_cb = pg_process_reply;
 }
 
 
@@ -488,4 +493,16 @@ pg_decode_message(LogicalDecodingContext *ctx,
 					 transactional, prefix, sz);
 	appendBinaryStringInfo(ctx->out, message, sz);
 	OutputPluginWrite(ctx, true);
+}
+
+/* Treat a reply message from a client as a text string to be logged. */
+static void
+pg_process_reply(LogicalDecodingContext *ctx, StringInfo msg)
+{
+	/*
+	 * Any of the pq_getmsg functions are suitable for use here. See pqformat.h.
+	 */
+	const char *reply = pq_getmsgstring(msg);
+
+	elog(INFO, "received message from logical decoding client: %s", reply);
 }

@@ -86,6 +86,14 @@ typedef void (*LogicalDecodeMessageCB) (
 													const char *message);
 
 /*
+ * Called for logical reply messages sent from downstream over walsender
+ * protocol.
+ */
+typedef void (*LogicalDecodeReplyCB) (
+											 struct LogicalDecodingContext *,
+											 		StringInfo msg);
+
+/*
  * Filter changes by origin.
  */
 typedef bool (*LogicalDecodeFilterByOriginCB) (
@@ -111,6 +119,7 @@ typedef struct OutputPluginCallbacks
 	LogicalDecodeMessageCB message_cb;
 	LogicalDecodeFilterByOriginCB filter_by_origin_cb;
 	LogicalDecodeShutdownCB shutdown_cb;
+	LogicalDecodeReplyCB reply_cb;
 } OutputPluginCallbacks;
 
 void		OutputPluginPrepareWrite(struct LogicalDecodingContext *ctx, bool last_write);

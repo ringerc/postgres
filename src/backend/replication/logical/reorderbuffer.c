@@ -689,6 +689,27 @@ ReorderBufferQueueMessage(ReorderBuffer *rb, TransactionId xid,
 	}
 }
 
+/* Pass a reply from the downstream to the output plugin */
+void
+ReorderBufferProcessReply(ReorderBuffer *rb, Snapshot snapshot, StringInfo msg)
+{
+	volatile Snapshot snapshot_now = snapshot;
+
+	/* setup snapshot to allow catalog access */
+	SetupHistoricSnapshot(snapshot_now, NULL);
+	PG_TRY();
+	{
+		rb->reply(rb, msg);
+
+		TeardownHistoricSnapshot(false);
+	}
+	PG_CATCH();
+	{
+		TeardownHistoricSnapshot(true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
 
 static void
 AssertTXNLsnOrder(ReorderBuffer *rb)

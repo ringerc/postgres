@@ -207,6 +207,7 @@ static void StartLogicalReplication(StartReplicationCmd *cmd);
 static void ProcessStandbyMessage(void);
 static void ProcessStandbyReplyMessage(void);
 static void ProcessStandbyHSFeedbackMessage(void);
+static void ProcessLogicalReply(void);
 static void ProcessRepliesIfAny(void);
 static void WalSndKeepalive(bool requestReply);
 static void WalSndKeepaliveIfNecessary(TimestampTz now);
@@ -1496,6 +1497,16 @@ ProcessStandbyMessage(void)
 			ProcessStandbyHSFeedbackMessage();
 			break;
 
+		case 'l':
+			if (logical_decoding_ctx == NULL)
+				ereport(COMMERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("unexpected message type \"%c\"", msgtype),
+						 errdetail("logical plugin messages only permitted in logical decoding mode")));
+
+			ProcessLogicalReply();
+			break;
+
 		default:
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -1712,6 +1723,26 @@ ProcessStandbyHSFeedbackMessage(void)
 		PhysicalReplicationSlotNewXmin(feedbackXmin);
 	else
 		MyPgXact->xmin = feedbackXmin;
+}
+
+/*
+ * Received data to be passed directly to the logical decoding output plugin
+ * for handling in a plugin-defined manner.
+ */
+static void
+ProcessLogicalReply(void)
+{
+	Assert(logical_decoding_ctx != NULL);
+
+	/*
+	 * We don't have to decode anything in the message; the caller already consumed
+	 * the first byte, and the rest is a raw payload to be passed to an output plugin.
+	 *
+	 * We won't receive new feedback until this is processed so it's safe to just hand
+	 * the output plugin the StringInfo for easy processing, via the decoding layer
+	 * and reorder buffer.
+	 */
+	LogicalDecodingProcessReply(logical_decoding_ctx, &reply_message);
 }
 
 /*
