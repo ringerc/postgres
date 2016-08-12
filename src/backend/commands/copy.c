@@ -1761,7 +1761,9 @@ BeginCopyTo(Relation rel,
 			if (!is_absolute_path(filename))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_NAME),
-					  errmsg("relative path not allowed for COPY to file")));
+					  errmsg("relative path not allowed for COPY to file"),
+					  errhint("Paths for COPY are on the PostgreSQL server, not the client. "
+						  "You may want psql's \\copy or a driver COPY ... TO STDOUT wrapper")));
 
 			oumask = umask(S_IWGRP | S_IWOTH);
 			cstate->copy_file = AllocateFile(cstate->filename, PG_BINARY_W);
@@ -1770,7 +1772,9 @@ BeginCopyTo(Relation rel,
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not open file \"%s\" for writing: %m",
-								cstate->filename)));
+								cstate->filename),
+						 errhint("Paths for COPY are on the PostgreSQL server, not the client. "
+						 		 "You may want psql's \\copy or a driver COPY ... TO STDOUT wrapper")));
 
 			if (fstat(fileno(cstate->copy_file), &st))
 				ereport(ERROR,
@@ -2796,7 +2800,9 @@ BeginCopyFrom(Relation rel,
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not open file \"%s\" for reading: %m",
-								cstate->filename)));
+								cstate->filename),
+						 errhint("Paths for COPY are on the PostgreSQL server, not the client. "
+						 		 "You may want psql's \\copy or a driver COPY ... FROM STDIN wrapper")));
 
 			if (fstat(fileno(cstate->copy_file), &st))
 				ereport(ERROR,
