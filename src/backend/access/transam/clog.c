@@ -41,29 +41,6 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 
-/*
- * Defines for CLOG page sizes.  A page is the same BLCKSZ as is used
- * everywhere else in Postgres.
- *
- * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF,
- * CLOG page numbering also wraps around at 0xFFFFFFFF/CLOG_XACTS_PER_PAGE,
- * and CLOG segment numbering at
- * 0xFFFFFFFF/CLOG_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no
- * explicit notice of that fact in this module, except when comparing segment
- * and page numbers in TruncateCLOG (see CLOGPagePrecedes).
- */
-
-/* We need two bits per xact, so four xacts fit in a byte */
-#define CLOG_BITS_PER_XACT	2
-#define CLOG_XACTS_PER_BYTE 4
-#define CLOG_XACTS_PER_PAGE (BLCKSZ * CLOG_XACTS_PER_BYTE)
-#define CLOG_XACT_BITMASK	((1 << CLOG_BITS_PER_XACT) - 1)
-
-#define TransactionIdToPage(xid)	((xid) / (TransactionId) CLOG_XACTS_PER_PAGE)
-#define TransactionIdToPgIndex(xid) ((xid) % (TransactionId) CLOG_XACTS_PER_PAGE)
-#define TransactionIdToByte(xid)	(TransactionIdToPgIndex(xid) / CLOG_XACTS_PER_BYTE)
-#define TransactionIdToBIndex(xid)	((xid) % (TransactionId) CLOG_XACTS_PER_BYTE)
-
 /* We store the latest async LSN for each group of transactions */
 #define CLOG_XACTS_PER_LSN_GROUP	32	/* keep this a power of 2 */
 #define CLOG_LSNS_PER_PAGE	(CLOG_XACTS_PER_PAGE / CLOG_XACTS_PER_LSN_GROUP)

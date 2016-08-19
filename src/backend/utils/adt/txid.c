@@ -21,6 +21,7 @@
 
 #include "postgres.h"
 
+#include "access/clog.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -114,6 +115,67 @@ convert_xid(TransactionId xid, const TxidEpoch *state)
 		epoch++;
 
 	return (epoch << 32) | xid;
+}
+
+/*
+ * Helper to get a TransactionId from a 64-bit txid with wraparound
+ * detection.
+ *
+ * ERRORs if the txid is in the future. Returns permanent XIDs
+ * unchanged.  Otherwise returns the 32-bit xid and sets the too_old
+ * param to true if status for this xid cannot be reliably determined.
+ * It's only safe to use the returned xid for most purposes if too_old
+ * is false on return.
+ *
+ * XIDs older than ShmemVariableCache->oldestXid are treated as too
+ * old to look up because the clog could've been truncated away - even
+ * if they're still far from the xid wraparound theshold. The caller
+ * should have at least a share lock on XidGenLock to prevent
+ * oldestXid from advancing between our oldestXid check and subsequent
+ * lookups of transaction status using the returned xid. Failure to do
+ * so risks ERRORs on clog access but nothing worse.
+ */
+static TransactionId
+get_xid_in_recent_past(txid xid_with_epoch, bool *too_old)
+{
+	uint32			xid_epoch = (uint32) (xid_with_epoch >> 32);
+	TransactionId	xid = (TransactionId) xid_with_epoch;
+	TxidEpoch		now_epoch;
+
+	load_xid_epoch(&now_epoch);
+
+	*too_old = false;
+
+	if (!TransactionIdIsNormal(xid))
+	{
+		/* must be a permanent XID, ignore the epoch and return unchanged */
+		return xid;
+	}
+	else if (xid_epoch > now_epoch.epoch
+			 || (xid_epoch == now_epoch.epoch && xid > now_epoch.last_xid))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("transaction ID "UINT64_FORMAT" is in the future",
+					xid_with_epoch)));
+	}
+	else if (xid_epoch + 1 < now_epoch.epoch
+			 || (xid_epoch + 1 == now_epoch.epoch && xid < now_epoch.last_xid))
+	{
+		/* xid is wrapped, too far in the past */
+		*too_old = true;
+	}
+	else if (TransactionIdPrecedes(xid, ShmemVariableCache->oldestXid))
+	{
+		/* xid isn't wrapped, but clog could've been truncated away */
+		*too_old = true;
+	}
+	else
+	{
+		Assert(TransactionIdPrecedesOrEquals(xid, now_epoch.last_xid));
+	}
+
+	return xid;
 }
 
 /*
@@ -354,6 +416,9 @@ bad_format:
  *
  *	Return the current toplevel transaction ID as TXID
  *	If the current transaction does not have one, one is assigned.
+ *
+ *	This value has the epoch as the high 32 bits and the 32-bit xid
+ *	as the low 32 bits.
  */
 Datum
 txid_current(PG_FUNCTION_ARGS)
@@ -657,4 +722,58 @@ txid_snapshot_xip(PG_FUNCTION_ARGS)
 	{
 		SRF_RETURN_DONE(fctx);
 	}
+}
+
+/*
+ * Report the status of a recent transaction ID, or null for wrapped,
+ * truncated away or otherwise too old XIDs.
+ */
+Datum
+txid_status(PG_FUNCTION_ARGS)
+{
+	const char	   *status;
+	bool			too_old;
+	uint64			xid_with_epoch = PG_GETARG_INT64(0);
+	TransactionId	xid;
+
+	/*
+	 * We must hold XidGenLock here to prevent oldestXid advancing and
+	 * triggering clog truncation between when we check that the xid
+	 * is ok and when we look it up in the clog. Otherwise an
+	 * exception might get thrown on clog access.
+	 */
+	LWLockAcquire(XidGenLock, LW_SHARED);
+	xid = get_xid_in_recent_past(xid_with_epoch, &too_old);
+
+	if (!TransactionIdIsValid(xid))
+	{
+		LWLockRelease(XidGenLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("transaction ID "UINT64_FORMAT" is an invalid xid",
+						xid_with_epoch)));
+	}
+
+	if (too_old)
+		status = NULL;
+	else if (TransactionIdIsCurrentTransactionId(xid))
+		status = gettext_noop("in progress");
+	else if (TransactionIdDidCommit(xid))
+		status = gettext_noop("committed");
+	else if (TransactionIdDidAbort(xid))
+		status = gettext_noop("aborted");
+	else
+		/*
+		 * can't test TransactionIdIsInProgress here or we race
+		 * with concurrent commit/abort. There's no point anyway,
+		 * since it might then commit/abort just after we check.
+		 */
+		status = gettext_noop("in progress");
+
+	LWLockRelease(XidGenLock);
+
+	if (status == NULL)
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_TEXT_P(cstring_to_text(status));
 }
