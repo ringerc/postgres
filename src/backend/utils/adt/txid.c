@@ -789,3 +789,216 @@ txid_status(PG_FUNCTION_ARGS)
 	else
 		PG_RETURN_TEXT_P(cstring_to_text(status));
 }
+
+/*
+ * Internal function for test only use to burn transaction IDs
+ * as fast as possible.
+ *
+ * Forcibly advance to just before wraparound.
+ *
+ * This will cause commit/rollback of our own xact to fail because
+ * the clog page has been truncated away.
+ *
+ * No safety check is performed to ensure nothing else has an xid.
+ * They'll fail on commit. Should really lock procarray.
+ *
+ * There's also no attempt to keep datfrozenxid correct for the other
+ * DBs. The user gets the fun of freezing them.
+ */
+Datum
+txid_incinerate(PG_FUNCTION_ARGS)
+{
+	const char *target;
+	int nreserved;
+	int i;
+
+	TransactionId lastAllocatedXid;
+	TransactionId clogPageFirstXid;
+	TransactionId targetNextXid;
+
+	if (!superuser())
+		elog(ERROR, "txid_incinerate may only be called by the superuser");
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "xid argument must be non-null");
+
+	if (PG_ARGISNULL(1))
+	{
+		nreserved = 0;
+	}
+	else
+	{
+		nreserved = PG_GETARG_INT32(1);
+		if (nreserved < 0)
+			elog(ERROR, "nreserved xids must be >= 0");
+	}
+
+	target = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	LWLockAcquire(XidGenLock, LW_SHARED);
+	if (GetTopTransactionIdIfAny() != InvalidTransactionId)
+	{
+		LWLockRelease(XidGenLock);
+		ereport(ERROR,
+				(errmsg_internal("can't burn XIDs in a session with an xid allocated")));
+	}
+
+	lastAllocatedXid = ShmemVariableCache->nextXid;
+	TransactionIdRetreat(lastAllocatedXid);
+
+	if (strcmp(target, "stop"))
+		targetNextXid = ShmemVariableCache->xidStopLimit;
+	else if (strcmp(target, "warn"))
+		targetNextXid = ShmemVariableCache->xidWarnLimit;
+	else if (strcmp(target, "vac"))
+		targetNextXid = ShmemVariableCache->xidVacLimit;
+	else if (strcmp(target, "wrap"))
+		targetNextXid = ShmemVariableCache->xidWrapLimit;
+	else if (strcmp(target, "page"))
+		targetNextXid = ShmemVariableCache->nextXid + CLOG_XACTS_PER_PAGE - nreserved;
+	else
+	{
+		unsigned long parsed;
+		char *endp;
+		parsed = strtol(target, &endp, 10);
+		if (*endp != '\0')
+			elog(ERROR, "Argument must be an xid or one of the strings page, stop, warn, vac or wrap");
+		if (!TransactionIdIsNormal((TransactionId)parsed))
+			elog(ERROR, "Argument xid must be a normal xid, not the invalid/frozen/bootstrap xid");
+		targetNextXid = (TransactionId)parsed;
+	}
+
+	for (i = 0; i < nreserved; i++)
+		TransactionIdRetreat(targetNextXid);
+
+	if (!TransactionIdFollowsOrEquals(targetNextXid, ShmemVariableCache->nextXid))
+		elog(ERROR, "Target xid %u is <= current xid %u in modulo 32",
+			  targetNextXid, ShmemVariableCache->nextXid);
+
+	elog(NOTICE, "xid limits are: vac=%u, warn=%u, stop=%u, wrap=%u, oldest=%u, next=%u; target xid is %u",
+		ShmemVariableCache->xidVacLimit,
+		ShmemVariableCache->xidWarnLimit,
+		ShmemVariableCache->xidStopLimit,
+		ShmemVariableCache->xidWrapLimit,
+		ShmemVariableCache->nextXid,
+		ShmemVariableCache->oldestXid,
+		targetNextXid);
+
+	Assert(TransactionIdPrecedes(ShmemVariableCache->nextXid, ShmemVariableCache->xidStopLimit));
+	Assert(TransactionIdPrecedesOrEquals(ShmemVariableCache->nextXid, ShmemVariableCache->xidWrapLimit));
+
+	/* Advance nextXid to the last xid on the current clog page */
+	clogPageFirstXid = ShmemVariableCache->nextXid - TransactionIdToPgIndex(ShmemVariableCache->nextXid);
+	ShmemVariableCache->nextXid = clogPageFirstXid + (CLOG_XACTS_PER_PAGE - 1);
+	elog(DEBUG1, "txid_incinerate: Advanced xid to %u, first %u on page %u",
+			ShmemVariableCache->nextXid, clogPageFirstXid,
+			TransactionIdToPage(ShmemVariableCache->nextXid));
+		
+	/*
+	 * Write new clog pages and advance to the end of the next page, until
+	 * we've allocated the last clog page. This might take a while.
+	 *
+	 * At each step, force the next xid forward and extend the clog. We must
+	 * allocate the first xid on the last page so that ExtendCLOG actually does
+	 * some work, since otherwise it just shortcuts out.
+	 */
+	do
+	{
+		TransactionId	page_xids[CLOG_XACTS_PER_PAGE];
+		uint32_t		n_page_subxids;
+		TransactionId	subxid;
+
+		if (clogPageFirstXid == FirstNormalTransactionId)
+			clogPageFirstXid = CLOG_XACTS_PER_PAGE;
+		else
+			clogPageFirstXid += CLOG_XACTS_PER_PAGE;
+
+		elog(DEBUG1, "txid_incinerate: nextXid %u", ShmemVariableCache->nextXid);
+
+		if (TransactionIdPrecedes(clogPageFirstXid, targetNextXid)
+			&& TransactionIdPrecedesOrEquals(targetNextXid, clogPageFirstXid + (CLOG_XACTS_PER_PAGE - 1)))
+		{
+			ShmemVariableCache->nextXid = targetNextXid;
+			elog(DEBUG1, "txid_incinerate: reached target xid, next page %u greater than target %u",
+				targetNextXid, targetNextXid + CLOG_XACTS_PER_PAGE);
+			/* don't try to set xid statuses in the future */
+		}
+		else
+		{
+			ShmemVariableCache->nextXid = clogPageFirstXid + (CLOG_XACTS_PER_PAGE - 1);
+		}
+
+		n_page_subxids = TransactionIdToPgIndex(clogPageFirstXid) + CLOG_XACTS_PER_PAGE - 1;
+
+		if (clogPageFirstXid < FirstNormalTransactionId)
+		{
+			clogPageFirstXid = FirstNormalTransactionId;
+			/* We won't try to set commit status for permanent xids */
+			n_page_subxids -= FirstNormalTransactionId;
+		}
+
+		Assert(TransactionIdToPgIndex(clogPageFirstXid) == 0 || clogPageFirstXid == FirstNormalTransactionId);
+		Assert(TransactionIdPrecedesOrEquals(ShmemVariableCache->nextXid, ShmemVariableCache->xidWrapLimit));
+
+		/*
+		 * Create a fake subxact with enough xacts to fill the page from the
+		 * start xact to the target xid or end of page. It's safe to increment
+		 * the xid without considering wrapping around because wraparound never
+		 * occurs within a page.
+		 *
+		 * TODO: figure out how to set status only for xids nobody else got,
+		 * i.e.  xids allocated to any other xact, whether committed,
+		 * in-progress or aborted.
+		 */
+		elog(WARNING, "making xid array for page %u for %u", TransactionIdToPage(clogPageFirstXid), n_page_subxids);
+		for (subxid = clogPageFirstXid + 1; subxid < (clogPageFirstXid + n_page_subxids); subxid++)
+		{
+			/*
+			elog(WARNING, "for xid %u on page %u, setting ptr %p[%u]/%u to xid %u",
+				 clogPageFirstXid, TransactionIdToPage(clogPageFirstXid), page_xids,
+				 TransactionIdToPgIndex(subxid), n_page_subxids, subxid);
+			*/
+			page_xids[TransactionIdToPgIndex(subxid)] = subxid;
+			Assert(subxid - clogPageFirstXid <= n_page_subxids);
+			Assert(TransactionIdToPgIndex(subxid) <= n_page_subxids);
+		}
+		Assert(TransactionIdToPage(clogPageFirstXid) == TransactionIdToPage(subxid));
+		elog(WARNING, "done, extending clog for page %u", TransactionIdToPage(clogPageFirstXid));
+
+		ExtendCLOG(clogPageFirstXid);
+
+		
+		elog(WARNING, "about to set status of xid %u and %u subsequent xids in range [%u,%u] inclusive",
+			 clogPageFirstXid, n_page_subxids,
+			 page_xids[TransactionIdToPgIndex(clogPageFirstXid+1)],
+			 page_xids[n_page_subxids-1]);
+
+		TransactionIdSetTreeStatus(clogPageFirstXid, n_page_subxids,
+								   &page_xids[TransactionIdToPgIndex(clogPageFirstXid+1)],
+								   TRANSACTION_STATUS_ABORTED, InvalidXLogRecPtr);
+
+		CHECK_FOR_INTERRUPTS();
+	}
+	while (TransactionIdToPage(ShmemVariableCache->nextXid) != (targetNextXid/CLOG_XACTS_PER_PAGE));
+
+	elog(DEBUG1, "txid_incinerate: done extending clog and advancing counter, nextXid is %u",
+		 ShmemVariableCache->nextXid);
+
+	Assert(TransactionIdPrecedesOrEquals(ShmemVariableCache->nextXid, ShmemVariableCache->xidWrapLimit));
+	
+	/*
+	 * We'd really like to totally reset the clog by truncating it and
+	 * moving the wraparound pointer, but we can't do that unless all DBs
+	 * are already frozen.
+	 *
+	 * We can't freeze here since we can't access other DBs. So we've got
+	 * to let the user do the job.
+	 */
+
+	elog(NOTICE, "txid_incinerate: advanced nextXid to %u",
+		ShmemVariableCache->nextXid);
+
+	LWLockRelease(XidGenLock);
+
+	PG_RETURN_VOID();
+}

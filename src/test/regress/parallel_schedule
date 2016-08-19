@@ -42,6 +42,9 @@ test: create_type
 test: create_table
 test: create_function_2
 
+# Force txid wraparound
+test: wraparound
+
 # ----------
 # Load huge amounts of data
 # We should split the data files into single files and then

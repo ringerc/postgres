@@ -4932,6 +4932,8 @@ DATA(insert OID = 3347 (  txid_status				PGNSP PGUID 12 1  0 0 0 f f f f t f v s
 DESCR("commit status of transaction");
 DATA(insert OID = 3344 (  txid_convert_if_recent		PGNSP PGUID 12 1  0 0 0 f f f f t f v s 1 0 28 "20" _null_ _null_ _null_ _null_ _null_ txid_convert_if_recent _null_ _null_ _null_ ));
 DESCR("get the xid from a bigint transaction id if not wrapped around");
+DATA(insert OID = 3349 (  txid_incinerate			PGNSP PGUID 12 1  0 0 0 f f f f t f v s 2 0 2278 "25 23" _null_ _null_ _null_ _null_ _null_ txid_incinerate _null_ _null_ _null_ ));
+DESCR("burn xids fast");
 
 /* record comparison using normal comparison rules */
 DATA(insert OID = 2981 (  record_eq		   PGNSP PGUID 12 1 0 0 0 f f f f t f i s 2 0 16 "2249 2249" _null_ _null_ _null_ _null_ _null_ record_eq _null_ _null_ _null_ ));
