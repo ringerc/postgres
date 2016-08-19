@@ -4928,8 +4928,10 @@ DATA(insert OID = 2947 (  txid_snapshot_xip			PGNSP PGUID 12 1 50 0 0 f f f f t 
 DESCR("get set of in-progress txids in snapshot");
 DATA(insert OID = 2948 (  txid_visible_in_snapshot	PGNSP PGUID 12 1  0 0 0 f f f f t f i s 2 0 16 "20 2970" _null_ _null_ _null_ _null_ _null_ txid_visible_in_snapshot _null_ _null_ _null_ ));
 DESCR("is txid visible in snapshot?");
-DATA(insert OID = 3346 (  txid_status				PGNSP PGUID 12 1  0 0 0 f f f f t f v s 1 0 25 "20" _null_ _null_ _null_ _null_ _null_ txid_status _null_ _null_ _null_ ));
+DATA(insert OID = 3347 (  txid_status				PGNSP PGUID 12 1  0 0 0 f f f f t f v s 1 0 25 "20" _null_ _null_ _null_ _null_ _null_ txid_status _null_ _null_ _null_ ));
 DESCR("commit status of transaction");
+DATA(insert OID = 3344 (  txid_convert_if_recent		PGNSP PGUID 12 1  0 0 0 f f f f t f v s 1 0 28 "20" _null_ _null_ _null_ _null_ _null_ txid_convert_if_recent _null_ _null_ _null_ ));
+DESCR("get the xid from a bigint transaction id if not wrapped around");
 
 /* record comparison using normal comparison rules */
 DATA(insert OID = 2981 (  record_eq		   PGNSP PGUID 12 1 0 0 0 f f f f t f i s 2 0 16 "2249 2249" _null_ _null_ _null_ _null_ _null_ record_eq _null_ _null_ _null_ ));

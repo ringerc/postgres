@@ -17198,6 +17198,11 @@ SELECT collation for ('foo' COLLATE "de_DE");
        <entry>is transaction ID visible in snapshot? (do not use with subtransaction ids)</entry>
       </row>
       <row>
+       <entry><literal><function>txid_convert_if_recent(<parameter>bigint</parameter>)</function></literal></entry>
+       <entry><type>xid</type></entry>
+       <entry>return the 32-bit <type>xid</> for a 64-bit transaction ID if it isn't wrapped around, otherwise return null</entry>
+      </row>
+      <row>
        <entry><literal><function>txid_status(<parameter>bigint</parameter>)</function></literal></entry>
        <entry><type>txid_status</type></entry>
        <entry>report the status of the given xact - <literal>committed</literal>, <literal>aborted</literal>, <literal>in progress</literal>, or NULL if the xid is too old</entry>
@@ -17210,9 +17215,15 @@ SELECT collation for ('foo' COLLATE "de_DE");
     The internal transaction ID type (<type>xid</>) is 32 bits wide and
     wraps around every 4 billion transactions.  However, these functions
     export a 64-bit format that is extended with an <quote>epoch</> counter
-    so it will not wrap around during the life of an installation.
-    The data type used by these functions, <type>txid_snapshot</type>,
-    stores information about transaction ID
+    so it will not wrap around during the life of an installation. For that
+    reason you cannot cast a bigint transaction ID directly to <type>xid</>
+    and must use <function>txid_convert_if_recent(bigint)</function> instead of
+    casting to <type>xid</>.
+   </para>
+
+   <para>
+    The data type used by the xid snapshot functions,
+    <type>txid_snapshot</type>, stores information about transaction ID
     visibility at a particular moment in time.  Its components are
     described in <xref linkend="functions-txid-snapshot-parts">.
    </para>

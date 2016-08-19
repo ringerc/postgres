@@ -724,6 +724,18 @@ txid_snapshot_xip(PG_FUNCTION_ARGS)
 	}
 }
 
+Datum
+txid_convert_if_recent(PG_FUNCTION_ARGS)
+{
+	bool wraparound;
+	TransactionId xid = get_xid_in_recent_past(PG_GETARG_INT64(0), &wraparound);
+
+	if (wraparound)
+		PG_RETURN_NULL();
+	else
+		return TransactionIdGetDatum(xid);
+}
+
 /*
  * Report the status of a recent transaction ID, or null for wrapped,
  * truncated away or otherwise too old XIDs.

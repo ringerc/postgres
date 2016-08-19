@@ -1228,6 +1228,7 @@ extern Datum txid_snapshot_xmax(PG_FUNCTION_ARGS);
 extern Datum txid_snapshot_xip(PG_FUNCTION_ARGS);
 extern Datum txid_visible_in_snapshot(PG_FUNCTION_ARGS);
 extern Datum txid_status(PG_FUNCTION_ARGS);
+extern Datum txid_convert_if_recent(PG_FUNCTION_ARGS);
 
 /* uuid.c */
 extern Datum uuid_in(PG_FUNCTION_ARGS);

@@ -72,6 +72,19 @@ ROLLBACK;
 BEGIN;
 SELECT txid_current() AS inprogress \gset
 
+-- We can reasonably assume we haven't hit the first xid
+-- wraparound here, so:
+SELECT txid_convert_if_recent(:committed) = :'committed'::xid;
+SELECT txid_convert_if_recent(:rolledback) = :'rolledback'::xid;
+SELECT txid_convert_if_recent(:inprogress) = :'inprogress'::xid;
+SELECT txid_convert_if_recent(0) = '0'::xid; -- InvalidTransactionId
+SELECT txid_convert_if_recent(1) = '1'::xid; -- BootstrapTransactionId
+SELECT txid_convert_if_recent(2) = '2'::xid; -- FrozenTransactionId
+-- we ignore epoch for the fixed xids
+SELECT txid_convert_if_recent(BIGINT '1' << 32);
+SELECT txid_convert_if_recent((BIGINT '1' << 32) + 1);
+SELECT txid_convert_if_recent((BIGINT '1' << 32) + 2);
+
 SELECT txid_status(:committed) AS committed;
 SELECT txid_status(:rolledback) AS rolledback;
 SELECT txid_status(:inprogress) AS inprogress;
@@ -80,6 +93,44 @@ SELECT txid_status(2); -- FrozenTransactionId is always committed
 SELECT txid_status(3); -- in regress testing FirstNormalTransactionId will always be behind oldestXmin
 
 COMMIT;
+
+-- Check xids in the future
+DO
+$$
+BEGIN
+  PERFORM txid_convert_if_recent(txid_current() + (BIGINT '1' << 32));
+EXCEPTION
+  WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'got expected xid out of range error';
+END;
+$$;
+
+DO
+$$
+BEGIN
+  PERFORM txid_convert_if_recent((BIGINT '1' << 32) - 1);
+EXCEPTION
+  WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'got expected xid out of range error';
+END;
+$$;
+
+BEGIN;
+CREATE FUNCTION test_future_xid(bigint)
+RETURNS void
+LANGUAGE plpgsql
+AS
+$$
+BEGIN
+  PERFORM txid_convert_if_recent($1);
+  RAISE EXCEPTION 'didn''t ERROR at xid in the future as expected';
+EXCEPTION
+  WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'Got expected error for xid in the future';
+END;
+$$;
+SELECT test_future_xid(:inprogress + 100000);
+ROLLBACK;
 
 BEGIN;
 CREATE FUNCTION test_future_xid_status(bigint)
