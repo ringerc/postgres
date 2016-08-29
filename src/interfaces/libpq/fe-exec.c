@@ -975,12 +975,26 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 		conn->std_strings = (strcmp(value, "on") == 0);
 		static_std_strings = conn->std_strings;
 	}
+	else if (strcmp(name, "server_version_num") == 0)
+	{
+		int cnt,
+			ver;
+
+		cnt = sscanf(value, "%d", &ver);
+		/* failure here seems unlikely; will fall back on server_version */
+		if (cnt > 0)
+			conn->sversion = ver;
+	}
 	else if (strcmp(name, "server_version") == 0)
 	{
 		int			cnt;
 		int			vmaj,
 					vmin,
 					vrev;
+
+		if (conn->sversion != 0)
+			/* already determined version and it can't change after connect */
+			return;
 
 		cnt = sscanf(value, "%d.%d.%d", &vmaj, &vmin, &vrev);
 
