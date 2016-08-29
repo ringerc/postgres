@@ -72,11 +72,6 @@ Item
 </row>
 
 <row>
- <entry><filename>pg_clog</></entry>
- <entry>Subdirectory containing transaction commit status data</entry>
-</row>
-
-<row>
  <entry><filename>pg_dynshmem</></entry>
  <entry>Subdirectory containing files used by the dynamic shared memory
   subsystem</entry>
@@ -133,6 +128,11 @@ Item
 <row>
  <entry><filename>pg_tblspc</></entry>
  <entry>Subdirectory containing symbolic links to tablespaces</entry>
+</row>
+
+<row>
+ <entry><filename>pg_trans</></entry>
+ <entry>Subdirectory containing transaction commit status data</entry>
 </row>
 
 <row>

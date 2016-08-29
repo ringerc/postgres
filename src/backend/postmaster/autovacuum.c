@@ -2394,7 +2394,7 @@ deleted:
 	 */
 
 	/*
-	 * Update pg_database.datfrozenxid, and truncate pg_clog if possible. We
+	 * Update pg_database.datfrozenxid, and truncate pg_trans if possible. We
 	 * only need to do this once, not after each table.
 	 */
 	vac_update_datfrozenxid();
