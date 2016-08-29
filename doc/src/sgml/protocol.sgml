@@ -1091,6 +1091,7 @@
     At present there is a hard-wired set of parameters for which
     ParameterStatus will be generated: they are
     <varname>server_version</>,
+    <varname>server_version_num</>,
     <varname>server_encoding</>,
     <varname>client_encoding</>,
     <varname>application_name</>,
@@ -1106,7 +1107,8 @@
     <varname>standard_conforming_strings</> was not reported by releases
     before 8.1;
     <varname>IntervalStyle</> was not reported by releases before 8.4;
-    <varname>application_name</> was not reported by releases before 9.0.)
+    <varname>application_name</> was not reported by releases before 9.0;
+    <varname>server_version_num</> was not reported by releases before 10.0.)
     Note that
     <varname>server_version</>,
     <varname>server_encoding</> and
