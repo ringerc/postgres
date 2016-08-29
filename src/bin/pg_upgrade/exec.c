@@ -302,7 +302,12 @@ check_data_dir(ClusterInfo *cluster)
 	check_single_dir(pg_data, "pg_subtrans");
 	check_single_dir(pg_data, "pg_tblspc");
 	check_single_dir(pg_data, "pg_twophase");
-	check_single_dir(pg_data, "pg_xlog");
+
+	/* pg_xlog has been renamed to pg_wal in post-10 cluster */
+	if (GET_MAJOR_VERSION(cluster->major_version) < 1000)
+		check_single_dir(pg_data, "pg_xlog");
+	else
+		check_single_dir(pg_data, "pg_wal");
 
 	/* pg_clog has been renamed to pg_trans in post-10 cluster */
 	if (GET_MAJOR_VERSION(cluster->major_version) < 1000)

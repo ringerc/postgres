@@ -276,7 +276,7 @@ perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 		TimeLineID	tli;
 
 		/*
-		 * I'd rather not worry about timelines here, so scan pg_xlog and
+		 * I'd rather not worry about timelines here, so scan pg_wal and
 		 * include all WAL files in the range between 'startptr' and 'endptr',
 		 * regardless of the timeline the file is stamped with. If there are
 		 * some spurious WAL files belonging to timelines that don't belong in
@@ -289,11 +289,11 @@ perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 		XLByteToPrevSeg(endptr, endsegno);
 		XLogFileName(lastoff, ThisTimeLineID, endsegno);
 
-		dir = AllocateDir("pg_xlog");
+		dir = AllocateDir("pg_wal");
 		if (!dir)
 			ereport(ERROR,
-				 (errmsg("could not open directory \"%s\": %m", "pg_xlog")));
-		while ((de = ReadDir(dir, "pg_xlog")) != NULL)
+				 (errmsg("could not open directory \"%s\": %m", "pg_wal")));
+		while ((de = ReadDir(dir, "pg_wal")) != NULL)
 		{
 			/* Does it look like a WAL segment, and is it in the range? */
 			if (IsXLogFileName(de->d_name) &&
@@ -331,7 +331,7 @@ perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 		qsort(walFiles, nWalFiles, sizeof(char *), compareWalFileNames);
 
 		/*
-		 * There must be at least one xlog file in the pg_xlog directory,
+		 * There must be at least one xlog file in the pg_wal directory,
 		 * since we are doing backup-including-xlog.
 		 */
 		if (nWalFiles < 1)
@@ -988,15 +988,15 @@ sendDir(char *path, int basepathlen, bool sizeonly, List *tablespaces,
 		}
 
 		/*
-		 * We can skip pg_xlog, the WAL segments need to be fetched from the
+		 * We can skip pg_wal, the WAL segments need to be fetched from the
 		 * WAL archive anyway. But include it as an empty directory anyway, so
 		 * we get permissions right.
 		 */
-		if (strcmp(pathbuf, "./pg_xlog") == 0)
+		if (strcmp(pathbuf, "./pg_wal") == 0)
 		{
 			if (!sizeonly)
 			{
-				/* If pg_xlog is a symlink, write it as a directory anyway */
+				/* If pg_wal is a symlink, write it as a directory anyway */
 #ifndef WIN32
 				if (S_ISLNK(statbuf.st_mode))
 #else
@@ -1012,10 +1012,10 @@ sendDir(char *path, int basepathlen, bool sizeonly, List *tablespaces,
 			 * statbuf from above ...).
 			 */
 			if (!sizeonly)
-				_tarWriteHeader("./pg_xlog/archive_status", NULL, &statbuf);
+				_tarWriteHeader("./pg_wal/archive_status", NULL, &statbuf);
 			size += 512;		/* Size of the header just added */
 
-			continue;			/* don't recurse into pg_xlog */
+			continue;			/* don't recurse into pg_wal */
 		}
 
 		/* Allow symbolic links in pg_tblspc only */

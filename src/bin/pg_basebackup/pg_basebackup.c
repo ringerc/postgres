@@ -445,14 +445,14 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier)
 		/* Error message already written in GetConnection() */
 		exit(1);
 
-	snprintf(param->xlogdir, sizeof(param->xlogdir), "%s/pg_xlog", basedir);
+	snprintf(param->xlogdir, sizeof(param->xlogdir), "%s/pg_wal", basedir);
 
 	/*
-	 * Create pg_xlog/archive_status (and thus pg_xlog) so we can write to
-	 * basedir/pg_xlog as the directory entry in the tar file may arrive
+	 * Create pg_wal/archive_status (and thus pg_wal) so we can write to
+	 * basedir/pg_wal as the directory entry in the tar file may arrive
 	 * later.
 	 */
-	snprintf(statusdir, sizeof(statusdir), "%s/pg_xlog/archive_status",
+	snprintf(statusdir, sizeof(statusdir), "%s/pg_wal/archive_status",
 			 basedir);
 
 	if (pg_mkdir_p(statusdir, S_IRWXU) != 0 && errno != EEXIST)
@@ -1249,14 +1249,14 @@ ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
 					if (mkdir(filename, S_IRWXU) != 0)
 					{
 						/*
-						 * When streaming WAL, pg_xlog will have been created
+						 * When streaming WAL, pg_wal will have been created
 						 * by the wal receiver process. Also, when transaction
-						 * log directory location was specified, pg_xlog has
+						 * log directory location was specified, pg_wal has
 						 * already been created as a symbolic link before
 						 * starting the actual backup. So just ignore creation
 						 * failures on related directories.
 						 */
-						if (!((pg_str_endswith(filename, "/pg_xlog") ||
+						if (!((pg_str_endswith(filename, "/pg_wal") ||
 							 pg_str_endswith(filename, "/archive_status")) &&
 							  errno == EEXIST))
 						{
@@ -2180,7 +2180,7 @@ main(int argc, char **argv)
 		verify_dir_is_empty_or_create(xlog_dir);
 
 		/* form name of the place where the symlink must go */
-		linkloc = psprintf("%s/pg_xlog", basedir);
+		linkloc = psprintf("%s/pg_wal", basedir);
 
 #ifdef HAVE_SYMLINK
 		if (symlink(xlog_dir, linkloc) != 0)

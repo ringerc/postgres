@@ -200,7 +200,7 @@ static const char *backend_options = "--single -F -O -j -c search_path=pg_catalo
 
 static const char *const subdirs[] = {
 	"global",
-	"pg_xlog/archive_status",
+	"pg_wal/archive_status",
 	"pg_commit_ts",
 	"pg_dynshmem",
 	"pg_notify",
@@ -2281,7 +2281,7 @@ make_postgres(FILE *cmdfd)
  * Issue fsync recursively on PGDATA and all its contents.
  *
  * We fsync regular files and directories wherever they are, but we
- * follow symlinks only for pg_xlog and immediately under pg_tblspc.
+ * follow symlinks only for pg_wal and immediately under pg_tblspc.
  * Other symlinks are presumed to point at files we're not responsible
  * for fsyncing, and might not have privileges to write at all.
  *
@@ -2291,17 +2291,17 @@ static void
 fsync_pgdata(void)
 {
 	bool		xlog_is_symlink;
-	char		pg_xlog[MAXPGPATH];
+	char		pg_wal[MAXPGPATH];
 	char		pg_tblspc[MAXPGPATH];
 
 	fputs(_("syncing data to disk ... "), stdout);
 	fflush(stdout);
 
-	snprintf(pg_xlog, MAXPGPATH, "%s/pg_xlog", pg_data);
+	snprintf(pg_wal, MAXPGPATH, "%s/pg_wal", pg_data);
 	snprintf(pg_tblspc, MAXPGPATH, "%s/pg_tblspc", pg_data);
 
 	/*
-	 * If pg_xlog is a symlink, we'll need to recurse into it separately,
+	 * If pg_wal is a symlink, we'll need to recurse into it separately,
 	 * because the first walkdir below will ignore it.
 	 */
 	xlog_is_symlink = false;
@@ -2310,14 +2310,14 @@ fsync_pgdata(void)
 	{
 		struct stat st;
 
-		if (lstat(pg_xlog, &st) < 0)
+		if (lstat(pg_wal, &st) < 0)
 			fprintf(stderr, _("%s: could not stat file \"%s\": %s\n"),
-					progname, pg_xlog, strerror(errno));
+					progname, pg_wal, strerror(errno));
 		else if (S_ISLNK(st.st_mode))
 			xlog_is_symlink = true;
 	}
 #else
-	if (pgwin32_is_junction(pg_xlog))
+	if (pgwin32_is_junction(pg_wal))
 		xlog_is_symlink = true;
 #endif
 
@@ -2328,7 +2328,7 @@ fsync_pgdata(void)
 #ifdef PG_FLUSH_DATA_WORKS
 	walkdir(pg_data, pre_sync_fname, false);
 	if (xlog_is_symlink)
-		walkdir(pg_xlog, pre_sync_fname, false);
+		walkdir(pg_wal, pre_sync_fname, false);
 	walkdir(pg_tblspc, pre_sync_fname, true);
 #endif
 
@@ -2336,14 +2336,14 @@ fsync_pgdata(void)
 	 * Now we do the fsync()s in the same order.
 	 *
 	 * The main call ignores symlinks, so in addition to specially processing
-	 * pg_xlog if it's a symlink, pg_tblspc has to be visited separately with
+	 * pg_wal if it's a symlink, pg_tblspc has to be visited separately with
 	 * process_symlinks = true.  Note that if there are any plain directories
 	 * in pg_tblspc, they'll get fsync'd twice.  That's not an expected case
 	 * so we don't worry about optimizing it.
 	 */
 	walkdir(pg_data, fsync_fname_ext, false);
 	if (xlog_is_symlink)
-		walkdir(pg_xlog, fsync_fname_ext, false);
+		walkdir(pg_wal, fsync_fname_ext, false);
 	walkdir(pg_tblspc, fsync_fname_ext, true);
 
 	check_ok();
@@ -3087,7 +3087,7 @@ create_xlog_or_symlink(void)
 	char	   *subdirloc;
 
 	/* form name of the place for the subdirectory or symlink */
-	subdirloc = psprintf("%s/pg_xlog", pg_data);
+	subdirloc = psprintf("%s/pg_wal", pg_data);
 
 	if (strcmp(xlog_dir, "") != 0)
 	{
@@ -3220,7 +3220,7 @@ initialize_data_directory(void)
 
 	create_xlog_or_symlink();
 
-	/* Create required subdirectories (other than pg_xlog) */
+	/* Create required subdirectories (other than pg_wal) */
 	printf(_("creating subdirectories ... "));
 	fflush(stdout);
 
