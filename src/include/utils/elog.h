@@ -229,6 +229,9 @@ extern int	internalerrquery(const char *query);
 
 extern int	err_generic_string(int field, const char *str);
 
+extern int	errtrace(const char *trace_id, const char *span_id,
+					 const char *trace_flags);
+
 extern int	geterrcode(void);
 extern int	geterrposition(void);
 extern int	getinternalerrposition(void);
@@ -460,6 +463,9 @@ typedef struct ErrorData
 	int			cursorpos;		/* cursor index into query string */
 	int			internalpos;	/* cursor index into internalquery */
 	char	   *internalquery;	/* text of internally-generated query */
+	char	   *trace_id;		/* W3C trace-id (hex), or NULL */
+	char	   *span_id;		/* W3C span-id (hex), or NULL */
+	char	   *trace_flags;	/* W3C trace-flags (hex), or NULL */
 	int			saved_errno;	/* errno at entry */
 
 	/* context containing associated non-constant strings */

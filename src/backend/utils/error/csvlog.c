@@ -249,6 +249,14 @@ write_csvlog(ErrorData *edata)
 
 	/* query id */
 	appendStringInfo(&buf, "%" PRId64, pgstat_get_my_query_id());
+	appendStringInfoChar(&buf, ',');
+
+	/* OpenTelemetry trace context (trace_id, span_id, trace_flags) */
+	appendCSVLiteral(&buf, edata->trace_id);
+	appendStringInfoChar(&buf, ',');
+	appendCSVLiteral(&buf, edata->span_id);
+	appendStringInfoChar(&buf, ',');
+	appendCSVLiteral(&buf, edata->trace_flags);
 
 	appendStringInfoChar(&buf, '\n');
 
