@@ -22,6 +22,7 @@
 #define PqMsg_Execute				'E'
 #define PqMsg_FunctionCall			'F'
 #define PqMsg_Flush					'H'
+#define PqMsg_RequestHeaders		'M'
 #define PqMsg_Parse					'P'
 #define PqMsg_Query					'Q'
 #define PqMsg_Sync					'S'

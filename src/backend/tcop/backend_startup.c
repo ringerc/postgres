@@ -25,6 +25,7 @@
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
+#include "libpq/protocol_headers.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
@@ -803,12 +804,29 @@ retry:
 									valptr),
 							 errhint("Valid values are: \"false\", 0, \"true\", 1, \"database\".")));
 			}
+			else if (strcmp(nameptr, "_pq_.headers") == 0)
+			{
+				/*
+				 * Client is opting in to the per-message RequestHeaders
+				 * mechanism (message type 'M').  Honor the opt-in only if
+				 * the server-side feature is also enabled; otherwise treat
+				 * it as unrecognized so the client learns the server
+				 * cannot accept 'M' messages.  The value is currently
+				 * ignored --- the parameter's mere presence is the
+				 * opt-in.
+				 */
+				if (protocol_headers_enabled)
+					ProtocolHeadersNegotiated = true;
+				else
+					unrecognized_protocol_options =
+						lappend(unrecognized_protocol_options, pstrdup(nameptr));
+			}
 			else if (strncmp(nameptr, "_pq_.", 5) == 0)
 			{
 				/*
 				 * Any option beginning with _pq_. is reserved for use as a
-				 * protocol-level option, but at present no such options are
-				 * defined.
+				 * protocol-level option; report unrecognized ones via
+				 * NegotiateProtocolVersion below.
 				 */
 				unrecognized_protocol_options =
 					lappend(unrecognized_protocol_options, pstrdup(nameptr));
