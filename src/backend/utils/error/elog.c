@@ -1755,6 +1755,32 @@ err_generic_string(int field, const char *str)
 }
 
 /*
+ * errtrace --- attach a W3C TraceContext (trace-id, span-id, trace-flags)
+ * to the current error.
+ *
+ * Any of the arguments may be NULL to leave that field unset.  Values are
+ * expected to be in W3C hex form (trace-id = 32 chars, span-id = 16 chars,
+ * trace-flags = 2 chars), but no length validation is performed here.
+ */
+int
+errtrace(const char *trace_id, const char *span_id, const char *trace_flags)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+
+	/* we don't bother incrementing recursion_depth */
+	CHECK_STACK_DEPTH();
+
+	if (trace_id)
+		set_errdata_field(edata->assoc_context, &edata->trace_id, trace_id);
+	if (span_id)
+		set_errdata_field(edata->assoc_context, &edata->span_id, span_id);
+	if (trace_flags)
+		set_errdata_field(edata->assoc_context, &edata->trace_flags, trace_flags);
+
+	return 0;					/* return value does not matter */
+}
+
+/*
  * set_errdata_field --- set an ErrorData string field
  */
 static void
@@ -1997,6 +2023,12 @@ CopyErrorData(void)
 		newedata->constraint_name = pstrdup(newedata->constraint_name);
 	if (newedata->internalquery)
 		newedata->internalquery = pstrdup(newedata->internalquery);
+	if (newedata->trace_id)
+		newedata->trace_id = pstrdup(newedata->trace_id);
+	if (newedata->span_id)
+		newedata->span_id = pstrdup(newedata->span_id);
+	if (newedata->trace_flags)
+		newedata->trace_flags = pstrdup(newedata->trace_flags);
 
 	/* Use the calling context for string allocation */
 	newedata->assoc_context = CurrentMemoryContext;
@@ -2049,6 +2081,12 @@ FreeErrorDataContents(ErrorData *edata)
 		pfree(edata->constraint_name);
 	if (edata->internalquery)
 		pfree(edata->internalquery);
+	if (edata->trace_id)
+		pfree(edata->trace_id);
+	if (edata->span_id)
+		pfree(edata->span_id);
+	if (edata->trace_flags)
+		pfree(edata->trace_flags);
 }
 
 /*
@@ -2130,6 +2168,12 @@ ThrowErrorData(ErrorData *edata)
 	newedata->internalpos = edata->internalpos;
 	if (edata->internalquery)
 		newedata->internalquery = pstrdup(edata->internalquery);
+	if (edata->trace_id)
+		newedata->trace_id = pstrdup(edata->trace_id);
+	if (edata->span_id)
+		newedata->span_id = pstrdup(edata->span_id);
+	if (edata->trace_flags)
+		newedata->trace_flags = pstrdup(edata->trace_flags);
 
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
@@ -2185,6 +2229,12 @@ ReThrowError(ErrorData *edata)
 		newedata->constraint_name = pstrdup(newedata->constraint_name);
 	if (newedata->internalquery)
 		newedata->internalquery = pstrdup(newedata->internalquery);
+	if (newedata->trace_id)
+		newedata->trace_id = pstrdup(newedata->trace_id);
+	if (newedata->span_id)
+		newedata->span_id = pstrdup(newedata->span_id);
+	if (newedata->trace_flags)
+		newedata->trace_flags = pstrdup(newedata->trace_flags);
 
 	/* Reset the assoc_context to be ErrorContext */
 	newedata->assoc_context = ErrorContext;
@@ -3639,6 +3689,28 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 				else
 					appendStringInfo(buf, "%" PRId64,
 									 pgstat_get_my_query_id());
+				break;
+			case 'T':
+				if (edata->trace_id)
+				{
+					if (padding != 0)
+						appendStringInfo(buf, "%*s", padding, edata->trace_id);
+					else
+						appendStringInfoString(buf, edata->trace_id);
+				}
+				else if (padding != 0)
+					appendStringInfo(buf, "%*s", padding, "");
+				break;
+			case 'S':
+				if (edata->span_id)
+				{
+					if (padding != 0)
+						appendStringInfo(buf, "%*s", padding, edata->span_id);
+					else
+						appendStringInfoString(buf, edata->span_id);
+				}
+				else if (padding != 0)
+					appendStringInfo(buf, "%*s", padding, "");
 				break;
 			default:
 				/* format error - ignore it */
