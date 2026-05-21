@@ -4407,6 +4407,15 @@ PostgresMain(const char *dbname, const char *username)
 	BeginReportingGUCOptions();
 
 	/*
+	 * Advertise the protocol-level features negotiated for this connection
+	 * (e.g. _pq_.headers).  This rides on the initial ParameterStatus burst
+	 * that proxies are accustomed to relaying, so a client can distinguish
+	 * "server agreed" from "an intermediary stripped my opt-in and the
+	 * absence of NegotiateProtocolVersion is meaningless".
+	 */
+	SendProtocolFeaturesParameterStatus();
+
+	/*
 	 * Also set up handler to log session end; we have to wait till now to be
 	 * sure Log_disconnections has its final value.
 	 */

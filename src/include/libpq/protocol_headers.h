@@ -104,4 +104,24 @@ extern void ClearStatementScopeHeaders(void);
  */
 extern void ProtocolHeadersInit(void);
 
+/*
+ * Emit a ParameterStatus message advertising the protocol-level features
+ * negotiated for this connection.  Called by PostgresMain immediately
+ * after BeginReportingGUCOptions(), so it travels with the rest of the
+ * initial ParameterStatus burst that proxies are accustomed to relaying.
+ *
+ * The key is "protocol_features"; the value is a comma-separated list of
+ * negotiated feature names.  Currently only "headers" can appear in the
+ * list.  The message is sent only when the list is non-empty, so older
+ * proxies that don't know to relay an unknown key don't carry an extra
+ * empty message.
+ *
+ * The presence of this message --- not the absence of
+ * NegotiateProtocolVersion --- is the client's only reliable signal that
+ * the feature actually works end-to-end through whatever proxies are in
+ * the connection path.  See the commit message for the proxy
+ * false-positive scenario this defends against.
+ */
+extern void SendProtocolFeaturesParameterStatus(void);
+
 #endif							/* PROTOCOL_HEADERS_H */

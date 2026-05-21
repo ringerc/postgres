@@ -29,9 +29,13 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "libpq/libpq.h"
 #include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "libpq/protocol_headers.h"
 #include "storage/ipc.h"
+#include "tcop/dest.h"
+#include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 
 /* Negotiation state set during StartupPacket processing. */
@@ -112,6 +116,43 @@ RegisterProtocolHeaderHandler(const char *prefix,
 	handler_list = h;
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Emit a ParameterStatus advertising the protocol features negotiated
+ * for this connection.  See header for rationale; see commit log for
+ * the proxy false-positive scenario this defends against.
+ *
+ * The message is only sent when at least one feature is active so
+ * older clients/proxies that don't know to relay an unknown key are
+ * not burdened with empty messages.
+ */
+void
+SendProtocolFeaturesParameterStatus(void)
+{
+	StringInfoData buf;
+	StringInfoData features;
+
+	if (whereToSendOutput != DestRemote)
+		return;
+
+	initStringInfo(&features);
+	if (ProtocolHeadersNegotiated)
+		appendStringInfoString(&features, "headers");
+	/* future negotiated features append here, comma-separated */
+
+	if (features.len == 0)
+	{
+		pfree(features.data);
+		return;
+	}
+
+	pq_beginmessage(&buf, PqMsg_ParameterStatus);
+	pq_sendstring(&buf, "protocol_features");
+	pq_sendstring(&buf, features.data);
+	pq_endmessage(&buf);
+
+	pfree(features.data);
 }
 
 /*
