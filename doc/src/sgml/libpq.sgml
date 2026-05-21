@@ -2909,6 +2909,7 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
         <member><varname>integer_datetimes</varname></member>
         <member><varname>IntervalStyle</varname></member>
         <member><varname>is_superuser</varname></member>
+        <member><varname>protocol_features</varname></member>
         <member><varname>scram_iterations</varname></member>
         <member><varname>search_path</varname></member>
         <member><varname>server_encoding</varname></member>
@@ -5283,6 +5284,195 @@ unsigned char *PQunescapeBytea(const unsigned char *from, size_t *to_length);
    </variablelist>
 
   </sect2>
+
+ </sect1>
+
+ <sect1 id="libpq-headers">
+  <title>Per-Message Protocol Headers</title>
+
+  <indexterm zone="libpq-headers">
+   <primary>protocol headers</primary>
+  </indexterm>
+
+  <para>
+   Applications can attach a list of <literal>(key, value)</literal>
+   string pairs to the next operation sent to the server.  The pairs
+   travel in a single <literal>RequestHeaders</literal>
+   (<literal>'M'</literal>) protocol message that precedes the
+   operation; the server dispatches each pair to whichever loadable
+   extension has registered interest in the key's prefix.  This is the
+   wire-level mechanism that supports features such as OpenTelemetry
+   trace-context propagation, application-supplied query tags, and
+   per-request correlation IDs without requiring a new protocol-version
+   bump for each consumer.
+  </para>
+
+  <para>
+   Headers are advisory only.  They are intended to carry observability
+   and routing metadata and <emphasis>must not</emphasis> be used for
+   authorization decisions or as the basis of row-level security
+   predicates.  Authentication is handled by the connection's
+   authentication exchange, not by these headers.
+  </para>
+
+  <para>
+   The feature is negotiated automatically at startup.
+   <application>libpq</application> always advertises support by
+   sending <literal>_pq_.headers=1</literal> as a protocol option in
+   the <literal>StartupMessage</literal>.  A server that supports the
+   feature confirms acceptance by emitting a
+   <literal>ParameterStatus</literal> message with key
+   <literal>protocol_features</literal> whose comma-separated value
+   includes <literal>headers</literal>.  The presence of this
+   affirmative acknowledgement &mdash; not the absence of a
+   <literal>NegotiateProtocolVersion</literal> &mdash; is the only
+   reliable signal that the feature works end-to-end through whatever
+   proxies are in the connection path.  Use
+   <xref linkend="libpq-PQheadersAvailable"/> to check.
+  </para>
+
+  <variablelist>
+   <varlistentry id="libpq-PQattachHeader">
+    <term><function>PQattachHeader</function><indexterm><primary>PQattachHeader</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Queues a <literal>(key, value)</literal> protocol header to be
+      sent as part of the next operation on the connection.
+
+<synopsis>
+int PQattachHeader(PGconn *conn, const char *key, const char *value);
+</synopsis>
+     </para>
+
+     <para>
+      Headers accumulate in a per-connection queue.  The queue is
+      flushed as a single <literal>RequestHeaders</literal> message
+      immediately before the next call to
+      <xref linkend="libpq-PQexec"/>,
+      <xref linkend="libpq-PQexecParams"/>,
+      <xref linkend="libpq-PQprepare"/>,
+      <xref linkend="libpq-PQexecPrepared"/>,
+      <xref linkend="libpq-PQsendQuery"/>, or any other function that
+      initiates a frontend operation on the connection.  After flush
+      the queue is empty, so headers attached to one operation do not
+      bleed into the next.
+     </para>
+
+     <para>
+      Returns <literal>1</literal> on success and <literal>0</literal>
+      on failure.  Failure cases include the server not having
+      negotiated <literal>_pq_.headers</literal> (see
+      <xref linkend="libpq-PQheadersAvailable"/>), a <symbol>NULL</symbol>
+      <parameter>key</parameter> or <parameter>value</parameter>, and
+      out-of-memory.  On failure call
+      <xref linkend="libpq-PQerrorMessage"/> for details.
+     </para>
+
+     <para>
+      The interpretation of header keys and values is the
+      responsibility of whichever server-side extension consumes them.
+      <application>libpq</application> performs no format validation
+      beyond rejecting embedded <literal>NUL</literal> bytes (which
+      would break the protocol's NUL-terminated string encoding).  By
+      convention, keys are namespaced using a prefix that identifies
+      the consumer (for example, <literal>otel.traceparent</literal>
+      for the bundled OpenTelemetry handler), and an empty
+      <parameter>value</parameter> requests that the named key's
+      effect be cleared on the server side.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="libpq-PQclearHeaders">
+    <term><function>PQclearHeaders</function><indexterm><primary>PQclearHeaders</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Discards all headers queued by previous calls to
+      <xref linkend="libpq-PQattachHeader"/> on this connection,
+      without sending them.
+
+<synopsis>
+void PQclearHeaders(PGconn *conn);
+</synopsis>
+     </para>
+
+     <para>
+      Useful when an application has queued headers in preparation for
+      an operation that it has since decided not to issue, or to reset
+      a partially-built header set before retrying with a different
+      one.  The queue is also drained automatically by the next
+      operation that triggers a flush, so explicit
+      <function>PQclearHeaders</function> is only needed to cancel a
+      pending attachment.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="libpq-PQheadersAvailable">
+    <term><function>PQheadersAvailable</function><indexterm><primary>PQheadersAvailable</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Reports whether the server has affirmatively negotiated the
+      per-message protocol headers feature on this connection.
+
+<synopsis>
+int PQheadersAvailable(const PGconn *conn);
+</synopsis>
+     </para>
+
+     <para>
+      Returns <literal>1</literal> if the server emitted a
+      <literal>ParameterStatus</literal> message advertising
+      <literal>protocol_features</literal> with a value containing
+      <literal>headers</literal>, and <literal>0</literal> otherwise.
+      The result is meaningful only after the connection has reached
+      <literal>CONNECTION_OK</literal>.
+     </para>
+
+     <para>
+      The <emphasis>absence</emphasis> of a
+      <literal>NegotiateProtocolVersion</literal> rejection during
+      startup is not a sufficient signal of acceptance: a connection
+      pooler in the network path may have silently stripped
+      <application>libpq</application>'s
+      <literal>_pq_.headers</literal> opt-in from the
+      <literal>StartupMessage</literal>, in which case the server
+      never saw the option and emits nothing about it.  Relying on the
+      affirmative <literal>ParameterStatus</literal> &mdash; which
+      proxies relay along with the other startup-time
+      <literal>ParameterStatus</literal> messages such as
+      <varname>server_version</varname> &mdash; closes that gap.
+     </para>
+
+     <para>
+      <xref linkend="libpq-PQattachHeader"/> also fails when this
+      function would return <literal>0</literal>, so applications that
+      do not care to distinguish a feature-supported connection from a
+      not-supported one can simply ignore the return value of
+      <function>PQheadersAvailable</function> and react to a
+      <xref linkend="libpq-PQattachHeader"/> failure instead.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+
+  <para>
+   Pooled and proxied deployments require special consideration.  A
+   pooler that does not understand the
+   <literal>RequestHeaders</literal> message will drop the
+   <literal>'M'</literal> wire byte and break the operation that
+   followed it.  Even a pooler that understands the message but
+   operates in transaction-pooling mode cannot meaningfully apply a
+   per-client opt-in to a shared backend connection that was opened
+   without one.  The affirmative <literal>ParameterStatus</literal>
+   acknowledgement protects clients from silently mis-detecting the
+   feature as available in such environments, but it cannot make the
+   feature work; the pooler itself must learn to relay
+   <literal>RequestHeaders</literal> messages.
+  </para>
 
  </sect1>
 
