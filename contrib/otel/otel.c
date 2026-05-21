@@ -9,35 +9,51 @@
  * the trace-id, span-id and trace-flags to every log message emitted
  * for the remainder of the current transaction.
  *
- * Recognized header keys:
+ * State storage:
+ *
+ * The active trace context is stored in two custom GUCs:
  *
  *	 otel.traceparent  W3C TraceContext header value
- *					   ("00-{32 hex}-{16 hex}-{2 hex}"); see
- *					   https://www.w3.org/TR/trace-context/.
- *	 otel.tracestate   Companion W3C header, stored opaquely and
- *					   not interpreted further by this module.
+ *					   ("00-{32 hex}-{16 hex}-{2 hex}").  An assign-hook
+ *					   parses and decomposes the value into the
+ *					   in-memory OtelContext struct used by the
+ *					   emit_log_hook.
+ *	 otel.tracestate   Companion W3C header, stored opaquely by the GUC
+ *					   machinery; not interpreted further by this module.
+ *
+ * Using GUCs as the canonical storage has a deliberate side effect:
+ * GUC values automatically propagate to parallel workers via
+ * RestoreGUCState during ParallelWorkerMain startup.  The workers'
+ * assign-hooks then populate their own copies of the in-memory
+ * OtelContext, so worker-side log emission picks up the trace context
+ * exactly as the leader's does.  No bespoke parallel-state plumbing
+ * is required.
  *
  * Behaviour:
  *
- *	 * The handler is registered at PROTOCOL_HEADER_SCOPE_TRANSACTION;
- *	   the trace context set with a single 'M' message applies for the
- *	   remainder of the current transaction and is cleared at
- *	   COMMIT/ROLLBACK (or at the end of the implicit transaction
- *	   around a single Parse/Bind/Execute cycle).
- *
- *	 * An emit_log_hook (in otel_log.c) fills the ErrorData trace_id /
- *	   span_id / trace_flags fields whenever a trace context is active,
- *	   so the built-in JSON-log writer, CSV-log writer, and
- *	   log_line_prefix %T / %S escapes pick the values up automatically.
- *
- *	 * Malformed traceparent values are silently ignored (at DEBUG1
- *	   level).  An empty value is the documented "clear this key"
- *	   convention.
+ *	 * The header handler is registered at
+ *	   PROTOCOL_HEADER_SCOPE_TRANSACTION; one 'M' before BEGIN (or
+ *	   before a one-shot Parse/Bind/Execute) installs context for
+ *	   every statement until COMMIT/ROLLBACK or the end of the
+ *	   implicit transaction.  Last-write-wins.
+ *	 * An emit_log_hook (in otel_log.c) fills ErrorData.trace_id /
+ *	   span_id / trace_flags when not already set, so the built-in
+ *	   JSON-log, CSV-log, and log_line_prefix %T / %S escapes pick
+ *	   the values up automatically.
+ *	 * Malformed traceparent values are rejected by the GUC check-hook
+ *	   with a clear error message (instead of being silently dropped
+ *	   like in the previous direct-write design); any user-facing
+ *	   error is surfaced through normal GUC error reporting.
+ *	 * An empty value is the documented "clear this key" convention
+ *	   from the headers mechanism, and translates to a GUC reset
+ *	   (SetConfigOption with a NULL value).
  *
  * Module must be loaded via shared_preload_libraries so the header
- * handler is registered before any client connects.  CREATE EXTENSION
- * otel installs the introspection SQL function but is not required to
- * receive trace context from clients.
+ * handler is registered before any backend processes its first 'M'
+ * message, and so the custom GUCs are defined before any worker
+ * tries to restore them.  CREATE EXTENSION otel installs the
+ * introspection SQL function but is not required for receiving
+ * trace context from clients.
  *
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -57,73 +73,131 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 
 #include "otel_internal.h"
 
 PG_MODULE_MAGIC;
 
-/*
- * Currently-active trace context for this backend.  Storage is in
- * TopMemoryContext via MemoryContextStrdup, so values survive across
- * statements within a transaction until cleared by the handler's
- * scope callback.
- */
+/* In-memory derived state populated by the otel.traceparent assign-hook
+ * (called by the GUC machinery on M-header arrival, SET, or
+ * parallel-worker RestoreGUCState).  Read by the emit_log_hook in
+ * otel_log.c. */
 OtelContext otel_ctx;
+
+/* GUC variables --- canonical storage. */
+static char *otel_traceparent_guc;
+static char *otel_tracestate_guc;
+
 
 static bool parse_traceparent(const char *s, OtelContext *out);
 static bool all_hex(const char *p, size_t n);
 static bool all_zeros(const char *p, size_t n);
-static void otel_reset(void);
+static void otel_ctx_reset(void);
+
+/* GUC check / assign hooks. */
+static bool check_traceparent(char **newval, void **extra, GucSource source);
+static void assign_traceparent(const char *newval, void *extra);
+
+
+/*
+ * GUC check-hook for otel.traceparent --- validates the W3C format.
+ * An empty string or NULL is accepted as "clear".
+ */
+static bool
+check_traceparent(char **newval, void **extra, GucSource source)
+{
+	OtelContext tmp;
+
+	if (*newval == NULL || (*newval)[0] == '\0')
+		return true;
+
+	if (!parse_traceparent(*newval, &tmp))
+	{
+		GUC_check_errmsg("invalid W3C traceparent format: \"%s\"", *newval);
+		GUC_check_errdetail("Expected \"00-{32 hex}-{16 hex}-{2 hex}\" with non-zero trace-id and parent-id.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * GUC assign-hook for otel.traceparent --- populates the in-memory
+ * derived state.  Called on every value change, including by
+ * RestoreGUCState in a parallel worker.
+ */
+static void
+assign_traceparent(const char *newval, void *extra)
+{
+	OtelContext tmp;
+
+	if (newval == NULL || newval[0] == '\0')
+	{
+		otel_ctx_reset();
+		return;
+	}
+
+	/*
+	 * parse_traceparent was already vetted in the check-hook; this
+	 * cannot fail.  Defensively still check.
+	 */
+	if (parse_traceparent(newval, &tmp))
+		otel_ctx = tmp;
+	else
+		otel_ctx_reset();
+}
 
 /*
  * Header set callback: invoked once per matching entry in an incoming
- * RequestHeaders message.
+ * RequestHeaders message.  Routes through SetConfigOption so the GUC
+ * machinery propagates to parallel workers and triggers the assign
+ * hook (which updates the in-memory derived state).
  */
 static void
 otel_set_cb(const char *key, const char *value, void *cb_ctx)
 {
-	if (strcmp(key, "otel.traceparent") == 0)
-	{
-		if (value[0] == '\0')
-		{
-			/* documented "clear this key" convention */
-			otel_reset();
-			return;
-		}
+	const char *guc;
 
-		if (!parse_traceparent(value, &otel_ctx))
-			ereport(DEBUG1,
-					(errmsg("otel: ignoring malformed traceparent value")));
-	}
+	if (strcmp(key, "otel.traceparent") == 0)
+		guc = "otel.traceparent";
 	else if (strcmp(key, "otel.tracestate") == 0)
-	{
-		if (otel_ctx.tracestate)
-		{
-			pfree(otel_ctx.tracestate);
-			otel_ctx.tracestate = NULL;
-		}
-		if (value[0] != '\0')
-			otel_ctx.tracestate =
-				MemoryContextStrdup(TopMemoryContext, value);
-	}
-	/* unknown otel.* keys are silently ignored */
+		guc = "otel.tracestate";
+	else
+		return;					/* unknown otel.* key */
+
+	/*
+	 * An empty value is the documented "clear this key" convention; map
+	 * it to a GUC reset by passing NULL as the value.  Malformed
+	 * traceparent values are rejected by the GUC check-hook with a LOG
+	 * (we swallow the error so a misbehaving client cannot abort the
+	 * caller's operation; the operation proceeds without a trace
+	 * context).
+	 */
+	(void) set_config_option(guc,
+							 value[0] == '\0' ? NULL : value,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, LOG, false);
 }
 
 /*
- * Header clear callback: invoked once at the handler's scope boundary
- * (transaction end).
+ * Header clear callback: invoked at the handler's scope boundary
+ * (transaction end).  Clears both GUCs back to default.
  */
 static void
 otel_clear_cb(void *cb_ctx)
 {
-	otel_reset();
+	(void) set_config_option("otel.traceparent", NULL,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, LOG, false);
+	(void) set_config_option("otel.tracestate", NULL,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, LOG, false);
 }
 
 /*
- * SQL function: return the currently-active traceparent, in W3C
- * traceparent header format, or NULL if none is set.  Useful for
- * application-side introspection and for testing.
+ * SQL function: return the currently-active traceparent in W3C
+ * header format, or NULL if none is set.
  */
 PG_FUNCTION_INFO_V1(otel_current_traceparent);
 
@@ -142,8 +216,9 @@ otel_current_traceparent(PG_FUNCTION_ARGS)
 
 /*
  * Module entrypoint.  Must run in the postmaster (via
- * shared_preload_libraries) so the handler is in place before any
- * backend processes its first 'M' message.
+ * shared_preload_libraries) so the GUCs are defined and the header
+ * handler is in place before any backend, including any future
+ * parallel worker, needs them.
  */
 void		_PG_init(void);
 
@@ -153,6 +228,37 @@ _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
 				(errmsg("otel must be loaded via shared_preload_libraries")));
+
+	/*
+	 * Custom GUCs --- canonical storage for trace context.  Defined
+	 * with PGC_USERSET so the postgres GUC machinery propagates them
+	 * to parallel workers without any bespoke plumbing.  Both default
+	 * to the empty string (= "no context set"); the assign-hook
+	 * collapses empty -> no context.
+	 */
+	DefineCustomStringVariable("otel.traceparent",
+							   "W3C Trace Context traceparent for the current operation.",
+							   "Format: \"00-{32 hex}-{16 hex}-{2 hex}\". Empty means no trace context.",
+							   &otel_traceparent_guc,
+							   "",
+							   PGC_USERSET,
+							   0,
+							   check_traceparent,
+							   assign_traceparent,
+							   NULL);
+
+	DefineCustomStringVariable("otel.tracestate",
+							   "W3C Trace Context tracestate companion value.",
+							   "Stored opaquely; not interpreted by this module.",
+							   &otel_tracestate_guc,
+							   "",
+							   PGC_USERSET,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	MarkGUCPrefixReserved("otel");
 
 	RegisterProtocolHeaderHandler("otel.",
 								  PROTOCOL_HEADER_SCOPE_TRANSACTION,
@@ -206,22 +312,16 @@ parse_traceparent(const char *s, OtelContext *out)
 	memcpy(out->trace_flags, s + 53, OTEL_TRACE_FLAGS_LEN);
 	out->trace_flags[OTEL_TRACE_FLAGS_LEN] = '\0';
 	out->is_set = true;
-	/* tracestate is set independently and not touched here */
 	return true;
 }
 
 static void
-otel_reset(void)
+otel_ctx_reset(void)
 {
 	otel_ctx.is_set = false;
 	otel_ctx.trace_id[0] = '\0';
 	otel_ctx.span_id[0] = '\0';
 	otel_ctx.trace_flags[0] = '\0';
-	if (otel_ctx.tracestate)
-	{
-		pfree(otel_ctx.tracestate);
-		otel_ctx.tracestate = NULL;
-	}
 }
 
 static bool

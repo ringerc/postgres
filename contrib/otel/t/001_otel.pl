@@ -276,6 +276,34 @@ like(
 run_query($sock, 'ROLLBACK');
 
 # ----------------------------------------------------------------------
+# Test 6: parallel-worker propagation.
+#
+# The trace context is stored in custom GUCs (otel.traceparent,
+# otel.tracestate); custom GUCs propagate to parallel workers as part
+# of the standard parallel-state machinery (RestoreGUCState during
+# worker startup).  The worker's assign_hook fires during that
+# restore, populating the worker's in-memory OtelContext.
+#
+# debug_parallel_query=regress forces every query through a Gather,
+# so otel_current_traceparent() runs in a worker rather than the
+# leader.  Without propagation the function would return NULL (the
+# worker's otel_ctx would be empty); with propagation it returns the
+# leader's active traceparent.
+# ----------------------------------------------------------------------
+
+run_query($sock, "SET debug_parallel_query = regress");
+
+run_query($sock, 'BEGIN');
+send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+
+my @parallel_msgs = run_query($sock, 'SELECT otel_current_traceparent()');
+is(first_value(@parallel_msgs), $TRACEPARENT,
+	'parallel worker sees the trace context (GUC propagated, assign_hook populated worker otel_ctx)');
+
+run_query($sock, 'COMMIT');
+run_query($sock, "SET debug_parallel_query = off");
+
+# ----------------------------------------------------------------------
 # Tidy up.
 # ----------------------------------------------------------------------
 
