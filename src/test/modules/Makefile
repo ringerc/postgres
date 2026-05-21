@@ -43,6 +43,7 @@ SUBDIRS = \
 		  test_pg_dump \
 		  test_plan_advice \
 		  test_predtest \
+		  test_protocol_headers \
 		  test_radixtree \
 		  test_rbtree \
 		  test_regex \
