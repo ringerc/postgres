@@ -28,6 +28,7 @@ SUBDIRS = \
 		lo		\
 		ltree		\
 		oid2name	\
+		otel		\
 		pageinspect	\
 		passwordcheck	\
 		pg_buffercache	\
