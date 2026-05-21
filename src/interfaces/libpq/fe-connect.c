@@ -5176,6 +5176,11 @@ freePGconn(PGconn *conn)
 	free(conn->inBuffer);
 	free(conn->outBuffer);
 	free(conn->rowBuf);
+
+	/* Drop any queued protocol headers and the array itself. */
+	pqReleaseQueuedHeaders(conn);
+	free(conn->queuedHeaders);
+
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 

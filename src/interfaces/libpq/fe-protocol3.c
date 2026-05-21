@@ -2532,6 +2532,16 @@ build_startup_packet(const PGconn *conn, char *packet,
 	if (conn->pversion == PG_PROTOCOL_GREASE)
 		ADD_STARTUP_OPTION("_pq_.test_protocol_negotiation", "");
 
+	/*
+	 * Advertise support for per-message protocol headers (RequestHeaders,
+	 * 'M').  Old servers, and servers with the feature disabled, will
+	 * report the option as unrecognized via NegotiateProtocolVersion;
+	 * acceptance is confirmed by a "protocol_features" ParameterStatus
+	 * later, not by the absence of NegotiateProtocolVersion (an
+	 * intermediary may have stripped the option).
+	 */
+	ADD_STARTUP_OPTION("_pq_.headers", "1");
+
 	/* Add any environment-driven GUC settings needed */
 	for (next_eo = options; next_eo->envName; next_eo++)
 	{
