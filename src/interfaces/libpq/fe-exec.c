@@ -1155,6 +1155,34 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 		conn->std_strings = (strcmp(value, "on") == 0);
 		static_std_strings = conn->std_strings;
 	}
+	else if (strcmp(name, "protocol_features") == 0)
+	{
+		/*
+		 * Comma-separated list of v3 protocol features the server has
+		 * affirmatively negotiated for this connection.  We only need to
+		 * recognize "headers" here; unknown future names are ignored.
+		 * Scan with explicit token boundaries so a hypothetical feature
+		 * name like "myheaders" cannot be mistaken for "headers".
+		 */
+		const char *p = value;
+
+		while (*p)
+		{
+			const char *start = p;
+			const char *end;
+
+			while (*p && *p != ',')
+				p++;
+			end = p;
+			if (end - start == 7 && memcmp(start, "headers", 7) == 0)
+			{
+				conn->headersAvailable = true;
+				break;
+			}
+			if (*p == ',')
+				p++;
+		}
+	}
 	else if (strcmp(name, "server_version") == 0)
 	{
 		/* We convert the server version to numeric form. */
@@ -1713,6 +1741,18 @@ PQsendQueryStart(PGconn *conn, bool newQuery)
 	{
 		libpq_append_conn_error(conn, "another command is already in progress");
 		return false;
+	}
+
+	/*
+	 * Flush any headers queued via PQattachHeader() into a single
+	 * RequestHeaders ('M') message that precedes the operation we're
+	 * about to send.  Headers queue per-connection and consume on flush,
+	 * so each subsequent operation gets a fresh empty queue.
+	 */
+	if (conn->nQueuedHeaders > 0)
+	{
+		if (pqFlushHeaders(conn) != 0)
+			return false;
 	}
 
 	if (conn->pipelineStatus != PQ_PIPELINE_OFF)

@@ -676,6 +676,44 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
 
 
 
+/* === in fe-headers.c === */
+
+/*
+ * Per-message protocol headers.
+ *
+ * PQattachHeader queues a (key, value) header to be sent as a single
+ * RequestHeaders ('M') message immediately before the next PQsend* /
+ * PQexec* operation on this connection.  The queue is flushed at the
+ * start of that operation and is then empty for the next one.
+ *
+ * Headers are advisory only and must not be used in authorization
+ * decisions.  The server side dispatches headers to extension-supplied
+ * handlers by key prefix.
+ *
+ * Returns 1 on success, 0 on failure (use PQerrorMessage).  Failure
+ * cases: the server did not negotiate _pq_.headers (see
+ * PQheadersAvailable); key or value contains a NUL byte; out of memory.
+ */
+extern int	PQattachHeader(PGconn *conn,
+						   const char *key,
+						   const char *value);
+
+/* Discard any queued headers without sending them. */
+extern void PQclearHeaders(PGconn *conn);
+
+/*
+ * Returns 1 if the server affirmatively negotiated _pq_.headers during
+ * the startup handshake (i.e. the server emitted a ParameterStatus
+ * "protocol_features" listing "headers"); 0 otherwise.  Note that the
+ * absence of a NegotiateProtocolVersion is NOT sufficient evidence on
+ * its own, since an intermediary may have silently stripped the
+ * client's _pq_.headers opt-in; PQheadersAvailable rides on the
+ * affirmative ParameterStatus instead.
+ */
+extern int	PQheadersAvailable(const PGconn *conn);
+
+
+
 /* === in fe-print.c === */
 
 extern void PQprint(FILE *fout, /* output stream */
