@@ -350,6 +350,15 @@ typedef struct PGcmdQueueEntry
 } PGcmdQueueEntry;
 
 /*
+ * One queued protocol-header entry; key and value are malloc'd.
+ */
+typedef struct PQqueuedHeader
+{
+	char	   *key;
+	char	   *value;
+} PQqueuedHeader;
+
+/*
  * pg_conn_host stores all information about each of possibly several hosts
  * mentioned in the connection string.  Most fields are derived by splitting
  * the relevant connection parameter (e.g., pghost) at commas.
@@ -497,6 +506,24 @@ struct pg_conn
 	 * save them in this list for possible reuse.
 	 */
 	PGcmdQueueEntry *cmd_queue_recycle;
+
+	/*
+	 * Per-message protocol headers ('M' / RequestHeaders).
+	 *
+	 * headersAvailable is set to true only when the server emitted a
+	 * "protocol_features" ParameterStatus listing "headers" during the
+	 * startup handshake --- an affirmative acknowledgement that survives
+	 * proxies that might silently strip _pq_.headers from the
+	 * StartupMessage.
+	 *
+	 * queuedHeaders holds key/value pairs queued by PQattachHeader; the
+	 * queue is flushed as a single RequestHeaders message at the start
+	 * of the next PQsend* / PQexec* operation.
+	 */
+	bool		headersAvailable;
+	int			nQueuedHeaders;
+	int			queuedHeadersCapacity;
+	PQqueuedHeader *queuedHeaders;
 
 	/* Connection data */
 	pgsocket	sock;			/* FD for socket, PGINVALID_SOCKET if
@@ -747,6 +774,12 @@ extern pgthreadlock_t pg_g_threadlock;
 
 #define pglock_thread()		pg_g_threadlock(true)
 #define pgunlock_thread()	pg_g_threadlock(false)
+
+/* === in fe-headers.c === */
+
+extern int	pqFlushHeaders(PGconn *conn);
+extern void pqReleaseQueuedHeaders(PGconn *conn);
+
 
 /* === in fe-exec.c === */
 
