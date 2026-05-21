@@ -1545,6 +1545,17 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 		{
 			found_test_protocol_negotiation = true;
 		}
+		else if (strcmp(conn->workBuffer.data, "_pq_.headers") == 0)
+		{
+			/*
+			 * The server does not support per-message headers (either too
+			 * old, or has the feature disabled).  Nothing to track here;
+			 * conn->headersAvailable defaults to false and is flipped to
+			 * true only by an affirmative "protocol_features"
+			 * ParameterStatus, so a NegotiateProtocolVersion mention of
+			 * _pq_.headers leaves it false as desired.
+			 */
+		}
 		else
 		{
 			libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"%s\")",
