@@ -147,13 +147,41 @@ send_startup(
 	database => 'postgres',
 	'_pq_.headers' => '1');
 
-my @startup_types = drain_to_rfq($sock);
+# Capture full messages so the protocol_features ParameterStatus body
+# can be inspected (drain_to_rfq returned types-only previously; widen it).
+my @startup_msgs;
+while (1)
+{
+	my ($type, $body) = recv_msg($sock);
+	die "connection closed before ReadyForQuery" unless defined $type;
+	push @startup_msgs, [ $type, $body ];
+	last if $type eq 'Z';
+}
+my @startup_types = map { $_->[0] } @startup_msgs;
+
 ok(!(grep { $_ eq 'v' } @startup_types),
 	'_pq_.headers=1 is accepted (no NegotiateProtocolVersion)');
 ok((grep { $_ eq 'R' } @startup_types),
 	'authentication message received');
 ok((grep { $_ eq 'Z' } @startup_types),
 	'ReadyForQuery reached');
+
+# Affirmative acknowledgement: the server must emit a ParameterStatus
+# carrying ("protocol_features", value-containing-"headers").  Without
+# this, a proxy that silently strips _pq_.headers would let the absence
+# of NegotiateProtocolVersion masquerade as success.
+my $features_seen = 0;
+for my $m (@startup_msgs)
+{
+	next unless $m->[0] eq 'S';
+	my @parts = split /\0/, $m->[1];	  # key, value, trailing-NUL artifact
+	next unless @parts >= 2 && $parts[0] eq 'protocol_features';
+	$features_seen = 1
+	  if grep { $_ eq 'headers' } split /,/, $parts[1];
+	last;
+}
+ok($features_seen,
+	'ParameterStatus protocol_features contains "headers"');
 
 # ----------------------------------------------------------------------
 # Test 2: statement-scope dispatch and clear.
