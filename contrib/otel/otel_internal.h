@@ -24,8 +24,10 @@
 								 OTEL_SPAN_ID_LEN + 1 + OTEL_TRACE_FLAGS_LEN)
 
 /*
- * In-memory derived trace context for this backend.  Populated by the
- * M-header callback in otel.c; read by the emit_log_hook in otel_log.c.
+ * In-memory derived trace context populated by the otel.traceparent
+ * assign-hook in otel.c; read by the emit_log_hook in otel_log.c.
+ * tracestate, when present, lives in the otel.tracestate GUC's own
+ * string storage and is not duplicated here.
  */
 typedef struct OtelContext
 {
@@ -33,7 +35,6 @@ typedef struct OtelContext
 	char		trace_id[OTEL_TRACE_ID_LEN + 1];
 	char		span_id[OTEL_SPAN_ID_LEN + 1];
 	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
-	char	   *tracestate;		/* opaque, in TopMemoryContext, or NULL */
 } OtelContext;
 
 extern OtelContext otel_ctx;
