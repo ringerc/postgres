@@ -11,15 +11,56 @@
  *
  * State storage:
  *
- * The active trace context is stored in two custom GUCs:
+ * The active trace context is stored in two custom GUCs, mirroring the
+ * two HTTP headers the W3C Trace Context spec defines:
  *
- *	 otel.traceparent  W3C TraceContext header value
- *					   ("00-{32 hex}-{16 hex}-{2 hex}").  An assign-hook
- *					   parses and decomposes the value into the
- *					   in-memory OtelContext struct used by the
- *					   emit_log_hook.
- *	 otel.tracestate   Companion W3C header, stored opaquely by the GUC
- *					   machinery; not interpreted further by this module.
+ *	 otel.traceparent  Required, fixed format:
+ *					   "{version}-{trace-id}-{parent-id}-{flags}".
+ *					   Every component has spec-defined semantics;
+ *					   every conformant tracing participant MUST
+ *					   understand it.  Our assign-hook parses and
+ *					   decomposes the value into the in-memory
+ *					   OtelContext struct used by the emit_log_hook.
+ *					   This is the load-bearing piece for log
+ *					   correlation.
+ *
+ *	 otel.tracestate   Optional, vendor-extensible: a comma-separated
+ *					   list of "vendor=value" pairs, where the
+ *					   semantics of each value are defined by that
+ *					   vendor's tracing system (Datadog, Honeycomb,
+ *					   etc.), not by the W3C spec.
+ *
+ *					   We accept and store this opaquely.  We do NOT
+ *					   interpret it, log it, or attach it to ErrorData
+ *					   today.  It is kept for three reasons:
+ *
+ *					   1. The W3C spec requires that participants
+ *						  propagate unknown tracestate entries
+ *						  unchanged; clients that follow the spec
+ *						  send both headers and would have to drop
+ *						  vendor state at the Postgres boundary if we
+ *						  refused tracestate.
+ *					   2. Future use: if this module ever emits OTLP
+ *						  child spans of its own, propagating
+ *						  tracestate becomes mandatory.  Having the
+ *						  storage in place now avoids a wire/API
+ *						  change later.
+ *					   3. Diagnostic visibility via SHOW
+ *						  otel.tracestate when operators are
+ *						  debugging trace propagation through proxy
+ *						  chains.
+ *
+ *					   `tracestate` is NOT baggage.  W3C Baggage is a
+ *					   separate spec (https://www.w3.org/TR/baggage/)
+ *					   with its own HTTP header, key namespace, size
+ *					   budget, and audience (application code, not
+ *					   vendor tracing tools).  If an application
+ *					   needs to propagate baggage --- e.g. tenant_id
+ *					   for RLS, user_id for audit --- through
+ *					   PostgreSQL, that belongs in a separate
+ *					   `baggage.*` prefix handler (likely a sibling
+ *					   `contrib/baggage` module), not in
+ *					   `otel.tracestate`.
  *
  * Using GUCs as the canonical storage has a deliberate side effect:
  * GUC values automatically propagate to parallel workers via
