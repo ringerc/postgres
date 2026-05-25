@@ -24,7 +24,7 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel,test_otel_exporter'
-log_min_messages = log
+log_min_messages = warning
 log_statement = 'all'
 EOCONF
 $node->start;
@@ -249,6 +249,46 @@ like($span, qr/parent_span_id=\n/,
 # trace_id is a synthesized 32 hex chars
 like($span, qr/trace_id=[0-9a-f]{32}\n/,
 	'synthesized trace_id is 32 lowercase hex chars');
+
+# ----------------------------------------------------------------------
+# Test 4: a query that raises an ERROR produces a span with
+# status=ERROR and an event captured from the ereport.
+# ----------------------------------------------------------------------
+
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+# Division by zero against a set-returning-function source --- the
+# value isn't known until execution, so the planner cannot fold it
+# and the error fires inside the executor where our hooks live.
+# 22012 is ERRCODE_DIVISION_BY_ZERO.
+run_query($sock, 'SELECT 1/i FROM generate_series(0,0) AS i');
+
+@msgs = run_query($sock, 'SELECT test_otel_span_count()');
+is(first_value(@msgs), '1',
+	'one span captured even though the query errored');
+
+@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+$span = first_value(@msgs);
+like($span, qr/status=2\n/,
+	'span status is ERROR (2) for a query that raised an ereport(ERROR)');
+# In current postgres (v18+), ERROR's numeric value is 21
+# (WARNING_CLIENT_ONLY occupies 20).
+like($span, qr/event\.elevel=21\n/,
+	'event elevel matches ERROR (21)');
+like($span, qr/event\.sqlstate=22012\n/,
+	'event sqlstate is 22012 (division_by_zero)');
+like($span, qr/event\.message=division by zero/,
+	'event message captures the ereport text');
+like($span, qr/event\.filename=\w+\.c/,
+	'event filename is a postgres source file');
+
+# Connection is now in a failed-transaction state; ROLLBACK to clear.
+run_query($sock, 'ROLLBACK');
+
+# Tests for WARNING-level event capture during an executor-run query
+# are deferred to after step 4 (ProcessUtility_hook): a DO block
+# carrying RAISE WARNING goes through ProcessUtility, not
+# ExecutorStart, so no span exists to attach the event to in step 3.
 
 # ----------------------------------------------------------------------
 # Tidy up.

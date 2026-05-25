@@ -51,4 +51,8 @@ extern void otel_log_install_hooks(void);
 /* Defined in otel_trace.c.  Called once from _PG_init. */
 extern void otel_trace_install_hooks(void);
 
+/* Called from otel_log.c's emit_log_hook to record an ereport as a
+ * span event when a span is active.  No-op otherwise. */
+extern void otel_span_record_log_event(ErrorData *edata);
+
 #endif							/* CONTRIB_OTEL_INTERNAL_H */
