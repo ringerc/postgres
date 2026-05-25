@@ -43,10 +43,15 @@ otel_log_install_hooks(void)
 
 
 /*
- * emit_log_hook integration: fill in ErrorData trace fields from the
- * stored context if they are not already set.  This is what causes
- * log_line_prefix %T/%S and the JSON/CSV log writers to pick up the
- * trace context without callers having to invoke errtrace() manually.
+ * emit_log_hook entry point.
+ *
+ *	1. Inject trace context into ErrorData so the built-in log
+ *	   writers and %T / %S log_line_prefix escapes pick it up
+ *	   automatically.
+ *	2. Hand the ereport to the span event-capture path in
+ *	   otel_trace.c; it handles the active-span check, the elevel
+ *	   gate, and the ERROR-status update internally.
+ *	3. Chain.
  */
 static void
 otel_emit_log_hook(ErrorData *edata)
@@ -64,6 +69,8 @@ otel_emit_log_hook(ErrorData *edata)
 
 		MemoryContextSwitchTo(oldcxt);
 	}
+
+	otel_span_record_log_event(edata);
 
 	if (prev_emit_log_hook)
 		prev_emit_log_hook(edata);
