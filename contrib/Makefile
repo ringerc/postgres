@@ -29,6 +29,7 @@ SUBDIRS = \
 		ltree		\
 		oid2name	\
 		otel		\
+		otel_demo_exporter	\
 		pageinspect	\
 		passwordcheck	\
 		pg_buffercache	\

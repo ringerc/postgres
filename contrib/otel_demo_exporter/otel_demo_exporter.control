@@ -1,0 +1,5 @@
+# otel_demo_exporter extension
+comment = 'Bare-minimum JSON-to-file exporter for contrib/otel spans'
+default_version = '1.0'
+module_pathname = '$libdir/otel_demo_exporter'
+relocatable = true
