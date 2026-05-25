@@ -32,6 +32,7 @@
 typedef struct OtelContext
 {
 	bool		is_set;
+	bool		sampled_flag_set;
 	char		trace_id[OTEL_TRACE_ID_LEN + 1];
 	char		span_id[OTEL_SPAN_ID_LEN + 1];
 	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];

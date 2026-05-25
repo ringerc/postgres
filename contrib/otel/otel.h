@@ -141,6 +141,32 @@ typedef struct OtelSpanEvent
 #define OTEL_INLINE_ATTRS 12
 
 /*
+ * Sampler decision returned by the sampler hook, mirroring the
+ * categories of OTel's SDK Sampler interface.
+ *
+ * DROP: the span should not be recorded or emitted; contrib/otel
+ * skips allocation entirely.
+ *
+ * RECORD_ONLY: the span should be recorded locally but, if/when
+ * contrib/otel ever propagates a child traceparent downstream, the
+ * sampled bit should NOT be set (because we are recording for our
+ * own purposes, not because the global trace is being sampled).
+ *
+ * RECORD_AND_SAMPLE: the span should be recorded locally AND
+ * propagated as sampled.  This is what we use for the
+ * upstream-says-sampled (W3C sampled-bit-set) path; sampler hooks
+ * may also choose this to "promote" an unsampled trace.
+ *
+ * Mirrors the OpenTelemetry SDK's `SamplingDecision` enum.
+ */
+typedef enum OtelSamplerDecision
+{
+	OTEL_SAMPLE_DROP = 0,
+	OTEL_SAMPLE_RECORD_ONLY = 1,
+	OTEL_SAMPLE_RECORD_AND_SAMPLE = 2,
+} OtelSamplerDecision;
+
+/*
  * A complete span.  Lifetime is from the producing hook (typically
  * ExecutorStart_hook) to the next finalization point
  * (ExecutorEnd_hook or XACT_EVENT_ABORT).  Storage may be a static
@@ -167,6 +193,13 @@ typedef struct OtelSpan
 	OtelSpanStatus status;
 	const char *status_description; /* error message on ERROR; NULL otherwise */
 
+	/* Sampling decision under which this span was recorded.
+	 * RECORD_AND_SAMPLE for the propagated-sampled-bit-set path and
+	 * for trace_all_queries; otherwise whatever the sampler hook
+	 * returned (RECORD_ONLY or RECORD_AND_SAMPLE; DROP never reaches
+	 * here because the span isn't created). */
+	OtelSamplerDecision sampler_decision;
+
 	TimestampTz start_time;
 	TimestampTz end_time;
 
@@ -185,6 +218,54 @@ typedef struct OtelSpan
 	int			n_overflow_events;
 	OtelSpanEvent *overflow_events; /* NULL if not used or alloc failed */
 } OtelSpan;
+
+/*
+ * Input to the sampler hook.  Populated with the minimum context
+ * the hook needs to make a decision WITHOUT contrib/otel having
+ * performed any allocation yet.  All pointers are valid only for
+ * the duration of the call; a sampler that wants to defer must
+ * copy.  All pointers may point at backend-owned long-lived
+ * memory (string literals, GUC values) and must not be freed by
+ * the hook.
+ *
+ * Hooks that want richer context (db.name, user, application_name,
+ * etc.) can read it from postgres globals (MyDatabaseId,
+ * MyProcPort, application_name GUC) at the cost of their own
+ * allocation/lookup --- which is the sampler's choice to make,
+ * not contrib/otel's.
+ */
+typedef struct OtelSamplerInput
+{
+	const char *trace_id;			/* 32 hex chars, NUL-terminated */
+	const char *parent_span_id;		/* 16 hex chars (the propagated parent) */
+	const char *trace_flags;		/* 2 hex chars */
+	const char *tracestate;			/* may be NULL */
+	const char *name;				/* proposed span name (command tag) */
+	OtelSpanKind kind;
+} OtelSamplerInput;
+
+/*
+ * Hook called BEFORE contrib/otel allocates anything for a span,
+ * when the propagated traceparent has the W3C sampled bit UNSET.
+ *
+ * Default (hook NULL) is OTel-SDK ParentBasedSampler behaviour:
+ * respect the propagated unsampled state and skip the span
+ * entirely.  An exporter module that needs richer sampling
+ * semantics --- ratio-based, rate-limited, tail-based,
+ * tenant-aware --- can register a hook here and return its own
+ * decision.  The hook MUST be fast (~nanoseconds) and MUST NOT
+ * allocate if it can possibly avoid it, since its whole purpose
+ * is to be cheaper than the work we are about to do.
+ *
+ * The hook is NOT called for the sampled-bit-set path; an upstream
+ * positive sampling signal is always honoured.  An exporter that
+ * wants to override sampled=1 (e.g. to drop on local rate-limit)
+ * can do so at emit time by returning early from the
+ * otel_span_emit_hook.
+ */
+typedef OtelSamplerDecision (*otel_sampler_hook_type) (const OtelSamplerInput *in);
+extern PGDLLIMPORT otel_sampler_hook_type otel_sampler_hook;
+
 
 /*
  * Hook for exporters.  Called once per span at finalization, in the

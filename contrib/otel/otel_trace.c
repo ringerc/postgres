@@ -110,6 +110,7 @@ static void otel_ProcessUtility(PlannedStmt *pstmt,
 								QueryCompletion *qc);
 static void otel_xact_callback(XactEvent event, void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
+static OtelSamplerDecision decide_whether_to_record(const char *name_hint);
 static void start_span(QueryDesc *queryDesc);
 static void start_utility_span(PlannedStmt *pstmt, const char *queryString);
 static void finalize_span(OtelSpanStatus status);
@@ -429,28 +430,98 @@ finalize_span(OtelSpanStatus status)
 }
 
 /*
+ * decide_whether_to_record --- the consolidated sampling decision.
+ *
+ * Returns OTEL_SAMPLE_DROP to skip span creation entirely (the
+ * caller MUST NOT allocate after seeing DROP).  Returns
+ * RECORD_AND_SAMPLE for the upstream-positively-sampled and
+ * trace_all_queries paths.  Returns RECORD_ONLY or
+ * RECORD_AND_SAMPLE per the sampler hook for the
+ * upstream-sampled-bit-unset path when a hook is registered.
+ *
+ * Decision order, expressed as gates:
+ *
+ *	  1. No consumer (no exporter hook AND log emission disabled)
+ *		 -> DROP.  Backends not actively tracing pay only the two
+ *		 pointer/bool reads at this gate.
+ *	  2. otel.trace_all_queries -> RECORD_AND_SAMPLE.  Always-on
+ *		 mode bypasses propagated state.
+ *	  3. No propagated context (otel_ctx.is_set == false) -> DROP.
+ *	  4. Propagated sampled bit IS set -> RECORD_AND_SAMPLE.  The
+ *		 upstream's positive signal is always honoured.
+ *	  5. Propagated sampled bit is unset AND otel_sampler_hook is
+ *		 set -> defer to the hook.  Default OTel SDK SamplerInput
+ *		 fields are populated from in-memory state with no
+ *		 allocation.  Hook returns one of DROP / RECORD_ONLY /
+ *		 RECORD_AND_SAMPLE.
+ *	  6. Propagated sampled bit is unset AND no hook -> DROP.
+ *		 This is the OTel SDK ParentBasedSampler default
+ *		 behaviour: respect the propagated unsampled state.
+ *
+ * Per W3C TraceContext Level 1 §3.2.2.1 the unset sampled bit is
+ * advisory and not a binding directive against recording; OTel SDK
+ * convention is stricter.  We adopt the OTel convention as default
+ * (since the module is named contrib/otel) and let exporter SDK
+ * modules override via the sampler hook.  See the comment on
+ * OtelContext.sampled_flag_set.
+ */
+static OtelSamplerDecision
+decide_whether_to_record(const char *name_hint)
+{
+	/* Gate 1: no consumer */
+	if (otel_span_emit_hook == NULL && !otel_emit_spans_to_log)
+		return OTEL_SAMPLE_DROP;
+
+	/* Gate 2: force-on overrides propagation entirely */
+	if (otel_trace_all_queries)
+		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+
+	/* Gate 3: no propagated context */
+	if (!otel_ctx.is_set)
+		return OTEL_SAMPLE_DROP;
+
+	/* Gate 4: upstream says sampled */
+	if (otel_ctx.sampled_flag_set)
+		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+
+	/* Gate 5: defer to registered sampler */
+	if (otel_sampler_hook != NULL)
+	{
+		OtelSamplerInput in;
+
+		in.trace_id = otel_ctx.trace_id;
+		in.parent_span_id = otel_ctx.span_id;
+		in.trace_flags = otel_ctx.trace_flags;
+		in.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
+			? otel_tracestate_guc : NULL;
+		in.name = name_hint;
+		in.kind = OTEL_SPAN_KIND_SERVER;
+
+		return otel_sampler_hook(&in);
+	}
+
+	/* Gate 6: default OTel ParentBased behaviour --- unsampled drops */
+	return OTEL_SAMPLE_DROP;
+}
+
+/*
  * ExecutorStart hook.  Gated by the early-bail checks; only starts
  * a span when there's actually a consumer AND something to record.
  */
 static void
 otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	bool		wants_span;
+	OtelSamplerDecision decision;
 
-	/* Early bail #1: any consumer at all? */
-	wants_span = (otel_span_emit_hook != NULL) || otel_emit_spans_to_log;
-
-	/* Early bail #2: any trace context active, OR opt-in to trace
-	 * untraced queries? */
-	if (wants_span)
-		wants_span = otel_ctx.is_set || otel_trace_all_queries;
+	decision = decide_whether_to_record("pgsql.execute");
 
 	/* Defensive: never overlap. */
-	if (wants_span && !span_active)
+	if (decision != OTEL_SAMPLE_DROP && !span_active)
 	{
 		PG_TRY();
 		{
 			start_span(queryDesc);
+			span_storage.sampler_decision = decision;
 		}
 		PG_CATCH();
 		{
@@ -585,27 +656,30 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 					DestReceiver *dest,
 					QueryCompletion *qc)
 {
-	bool		wants_span;
+	OtelSamplerDecision decision;
 	bool		started_here = false;
 
-	wants_span = (otel_span_emit_hook != NULL) || otel_emit_spans_to_log;
-	if (wants_span)
-		wants_span = otel_ctx.is_set || otel_trace_all_queries;
-
-	if (wants_span && !span_active && context == PROCESS_UTILITY_TOPLEVEL)
+	/* Only consult the sampler for top-level commands; nested utility
+	 * invocations (e.g. from EXPLAIN, CTAS) share the outer span. */
+	if (context == PROCESS_UTILITY_TOPLEVEL && !span_active)
 	{
-		PG_TRY();
+		decision = decide_whether_to_record("pgsql.utility");
+		if (decision != OTEL_SAMPLE_DROP)
 		{
-			start_utility_span(pstmt, queryString);
-			started_here = true;
+			PG_TRY();
+			{
+				start_utility_span(pstmt, queryString);
+				span_storage.sampler_decision = decision;
+				started_here = true;
+			}
+			PG_CATCH();
+			{
+				FlushErrorState();
+				span_active = false;
+				span_originator = SPAN_ORIGIN_NONE;
+			}
+			PG_END_TRY();
 		}
-		PG_CATCH();
-		{
-			FlushErrorState();
-			span_active = false;
-			span_originator = SPAN_ORIGIN_NONE;
-		}
-		PG_END_TRY();
 	}
 
 	/* Chain to the previous hook (or standard) and finalize on
