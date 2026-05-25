@@ -440,8 +440,8 @@ finalize_span(OtelSpanStatus status)
  * caller MUST NOT allocate after seeing DROP).  Returns
  * RECORD_AND_SAMPLE for the upstream-positively-sampled and
  * trace_all_queries paths.  Returns RECORD_ONLY or
- * RECORD_AND_SAMPLE per the sampler hook for the
- * upstream-sampled-bit-unset path when a hook is registered.
+ * RECORD_AND_SAMPLE per the sampler hook for paths where the
+ * registered policy delegates to it.
  *
  * Decision order, expressed as gates:
  *
@@ -451,29 +451,20 @@ finalize_span(OtelSpanStatus status)
  *	  2. otel.trace_all_queries -> RECORD_AND_SAMPLE.  Always-on
  *		 mode bypasses propagated state.
  *	  3. No propagated context (otel_ctx.is_set == false) -> DROP.
- *	  4. Propagated sampled bit IS set -> RECORD_AND_SAMPLE.  The
- *		 upstream's positive signal is always honoured.
- *	  5. Propagated sampled bit is unset AND otel_sampler_hook is
- *		 set -> defer to the hook.  Default OTel SDK SamplerInput
- *		 fields are populated from in-memory state with no
- *		 allocation.  Hook returns one of DROP / RECORD_ONLY /
- *		 RECORD_AND_SAMPLE.
- *	  6. Propagated sampled bit is unset AND no hook -> DROP.
- *		 This is the OTel SDK ParentBasedSampler default
- *		 behaviour: respect the propagated unsampled state.
+ *	  4-6. Policy-dependent.  See OtelSamplerHookPolicy in otel.h
+ *		 for the four regimes; the dispatch below applies them.
  *
  * Per W3C TraceContext Level 1 §3.2.2.1 the unset sampled bit is
  * advisory and not a binding directive against recording; OTel SDK
- * convention is stricter.  We adopt the OTel convention as default
- * (since the module is named contrib/otel) and let exporter SDK
- * modules override via the sampler hook.  See the comment on
- * OtelContext.sampled_flag_set.
+ * convention is stricter.  Our default policy adopts the OTel
+ * convention; exporters can override via api->set_sampler_policy.
  */
 static OtelSamplerDecision
 decide_whether_to_record(const char *name_hint)
 {
 	otel_span_emit_hook_type emit_hook = otel_get_span_emit_hook();
 	otel_sampler_hook_type sampler_hook = otel_get_sampler_hook();
+	OtelSamplerHookPolicy policy = otel_get_sampler_hook_policy();
 
 	/* Gate 1: no consumer */
 	if (emit_hook == NULL && !otel_emit_spans_to_log)
@@ -487,12 +478,47 @@ decide_whether_to_record(const char *name_hint)
 	if (!otel_ctx.is_set)
 		return OTEL_SAMPLE_DROP;
 
-	/* Gate 4: upstream says sampled */
-	if (otel_ctx.sampled_flag_set)
-		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+	/*
+	 * Gates 4-6: policy-driven dispatch.
+	 *
+	 * The four policies map onto four straight-line decision paths
+	 * with no further branching:
+	 */
+	switch (policy)
+	{
+		case OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE:
+			/* Record everything that has a propagated context, no
+			 * sampler call, no W3C bit check. */
+			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
 
-	/* Gate 5: defer to registered sampler */
-	if (sampler_hook != NULL)
+		case OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT:
+			/* Pure W3C ParentBased; sampler hook is never consulted. */
+			return otel_ctx.sampled_flag_set
+				? OTEL_SAMPLE_RECORD_AND_SAMPLE
+				: OTEL_SAMPLE_DROP;
+
+		case OTEL_SAMPLER_HOOK_ALWAYS:
+			/* Defer EVERY decision to the hook, regardless of the
+			 * wire bit.  If no hook is registered, fall back to
+			 * always-record (a no-hook + ALWAYS combination is a
+			 * configuration error, but recording is the safer
+			 * default than silently dropping). */
+			if (sampler_hook == NULL)
+				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+			break;				/* fall through to the hook call below */
+
+		case OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT:
+		default:
+			/* Default: honour wire bit; only call hook on unset. */
+			if (otel_ctx.sampled_flag_set)
+				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+			if (sampler_hook == NULL)
+				return OTEL_SAMPLE_DROP;
+			break;				/* fall through to the hook call below */
+	}
+
+	/* Hook-call path (reached only by ALWAYS or ON_UNSAMPLED_BIT
+	 * after their wire-bit checks). */
 	{
 		OtelSamplerInput in;
 
@@ -506,9 +532,6 @@ decide_whether_to_record(const char *name_hint)
 
 		return sampler_hook(&in);
 	}
-
-	/* Gate 6: default OTel ParentBased behaviour --- unsampled drops */
-	return OTEL_SAMPLE_DROP;
 }
 
 /*
