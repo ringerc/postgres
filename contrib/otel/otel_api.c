@@ -46,6 +46,16 @@
 static otel_span_emit_hook_type otel_span_emit_hook = NULL;
 static otel_sampler_hook_type	otel_sampler_hook = NULL;
 
+/*
+ * Sampler-hook invocation policy.  Default is OTel-SDK-ParentBased
+ * compliant: call the hook only when the propagated W3C sampled bit
+ * is unset.  Exporters that want different semantics override via
+ * api->set_sampler_policy.  See OtelSamplerHookPolicy in otel.h for
+ * the four allowed values + their rationale.
+ */
+static OtelSamplerHookPolicy otel_sampler_hook_policy =
+	OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT;
+
 
 /*
  * Registration functions exposed via OtelTracingApi.  They record
@@ -70,6 +80,12 @@ api_register_sampler_hook(otel_sampler_hook_type new_hook,
 	otel_sampler_hook = new_hook;
 }
 
+static void
+api_set_sampler_policy(OtelSamplerHookPolicy policy)
+{
+	otel_sampler_hook_policy = policy;
+}
+
 /*
  * The api table installed into the rendezvous slot.  Static storage
  * duration means it lives forever and external consumers can cache
@@ -79,6 +95,7 @@ static const OtelTracingApi otel_tracing_api = {
 	.version = OTEL_TRACING_API_VERSION,
 	.register_emit_hook = api_register_emit_hook,
 	.register_sampler_hook = api_register_sampler_hook,
+	.set_sampler_policy = api_set_sampler_policy,
 };
 
 
@@ -110,4 +127,10 @@ otel_sampler_hook_type
 otel_get_sampler_hook(void)
 {
 	return otel_sampler_hook;
+}
+
+OtelSamplerHookPolicy
+otel_get_sampler_hook_policy(void)
+{
+	return otel_sampler_hook_policy;
 }

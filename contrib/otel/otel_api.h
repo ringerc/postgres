@@ -49,7 +49,7 @@
  * because an exporter built against v1 has no way to know whether a
  * later major's struct layout broke its assumptions.
  */
-#define OTEL_TRACING_API_VERSION		1
+#define OTEL_TRACING_API_VERSION		2
 
 /*
  * Rendezvous variable name (subject to NAMEDATALEN, currently 64).
@@ -112,9 +112,24 @@ typedef struct OtelTracingApi
 	 * Register a sampler hook.  Semantics mirror register_emit_hook.
 	 * See the comment on otel_sampler_hook_type for what the hook
 	 * is expected to do and when it is called.
+	 *
+	 * When the hook is called depends on the policy set via
+	 * set_sampler_policy below; the default is to call the hook only
+	 * when the propagated sampled bit is unset.
 	 */
 	void	  (*register_sampler_hook) (otel_sampler_hook_type new_hook,
 										otel_sampler_hook_type *prev_out);
+
+	/*
+	 * Configure the sampler-hook invocation policy.  See
+	 * OtelSamplerHookPolicy for the enum and rationale.  Default is
+	 * OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT (W3C ParentBased compliance).
+	 *
+	 * Typically called once at _PG_init time.  Subsequent calls are
+	 * permitted but have no defined synchronization with in-flight
+	 * queries.
+	 */
+	void	  (*set_sampler_policy) (OtelSamplerHookPolicy policy);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */
