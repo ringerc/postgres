@@ -332,6 +332,38 @@ $span = first_value(@msgs);
 like($span, qr/name=COMMIT\n/, 'second utility span is COMMIT');
 
 # ----------------------------------------------------------------------
+# Test 7: a traceparent with the sampled bit UNSET (flags = "00")
+# produces no span, by default.  This is the OTel-SDK ParentBased
+# default behaviour: contrib/otel honours an upstream "do not sample"
+# signal unless an exporter module installs a sampler hook to override
+# it.  No sampler hook is registered here.
+# ----------------------------------------------------------------------
+
+my $UNSAMPLED_TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-00";
+
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M',
+	headers_body('otel.traceparent' => $UNSAMPLED_TRACEPARENT));
+run_query($sock, 'SELECT 1');
+
+@msgs = run_query($sock, 'SELECT test_otel_span_count()');
+is(first_value(@msgs), '0',
+	'no span emitted for an upstream-unsampled traceparent (default policy)');
+
+# But trace_all_queries still wins over the unsampled bit --- the
+# force-on path bypasses propagated sampling state entirely.
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M',
+	headers_body('otel.traceparent' => $UNSAMPLED_TRACEPARENT));
+run_query($sock, 'SET otel.trace_all_queries = on');
+run_query($sock, 'SELECT 1');
+run_query($sock, 'RESET otel.trace_all_queries');
+
+@msgs = run_query($sock, 'SELECT test_otel_span_count()');
+isnt(first_value(@msgs), '0',
+	'trace_all_queries overrides unsampled traceparent');
+
+# ----------------------------------------------------------------------
 # Tidy up.
 # ----------------------------------------------------------------------
 
