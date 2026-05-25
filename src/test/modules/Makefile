@@ -13,6 +13,7 @@ SUBDIRS = \
 		  index \
 		  libpq_pipeline \
 		  oauth_validator \
+		  otel_test_exporter \
 		  plsample \
 		  spgist_name_ops \
 		  test_aio \

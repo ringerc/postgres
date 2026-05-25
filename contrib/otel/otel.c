@@ -117,9 +117,17 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 
+#include "otel.h"
 #include "otel_internal.h"
 
 PG_MODULE_MAGIC;
+
+/*
+ * Exporter hook --- exporters in separate loadable modules register
+ * a callback against this to receive completed spans.  See otel.h
+ * for the contract.
+ */
+otel_span_emit_hook_type otel_span_emit_hook = NULL;
 
 /* In-memory derived state populated by the otel.traceparent assign-hook
  * (called by the GUC machinery on M-header arrival, SET, or
