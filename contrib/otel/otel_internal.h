@@ -39,7 +39,16 @@ typedef struct OtelContext
 
 extern OtelContext otel_ctx;
 
+/* Defined in otel.c. */
+extern char *otel_tracestate_guc;
+extern char *otel_current_span_id_guc;
+extern bool otel_emit_spans_to_log;
+extern bool otel_trace_all_queries;
+
 /* Defined in otel_log.c.  Called once from _PG_init. */
 extern void otel_log_install_hooks(void);
+
+/* Defined in otel_trace.c.  Called once from _PG_init. */
+extern void otel_trace_install_hooks(void);
 
 #endif							/* CONTRIB_OTEL_INTERNAL_H */

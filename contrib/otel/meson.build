@@ -3,6 +3,7 @@
 otel_sources = files(
   'otel.c',
   'otel_log.c',
+  'otel_trace.c',
 )
 
 if host_system == 'windows'

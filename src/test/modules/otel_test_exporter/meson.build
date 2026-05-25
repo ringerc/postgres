@@ -21,3 +21,14 @@ test_install_data += files(
   'test_otel_exporter.control',
   'test_otel_exporter--1.0.sql',
 )
+
+tests += {
+  'name': 'otel_test_exporter',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'tap': {
+    'tests': [
+      't/001_basic.pl',
+    ],
+  },
+}
