@@ -243,17 +243,28 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
 
 /*
  * Header clear callback: invoked at the handler's scope boundary
- * (transaction end).  Clears both GUCs back to default.
+ * (transaction end).
+ *
+ * Resets the in-memory derived state directly --- DO NOT attempt to
+ * reset the backing GUCs via set_config_option here.  This function
+ * runs from inside a XactCallback during AbortTransaction (or
+ * CommitTransaction), and any set_config_option call from that
+ * context is part of the same transaction that is now ending: on
+ * the abort path the GUC change gets rolled back to whatever the
+ * GUC was before, which re-fires the assign_hook with the OLD value
+ * and re-populates otel_ctx, defeating the clear.
+ *
+ * Leaving the GUC variable stale relative to in-memory state is
+ * acceptable because otel_ctx.is_set is the authoritative flag that
+ * start_span reads.  The next M (or explicit SET) will overwrite
+ * the GUC cleanly.  SHOW otel.traceparent may briefly show a stale
+ * value between an aborted transaction and the next assignment ---
+ * a known cosmetic limitation.
  */
 static void
 otel_clear_cb(void *cb_ctx)
 {
-	(void) set_config_option("otel.traceparent", NULL,
-							 PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SET, true, LOG, false);
-	(void) set_config_option("otel.tracestate", NULL,
-							 PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SET, true, LOG, false);
+	otel_ctx_reset();
 }
 
 /*
