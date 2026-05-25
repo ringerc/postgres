@@ -52,6 +52,7 @@ extern bool otel_trace_all_queries;
 extern void otel_api_publish_rendezvous(void);
 extern otel_span_emit_hook_type otel_get_span_emit_hook(void);
 extern otel_sampler_hook_type	otel_get_sampler_hook(void);
+extern OtelSamplerHookPolicy	otel_get_sampler_hook_policy(void);
 
 /* Defined in otel_log.c.  Called once from _PG_init. */
 extern void otel_log_install_hooks(void);

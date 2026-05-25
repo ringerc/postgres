@@ -266,6 +266,58 @@ typedef struct OtelSamplerInput
 typedef OtelSamplerDecision (*otel_sampler_hook_type) (const OtelSamplerInput *in);
 
 /*
+ * Policy controlling WHEN the registered sampler hook is consulted.
+ *
+ * Default (no exporter calls set_sampler_policy) is
+ * HOOK_ON_UNSAMPLED_BIT --- contrib/otel respects W3C `sampled=1` as a
+ * binding "yes, record" signal and only consults the hook when the
+ * propagated bit is unset.  Exporters that want different semantics
+ * (always defer to their SDK, always record, ignore the hook entirely
+ * and just use the wire bit) can override at _PG_init time via
+ * OtelTracingApi.set_sampler_policy.
+ *
+ * The four values correspond to the four common decision regimes an
+ * out-of-tree exporter might want:
+ *
+ *	  HOOK_ON_UNSAMPLED_BIT   (default)
+ *		W3C-compliant.  sampled=1 → RECORD_AND_SAMPLE.  sampled=0 →
+ *		call hook; if no hook, DROP.  This is what
+ *		contrib/otel has done since the sampler hook was introduced.
+ *
+ *	  HOOK_ALWAYS
+ *		Defer every sampling decision to the hook, regardless of the
+ *		propagated bit.  Useful for exporters whose SDK has its own
+ *		opinion about overriding upstream signals (rate limiters,
+ *		tail-based samplers).  Risk: violates W3C TraceContext spec's
+ *		"sampled=1 means recorded" guarantee for downstream
+ *		consumers.  Caller's responsibility to know what they're doing.
+ *
+ *	  NEVER_HOOK_RESPECT_BIT
+ *		Pure W3C ParentBased.  sampled=1 → record, sampled=0 → drop,
+ *		hook is never invoked.  Useful for exporters that want zero
+ *		policy code on the hot path and trust the upstream's wire
+ *		signal exclusively.
+ *
+ *	  NEVER_HOOK_ALWAYS_SAMPLE
+ *		Record everything that reached gate 4 (i.e. has a propagated
+ *		context).  Equivalent to "no sampler hook, no
+ *		trace_all_queries, but always record what we see."  Useful
+ *		for debug-mode operators who want to capture every traced
+ *		query without paying for a sampler call.
+ *
+ * Set via api->set_sampler_policy(policy) from _PG_init.  Setting
+ * after _PG_init is permitted (it's just a single atomic word write)
+ * but has no defined synchronization with in-flight queries.
+ */
+typedef enum OtelSamplerHookPolicy
+{
+	OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT = 0,	/* default */
+	OTEL_SAMPLER_HOOK_ALWAYS = 1,
+	OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT = 2,
+	OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE = 3,
+} OtelSamplerHookPolicy;
+
+/*
  * Hook for exporters.  Called once per span at finalization, in the
  * backend's memory context.
  *
