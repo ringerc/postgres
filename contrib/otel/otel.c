@@ -96,6 +96,78 @@
  * introspection SQL function but is not required for receiving
  * trace context from clients.
  *
+ * Client-side propagation:
+ *
+ *	 The PRIMARY entry point is the per-message 'M' RequestHeaders
+ *	 protocol message: the client sends an otel.traceparent header
+ *	 with the next Query, the handler attaches it for the duration
+ *	 of that transaction, and it auto-clears at COMMIT / ROLLBACK
+ *	 because the header handler is registered at scope
+ *	 PROTOCOL_HEADER_SCOPE_TRANSACTION.  Drivers that implement the
+ *	 'M' message (e.g. via libpq's PQattachHeader, see
+ *	 src/test/modules/libpq_headers/) get the scoping and the
+ *	 zero-extra-round-trip behaviour for free.
+ *
+ *	 ALTERNATIVELY, clients may set the GUCs directly with SQL:
+ *
+ *		 SET otel.traceparent = '00-{trace-id}-{span-id}-{flags}';
+ *		 SET otel.tracestate  = 'vendor1=...,vendor2=...';
+ *
+ *	 or, scoped to one transaction:
+ *
+ *		 BEGIN;
+ *		 SET LOCAL otel.traceparent = '...';
+ *		 SELECT ...;
+ *		 COMMIT;
+ *
+ *	 This works because otel.traceparent / otel.tracestate are
+ *	 ordinary PGC_USERSET GUCs.  Use it when:
+ *
+ *	   * the driver doesn't support the 'M' message yet;
+ *	   * an ORM / pooler intercepts protocol-level extensions;
+ *	   * you want explicit SQL-visible audit of context changes.
+ *
+ *	 Costs versus the 'M'-header path:
+ *
+ *	   * Extra round-trip.  A SET is its own statement; each query
+ *		 you want traced now costs two client/server round trips
+ *		 instead of one.  Noticeable for high-rate workloads of
+ *		 short queries; irrelevant when the traced query is itself
+ *		 slow.  The 'M' header rides on the same Query message and
+ *		 adds no round-trip.
+ *	   * Cannot achieve statement scope.  GUC scoping options are:
+ *		   - plain SET: session-scoped (persists across statements
+ *			 AND transactions; survives auto-commit; the operator
+ *			 must explicitly clear with `SET otel.traceparent = ''`
+ *			 or `RESET otel.traceparent`).  Real risk of stale
+ *			 context leaking from one logical operation to the
+ *			 next, especially in long-lived connections.
+ *		   - SET LOCAL: transaction-scoped (cleared at COMMIT or
+ *			 ROLLBACK).  Better, but still NOT statement-scoped:
+ *			 multiple statements in the same explicit transaction
+ *			 all share the same context, even if they represent
+ *			 different logical operations being traced separately.
+ *		 The 'M' header is naturally statement-scoped in
+ *		 single-statement-per-message protocol use (each Query
+ *		 message can carry its own headers) and naturally
+ *		 transaction-scoped under explicit BEGIN/COMMIT because
+ *		 the handler is registered at TRANSACTION scope.
+ *	   * Connection-pooler interaction.  SET state on a pooled
+ *		 connection in TRANSACTION or STATEMENT mode pooling can
+ *		 leak the trace context to whichever client happens to
+ *		 borrow the connection next, unless the pooler explicitly
+ *		 discards GUC state between clients (PgBouncer in
+ *		 transaction mode does NOT discard PGC_USERSET GUC state).
+ *		 The 'M' header is per-message and confined to its own
+ *		 transaction, so it has no equivalent leak.
+ *	   * Visibility in pg_stat_statements / log_statement.  The SET
+ *		 statements appear in query logs and pg_stat_statements
+ *		 entries, mixing trace propagation with workload metrics.
+ *		 The 'M' header is below the SQL layer and doesn't appear.
+ *
+ *	 Use SET / SET LOCAL when you have no other choice; prefer 'M'
+ *	 when both are available.
+ *
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
