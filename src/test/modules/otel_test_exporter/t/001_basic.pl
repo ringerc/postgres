@@ -285,10 +285,51 @@ like($span, qr/event\.filename=\w+\.c/,
 # Connection is now in a failed-transaction state; ROLLBACK to clear.
 run_query($sock, 'ROLLBACK');
 
-# Tests for WARNING-level event capture during an executor-run query
-# are deferred to after step 4 (ProcessUtility_hook): a DO block
-# carrying RAISE WARNING goes through ProcessUtility, not
-# ExecutorStart, so no span exists to attach the event to in step 3.
+# ----------------------------------------------------------------------
+# Test 5: utility commands (DO block, BEGIN/COMMIT) get spans via
+# ProcessUtility_hook.  Span name reflects the command tag.
+# ----------------------------------------------------------------------
+
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+# RAISE WARNING from PL/pgSQL --- the inline DO block emits a
+# WARNING during execution and then continues to a successful
+# return.  DO goes through ProcessUtility (not ExecutorStart).
+run_query($sock, q{DO $$ BEGIN RAISE WARNING 'test-warn'; END $$});
+
+@msgs = run_query($sock, 'SELECT test_otel_span_count()');
+isnt(first_value(@msgs), '0',
+	'at least one span captured for the DO block');
+
+@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+$span = first_value(@msgs);
+like($span, qr/name=DO\n/,
+	'utility span name is "DO" (the command tag)');
+like($span, qr/status=0\n/,
+	'utility span status remains UNSET when only WARNING fires');
+like($span, qr/event\.elevel=19\n/,
+	'WARNING-level event captured on the utility span (elevel 19)');
+like($span, qr/event\.message=test-warn/,
+	'WARNING message captured on the utility span');
+
+# ----------------------------------------------------------------------
+# Test 6: explicit BEGIN/COMMIT cycle - the BEGIN and COMMIT statements
+# each produce a utility span with the matching name.
+# ----------------------------------------------------------------------
+
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+run_query($sock, 'BEGIN');
+run_query($sock, 'COMMIT');
+
+# At least two spans (BEGIN and COMMIT); names should reflect.
+@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+$span = first_value(@msgs);
+like($span, qr/name=BEGIN\n/, 'first utility span is BEGIN');
+
+@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+$span = first_value(@msgs);
+like($span, qr/name=COMMIT\n/, 'second utility span is COMMIT');
 
 # ----------------------------------------------------------------------
 # Tidy up.
