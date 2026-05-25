@@ -42,6 +42,7 @@
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "tcop/cmdtag.h"
+#include "tcop/utility.h"
 #include "utils/backend_status.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
@@ -62,9 +63,24 @@
  * variable-length data we need to copy in (e.g. on the abort path
  * where the portal's memory may already be gone).  It is reset
  * between spans, never deleted.
+ *
+ * span_originator identifies which hook owns the active span, so the
+ * matching hook is the one that finalizes it.  This matters for the
+ * nested case (utility command that runs an executor underneath, e.g.
+ * CTAS): the outer hook keeps ownership; the inner hook's End is a
+ * no-op for the span.  Set when start_span() is called, cleared on
+ * finalize_span().
  */
+typedef enum SpanOriginator
+{
+	SPAN_ORIGIN_NONE = 0,
+	SPAN_ORIGIN_EXECUTOR = 1,
+	SPAN_ORIGIN_UTILITY = 2,
+} SpanOriginator;
+
 static OtelSpan span_storage;
 static bool		span_active = false;
+static SpanOriginator span_originator = SPAN_ORIGIN_NONE;
 static MemoryContext span_cxt = NULL;
 
 /*
@@ -79,12 +95,22 @@ static bool	saved_current_span_id_set = false;
 /* Hook chains */
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 static void otel_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void otel_ExecutorEnd(QueryDesc *queryDesc);
+static void otel_ProcessUtility(PlannedStmt *pstmt,
+								const char *queryString,
+								bool readOnlyTree,
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+								QueryCompletion *qc);
 static void otel_xact_callback(XactEvent event, void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
 static void start_span(QueryDesc *queryDesc);
+static void start_utility_span(PlannedStmt *pstmt, const char *queryString);
 static void finalize_span(OtelSpanStatus status);
 static void generate_span_id(char out[OTEL_SPAN_ID_LEN + 1]);
 static void bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst);
@@ -107,6 +133,10 @@ otel_trace_install_hooks(void)
 	ExecutorStart_hook = otel_ExecutorStart;
 	prev_ExecutorEnd_hook = ExecutorEnd_hook;
 	ExecutorEnd_hook = otel_ExecutorEnd;
+
+	/* Utility-statement spans (step 4). */
+	prev_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = otel_ProcessUtility;
 
 	RegisterXactCallback(otel_xact_callback, NULL);
 	on_proc_exit(otel_proc_exit_cb, (Datum) 0);
@@ -334,6 +364,7 @@ start_span(QueryDesc *queryDesc)
 	 * attribute helpers check span_active and would silently no-op
 	 * otherwise. */
 	span_active = true;
+	span_originator = SPAN_ORIGIN_EXECUTOR;
 
 	/* Attributes --- borrowed pointers into long-lived state. */
 	span_add_attr("db.system", "postgresql");
@@ -391,6 +422,7 @@ finalize_span(OtelSpanStatus status)
 	PG_END_TRY();
 
 	span_active = false;
+	span_originator = SPAN_ORIGIN_NONE;
 	restore_current_span_id_guc();
 }
 
@@ -436,14 +468,168 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
-	/* Finalize span (success path; status stays UNSET unless
-	 * error-event capture flipped it to ERROR). */
-	finalize_span(OTEL_STATUS_UNSET);
+	/* Only finalize if this hook started the active span.  If a
+	 * utility command started the span (CTAS, etc.) and the
+	 * executor is running underneath it, the utility's hook owns
+	 * the span lifecycle and the executor's End should be a no-op
+	 * for the span. */
+	if (span_originator == SPAN_ORIGIN_EXECUTOR)
+		finalize_span(OTEL_STATUS_UNSET);
 
 	if (prev_ExecutorEnd_hook)
 		prev_ExecutorEnd_hook(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+}
+
+/*
+ * start_utility_span --- populate span_storage for a utility command.
+ *
+ * Identity / parent-link mechanics are the same as start_span(), but
+ * the name is the command tag of the utility statement and we record
+ * span_originator = SPAN_ORIGIN_UTILITY so otel_ExecutorEnd knows not
+ * to finalize this span when it later runs (e.g. for CTAS's
+ * underlying SELECT).
+ */
+static void
+start_utility_span(PlannedStmt *pstmt, const char *queryString)
+{
+	const char *parent;
+
+	Assert(!span_active);
+
+	if (span_cxt == NULL)
+		span_cxt = AllocSetContextCreate(TopMemoryContext,
+										 "otel_span_cxt",
+										 ALLOCSET_SMALL_SIZES);
+	else
+		MemoryContextReset(span_cxt);
+
+	memset(&span_storage, 0, sizeof(span_storage));
+
+	if (otel_ctx.is_set)
+	{
+		memcpy(span_storage.trace_id, otel_ctx.trace_id, sizeof(span_storage.trace_id));
+		memcpy(span_storage.trace_flags, otel_ctx.trace_flags, sizeof(span_storage.trace_flags));
+		parent = (otel_current_span_id_guc && otel_current_span_id_guc[0])
+			? otel_current_span_id_guc : otel_ctx.span_id;
+		strlcpy(span_storage.parent_span_id, parent,
+				sizeof(span_storage.parent_span_id));
+	}
+	else
+	{
+		unsigned char buf[16];
+
+		if (!pg_strong_random(buf, sizeof(buf)))
+			memset(buf, 0xa5, sizeof(buf));
+		bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
+		strcpy(span_storage.trace_flags, "00");
+		span_storage.parent_span_id[0] = '\0';
+	}
+
+	generate_span_id(span_storage.span_id);
+
+	span_storage.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
+		? otel_tracestate_guc : NULL;
+
+	/* Use the utility statement's command tag as the span name.
+	 * GetCommandTagName returns a pointer into rodata --- safe to
+	 * borrow without copying. */
+	span_storage.name = pstmt->utilityStmt
+		? GetCommandTagName(CreateCommandTag(pstmt->utilityStmt))
+		: "pgsql.utility";
+	span_storage.kind = OTEL_SPAN_KIND_SERVER;
+	span_storage.status = OTEL_STATUS_UNSET;
+	span_storage.start_time = GetCurrentTimestamp();
+
+	span_active = true;
+	span_originator = SPAN_ORIGIN_UTILITY;
+
+	span_add_attr("db.system", "postgresql");
+	if (MyDatabaseId != InvalidOid)
+	{
+		const char *dbname = get_database_name(MyDatabaseId);
+
+		if (dbname)
+			span_add_attr("db.name", dbname);
+	}
+	if (queryString)
+		span_add_attr("db.statement", queryString);
+	if (MyProcPort && MyProcPort->user_name)
+		span_add_attr("db.user", MyProcPort->user_name);
+	if (MyProcPort && MyProcPort->remote_host)
+		span_add_attr("net.peer.addr", MyProcPort->remote_host);
+	if (application_name && application_name[0])
+		span_add_attr("application_name", application_name);
+
+	update_current_span_id_guc(span_storage.span_id);
+}
+
+/*
+ * ProcessUtility hook --- spans for utility commands (BEGIN, COMMIT,
+ * COPY, DDL, EXPLAIN, etc.) that don't go through the executor.
+ *
+ * Only fires for PROCESS_UTILITY_TOPLEVEL to avoid creating spans
+ * for recursive ProcessUtility invocations from inside another
+ * utility statement.
+ */
+static void
+otel_ProcessUtility(PlannedStmt *pstmt,
+					const char *queryString,
+					bool readOnlyTree,
+					ProcessUtilityContext context,
+					ParamListInfo params,
+					QueryEnvironment *queryEnv,
+					DestReceiver *dest,
+					QueryCompletion *qc)
+{
+	bool		wants_span;
+	bool		started_here = false;
+
+	wants_span = (otel_span_emit_hook != NULL) || otel_emit_spans_to_log;
+	if (wants_span)
+		wants_span = otel_ctx.is_set || otel_trace_all_queries;
+
+	if (wants_span && !span_active && context == PROCESS_UTILITY_TOPLEVEL)
+	{
+		PG_TRY();
+		{
+			start_utility_span(pstmt, queryString);
+			started_here = true;
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			span_active = false;
+			span_originator = SPAN_ORIGIN_NONE;
+		}
+		PG_END_TRY();
+	}
+
+	/* Chain to the previous hook (or standard) and finalize on
+	 * normal return.  On error, XactCallback ABORT handles
+	 * finalization. */
+	PG_TRY();
+	{
+		if (prev_ProcessUtility_hook)
+			prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
+									 context, params, queryEnv,
+									 dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+									context, params, queryEnv,
+									dest, qc);
+	}
+	PG_CATCH();
+	{
+		/* Re-throw; abort callback will finalize the span. */
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/* Success path: only finalize spans we own here. */
+	if (started_here && span_originator == SPAN_ORIGIN_UTILITY)
+		finalize_span(OTEL_STATUS_UNSET);
 }
 
 /*
