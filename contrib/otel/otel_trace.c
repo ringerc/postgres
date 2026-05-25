@@ -431,6 +431,19 @@ finalize_span(OtelSpanStatus status)
 	span_active = false;
 	span_originator = SPAN_ORIGIN_NONE;
 	restore_current_span_id_guc();
+
+	/*
+	 * Statement-scoped scrub for comment-derived context: a
+	 * sqlcommenter traceparent applies to ONE statement and must
+	 * not bleed into the next.  Reset otel_ctx now.  ('M' / GUC
+	 * paths are not affected; they sit on otel_ctx until the
+	 * client clears them or the transaction ends.)
+	 */
+	if (otel_ctx_from_comment)
+	{
+		otel_ctx_reset();
+		otel_ctx_from_comment = false;
+	}
 }
 
 /*
@@ -542,6 +555,14 @@ static void
 otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	OtelSamplerDecision decision;
+
+	/*
+	 * If no in-memory context yet (no 'M' header, no SET) AND
+	 * sqlcommenter parsing is enabled, try the SQL text.  No-op
+	 * when the GUC is off (the cheap path is one boolean read).
+	 */
+	if (!otel_ctx.is_set && otel_parse_sqlcommenter && queryDesc != NULL)
+		(void) try_apply_sqlcommenter_context(queryDesc->sourceText);
 
 	decision = decide_whether_to_record("pgsql.execute");
 
@@ -693,6 +714,11 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	 * invocations (e.g. from EXPLAIN, CTAS) share the outer span. */
 	if (context == PROCESS_UTILITY_TOPLEVEL && !span_active)
 	{
+		/* sqlcommenter fallback --- see equivalent block in
+		 * otel_ExecutorStart for rationale. */
+		if (!otel_ctx.is_set && otel_parse_sqlcommenter)
+			(void) try_apply_sqlcommenter_context(queryString);
+
 		decision = decide_whether_to_record("pgsql.utility");
 		if (decision != OTEL_SAMPLE_DROP)
 		{

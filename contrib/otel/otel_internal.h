@@ -41,12 +41,17 @@ typedef struct OtelContext
 } OtelContext;
 
 extern OtelContext otel_ctx;
+extern bool otel_ctx_from_comment;
 
 /* Defined in otel.c. */
 extern char *otel_tracestate_guc;
 extern char *otel_current_span_id_guc;
 extern bool otel_emit_spans_to_log;
 extern bool otel_trace_all_queries;
+extern bool otel_parse_sqlcommenter;
+
+extern void otel_ctx_reset(void);
+extern bool try_apply_sqlcommenter_context(const char *sql);
 
 /* Defined in otel_api.c. */
 extern void otel_api_publish_rendezvous(void);

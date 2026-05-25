@@ -210,16 +210,33 @@ char	   *otel_current_span_id_guc;	/* leader-span-id for worker
 /* Behaviour-controlling GUCs */
 bool		otel_emit_spans_to_log = false;
 bool		otel_trace_all_queries = false;
+bool		otel_parse_sqlcommenter = false;
+
+/*
+ * Flag set by the executor/utility hooks when otel_ctx was
+ * populated from a sqlcommenter comment in the SQL text (as opposed
+ * to from the otel.traceparent GUC).  Comment-derived context is
+ * STATEMENT-scoped: cleared in finalize_span.  We bypass the GUC
+ * path so SHOW otel.traceparent doesn't lie about session state
+ * and so a comment on one statement doesn't bleed into the next.
+ */
+bool		otel_ctx_from_comment = false;
 
 
 static bool parse_traceparent(const char *s, OtelContext *out);
 static bool all_hex(const char *p, size_t n);
 static bool all_zeros(const char *p, size_t n);
-static void otel_ctx_reset(void);
 
 /* GUC check / assign hooks. */
 static bool check_traceparent(char **newval, void **extra, GucSource source);
 static void assign_traceparent(const char *newval, void *extra);
+
+/* sqlcommenter extraction. */
+static bool find_block_comment(const char *sql,
+							   const char **body, size_t *bodylen);
+static int	decode_percent_escape(const char *p, size_t remaining, char *out);
+static bool extract_traceparent_from_comment(const char *body, size_t bodylen,
+											 char *out, size_t outlen);
 
 
 /*
@@ -419,6 +436,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("otel.parse_sqlcommenter",
+							 "Extract trace context from sqlcommenter SQL comments when no other context is set.",
+							 "Default off.  WARNING: structurally broken under driver-side or "
+							 "server-side prepared statements --- the SQL text (and its comment) "
+							 "is captured at Parse time and frozen in the cached plan, so every "
+							 "subsequent Execute reuses the original traceparent.  Prefer the "
+							 "'M' protocol header, or SET LOCAL otel.traceparent with pipelining, "
+							 "for any workload that uses prepared statements.",
+							 &otel_parse_sqlcommenter,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("otel");
 
 	RegisterProtocolHeaderHandler("otel.",
@@ -491,7 +522,7 @@ parse_traceparent(const char *s, OtelContext *out)
 	return true;
 }
 
-static void
+void
 otel_ctx_reset(void)
 {
 	otel_ctx.is_set = false;
@@ -520,5 +551,287 @@ all_zeros(const char *p, size_t n)
 	for (size_t i = 0; i < n; i++)
 		if (p[i] != '0')
 			return false;
+	return true;
+}
+
+
+/*
+ * sqlcommenter --- in-band trace context smuggling.
+ *
+ * The spec (https://google.github.io/sqlcommenter/spec/) embeds
+ * key=value pairs inside a SQL block comment at the start OR end
+ * of the query, e.g.
+ *
+ *	 /+ traceparent='00-{32 hex}-{16 hex}-{2 hex}' +/ SELECT 1
+ *	 SELECT 1 /+ traceparent='...',action='do%20thing' +/
+ *
+ * (using +/ for *\/ in this comment to avoid ending the C
+ * comment.)
+ *
+ * Values are SQL-string-literal escaped, then URL-encoded.  Our
+ * extractor only cares about `traceparent`, has a fixed-size
+ * output buffer (a W3C traceparent is exactly 55 chars), and
+ * refuses anything that doesn't round-trip cleanly.
+ *
+ * Why this exists in contrib/otel: Most OTel auto-
+ * instrumentations emit sqlcommenter by default today and
+ * expect server-side extraction.  See the top-of-file comment
+ * for the limitations of this approach versus the protocol
+ * header / GUC paths.
+ */
+#define OTEL_SQLCOMMENTER_SCAN_BUDGET	4096
+
+/*
+ * Find an open block comment at the start of `sql` (skipping
+ * leading whitespace), or one at the end (skipping trailing
+ * whitespace + a single trailing semicolon).  On success
+ * returns true and writes [body, body+bodylen) for the comment
+ * INTERIOR (between /\* and *\/).  No comment nesting handling
+ * --- nested block comments aren't valid sqlcommenter anyway.
+ */
+static bool
+find_block_comment(const char *sql, const char **body, size_t *bodylen)
+{
+	size_t		len = strlen(sql);
+	size_t		i;
+	size_t		end;
+	const char *p;
+
+	/* ---- Leading-comment scan ---- */
+	i = 0;
+	while (i < len && (sql[i] == ' ' || sql[i] == '\t' ||
+					   sql[i] == '\n' || sql[i] == '\r'))
+		i++;
+	if (i + 4 <= len && sql[i] == '/' && sql[i + 1] == '*')
+	{
+		p = memmem(sql + i + 2, len - (i + 2), "*/", 2);
+		if (p)
+		{
+			*body = sql + i + 2;
+			*bodylen = (size_t) (p - (sql + i + 2));
+			return true;
+		}
+		/* leading /+ with no close --- fall through to trailing check */
+	}
+
+	/* ---- Trailing-comment scan ---- */
+	end = len;
+	while (end > 0 && (sql[end - 1] == ' ' || sql[end - 1] == '\t' ||
+					   sql[end - 1] == '\n' || sql[end - 1] == '\r' ||
+					   sql[end - 1] == ';'))
+		end--;
+	if (end >= 4 && sql[end - 2] == '*' && sql[end - 1] == '/')
+	{
+		/* Found *\/; search backwards for the matching /+.  Bound
+		 * the scan to a budget to avoid pathological behaviour on
+		 * megabyte queries with no opening comment. */
+		size_t		floor = (end > OTEL_SQLCOMMENTER_SCAN_BUDGET)
+			? end - OTEL_SQLCOMMENTER_SCAN_BUDGET : 0;
+
+		for (i = end - 2; i > floor; i--)
+		{
+			if (sql[i - 1] == '/' && sql[i] == '*')
+			{
+				*body = sql + i + 1;
+				*bodylen = (size_t) ((end - 2) - (i + 1));
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Decode a single %HH escape into out (single byte).  Returns the
+ * number of input bytes consumed (3) on success, or 0 on
+ * malformed input.
+ */
+static int
+decode_percent_escape(const char *p, size_t remaining, char *out)
+{
+	int			hi,
+				lo;
+
+	if (remaining < 3)
+		return 0;
+
+	hi = p[1];
+	lo = p[2];
+
+	if (hi >= '0' && hi <= '9')
+		hi = hi - '0';
+	else if (hi >= 'a' && hi <= 'f')
+		hi = hi - 'a' + 10;
+	else if (hi >= 'A' && hi <= 'F')
+		hi = hi - 'A' + 10;
+	else
+		return 0;
+
+	if (lo >= '0' && lo <= '9')
+		lo = lo - '0';
+	else if (lo >= 'a' && lo <= 'f')
+		lo = lo - 'a' + 10;
+	else if (lo >= 'A' && lo <= 'F')
+		lo = lo - 'A' + 10;
+	else
+		return 0;
+
+	*out = (char) ((hi << 4) | lo);
+	return 3;
+}
+
+/*
+ * Search `body` (the interior of the block comment) for a
+ * `traceparent='...'` key/value pair.  Comma-separated keys per
+ * spec.  Value is URL-decoded into `out` (max `outlen` bytes
+ * including NUL terminator); returns true on a clean decode.
+ *
+ * We don't try to be a full sqlcommenter parser --- only
+ * traceparent is required for our purposes, and the spec's
+ * other fields (action, controller, framework, ...) are
+ * application metadata we don't surface today.
+ */
+static bool
+extract_traceparent_from_comment(const char *body, size_t bodylen,
+								 char *out, size_t outlen)
+{
+	const char *p = body;
+	const char *end = body + bodylen;
+
+	/* Walk the comma-separated key=value list. */
+	while (p < end)
+	{
+		const char *key_start;
+		size_t		key_len;
+		const char *val_start;
+		size_t		val_len;
+		bool		matched_traceparent;
+
+		/* Skip whitespace. */
+		while (p < end && (*p == ' ' || *p == '\t'))
+			p++;
+		if (p >= end)
+			return false;
+
+		/* Key. */
+		key_start = p;
+		while (p < end && *p != '=' && *p != ',')
+			p++;
+		key_len = (size_t) (p - key_start);
+		matched_traceparent = (key_len == 11 &&
+							   strncmp(key_start, "traceparent", 11) == 0);
+
+		if (p >= end || *p != '=')
+		{
+			/* No '=' for this key; skip to next ',' and continue. */
+			while (p < end && *p != ',')
+				p++;
+			if (p < end)
+				p++;	/* eat the comma */
+			continue;
+		}
+		p++;	/* eat the '=' */
+
+		/* Value: single-quoted string per the spec. */
+		if (p >= end || *p != '\'')
+		{
+			/* Malformed --- bail entirely. */
+			return false;
+		}
+		p++;	/* eat opening quote */
+		val_start = p;
+		while (p < end && *p != '\'')
+			p++;
+		val_len = (size_t) (p - val_start);
+		if (p >= end)
+			return false;
+		p++;	/* eat closing quote */
+
+		if (matched_traceparent)
+		{
+			/*
+			 * URL-decode val_start..val_start+val_len into out.
+			 * + does NOT mean space in sqlcommenter (the spec uses
+			 * RFC-3986 percent-encoding, not form-encoding); pass
+			 * '+' through verbatim.
+			 */
+			size_t		oi = 0;
+			size_t		i;
+
+			for (i = 0; i < val_len; )
+			{
+				if (oi + 1 >= outlen) /* +1 leaves room for NUL */
+					return false;
+				if (val_start[i] == '%')
+				{
+					int			used;
+
+					used = decode_percent_escape(val_start + i,
+												 val_len - i,
+												 &out[oi]);
+					if (used == 0)
+						return false;
+					i += used;
+				}
+				else
+				{
+					out[oi] = val_start[i];
+					i++;
+				}
+				oi++;
+			}
+			out[oi] = '\0';
+			return true;
+		}
+
+		/* Wrong key; skip to next comma and continue. */
+		while (p < end && *p != ',')
+			p++;
+		if (p < end)
+			p++;
+	}
+
+	return false;
+}
+
+/*
+ * Orchestrator: if otel.parse_sqlcommenter is on AND otel_ctx is
+ * not already populated by a higher-priority source ('M' header or
+ * SET / SET LOCAL), try to extract a traceparent from a comment in
+ * `sql` and apply it to otel_ctx directly (NOT via the GUC path
+ * --- comment-derived context must NOT outlive the statement).
+ *
+ * Returns true if otel_ctx was populated from the comment; in that
+ * case caller must arrange for finalize_span to clear it (via the
+ * otel_ctx_from_comment flag this fn sets).
+ *
+ * On any malformed-comment or parse-validation failure: silently
+ * proceed without context.  Tracing is best-effort.
+ */
+bool
+try_apply_sqlcommenter_context(const char *sql)
+{
+	const char *body;
+	size_t		bodylen;
+	char		raw[OTEL_TRACEPARENT_LEN + 1];
+	OtelContext tmp;
+
+	if (!otel_parse_sqlcommenter)
+		return false;
+	if (otel_ctx.is_set)
+		return false;	/* 'M' header / GUC always wins */
+	if (sql == NULL || sql[0] == '\0')
+		return false;
+
+	if (!find_block_comment(sql, &body, &bodylen))
+		return false;
+	if (!extract_traceparent_from_comment(body, bodylen, raw, sizeof(raw)))
+		return false;
+	if (!parse_traceparent(raw, &tmp))
+		return false;
+
+	otel_ctx = tmp;
+	otel_ctx_from_comment = true;
 	return true;
 }
