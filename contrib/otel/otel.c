@@ -134,6 +134,16 @@ PG_MODULE_MAGIC;
  */
 PGDLLEXPORT otel_span_emit_hook_type otel_span_emit_hook = NULL;
 
+/*
+ * Sampler hook --- consulted only when the propagated traceparent's
+ * sampled bit is UNSET, before contrib/otel does any allocation.
+ * NULL means "default OTel-SDK ParentBasedSampler behaviour": respect
+ * the unsampled state and skip the span.  Out-of-tree exporters /
+ * SDK modules that implement OTel's Sampler abstraction (ratio,
+ * rate-limit, etc.) register here.  See otel.h.
+ */
+PGDLLEXPORT otel_sampler_hook_type otel_sampler_hook = NULL;
+
 /* In-memory derived state populated by the otel.traceparent assign-hook
  * (called by the GUC machinery on M-header arrival, SET, or
  * parallel-worker RestoreGUCState).  Read by the emit_log_hook in
@@ -413,6 +423,19 @@ parse_traceparent(const char *s, OtelContext *out)
 	out->span_id[OTEL_SPAN_ID_LEN] = '\0';
 	memcpy(out->trace_flags, s + 53, OTEL_TRACE_FLAGS_LEN);
 	out->trace_flags[OTEL_TRACE_FLAGS_LEN] = '\0';
+
+	/* Parse the trace_flags byte to extract the W3C "sampled" bit
+	 * (bit 0).  See the comment on OtelContext.sampled_flag_set
+	 * for the W3C-vs-OTel interpretation distinction. */
+	{
+		unsigned int flags_byte = 0;
+
+		if (sscanf(s + 53, "%2x", &flags_byte) == 1)
+			out->sampled_flag_set = (flags_byte & 0x01) != 0;
+		else
+			out->sampled_flag_set = false;
+	}
+
 	out->is_set = true;
 	return true;
 }
@@ -421,6 +444,7 @@ static void
 otel_ctx_reset(void)
 {
 	otel_ctx.is_set = false;
+	otel_ctx.sampled_flag_set = false;
 	otel_ctx.trace_id[0] = '\0';
 	otel_ctx.span_id[0] = '\0';
 	otel_ctx.trace_flags[0] = '\0';
