@@ -2,6 +2,7 @@
 
 otel_sources = files(
   'otel.c',
+  'otel_api.c',
   'otel_log.c',
   'otel_trace.c',
 )
@@ -22,6 +23,12 @@ install_data(
   'otel.control',
   'otel--1.0.sql',
   kwargs: contrib_data_args,
+)
+
+install_headers(
+  'otel.h',
+  'otel_api.h',
+  install_dir: dir_include_extension / 'otel',
 )
 
 tests += {

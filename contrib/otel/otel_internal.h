@@ -16,6 +16,8 @@
 
 #include "utils/elog.h"
 
+#include "otel.h"
+
 /* W3C Trace Context lengths. */
 #define OTEL_TRACE_ID_LEN		32
 #define OTEL_SPAN_ID_LEN		16
@@ -45,6 +47,11 @@ extern char *otel_tracestate_guc;
 extern char *otel_current_span_id_guc;
 extern bool otel_emit_spans_to_log;
 extern bool otel_trace_all_queries;
+
+/* Defined in otel_api.c. */
+extern void otel_api_publish_rendezvous(void);
+extern otel_span_emit_hook_type otel_get_span_emit_hook(void);
+extern otel_sampler_hook_type	otel_get_sampler_hook(void);
 
 /* Defined in otel_log.c.  Called once from _PG_init. */
 extern void otel_log_install_hooks(void);

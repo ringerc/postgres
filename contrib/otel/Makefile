@@ -4,11 +4,13 @@ MODULE_big = otel
 OBJS = \
 	$(WIN32RES) \
 	otel.o \
+	otel_api.o \
 	otel_log.o \
 	otel_trace.o
 
 EXTENSION = otel
 DATA = otel--1.0.sql
+HEADERS = otel.h otel_api.h
 PGFILEDESC = "otel - OpenTelemetry trace-context support"
 
 TAP_TESTS = 1

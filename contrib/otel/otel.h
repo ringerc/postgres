@@ -264,8 +264,6 @@ typedef struct OtelSamplerInput
  * otel_span_emit_hook.
  */
 typedef OtelSamplerDecision (*otel_sampler_hook_type) (const OtelSamplerInput *in);
-extern PGDLLIMPORT otel_sampler_hook_type otel_sampler_hook;
-
 
 /*
  * Hook for exporters.  Called once per span at finalization, in the
@@ -276,24 +274,15 @@ extern PGDLLIMPORT otel_sampler_hook_type otel_sampler_hook;
  * (e.g. async batching) must copy what it needs.  The hook may be
  * invoked under allocation-failure conditions; exporters that
  * allocate should be prepared for that to fail.
- *
- * To chain multiple consumers, an exporter should stash the previous
- * value at registration time and forward to it after doing its own
- * work:
- *
- *	 static otel_span_emit_hook_type prev_hook;
- *
- *	 static void my_emit(const OtelSpan *s) {
- *	   ... do work ...
- *	   if (prev_hook) prev_hook(s);
- *	 }
- *
- *	 void _PG_init(void) {
- *	   prev_hook = otel_span_emit_hook;
- *	   otel_span_emit_hook = my_emit;
- *	 }
  */
 typedef void (*otel_span_emit_hook_type) (const OtelSpan *span);
-extern PGDLLIMPORT otel_span_emit_hook_type otel_span_emit_hook;
+
+/*
+ * Backward-compatibility umbrella: the OtelTracingApi registration
+ * surface lived in this file before contrib/otel split its public
+ * headers.  Pull it in so existing consumers that include only
+ * <otel/otel.h> see the same symbols they always did.
+ */
+#include "otel_api.h"
 
 #endif							/* CONTRIB_OTEL_H */
