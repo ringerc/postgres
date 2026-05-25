@@ -4,7 +4,8 @@ MODULE_big = otel
 OBJS = \
 	$(WIN32RES) \
 	otel.o \
-	otel_log.o
+	otel_log.o \
+	otel_trace.o
 
 EXTENSION = otel
 DATA = otel--1.0.sql
