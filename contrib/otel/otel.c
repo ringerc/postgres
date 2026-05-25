@@ -122,28 +122,6 @@
 
 PG_MODULE_MAGIC;
 
-/*
- * Exporter hook --- exporters in separate loadable modules register
- * a callback against this to receive completed spans.  See otel.h
- * for the contract.
- *
- * PGDLLEXPORT (== __attribute__((visibility("default"))) on ELF) is
- * required so that out-of-tree exporter modules, themselves built
- * with -fvisibility=hidden, can resolve the symbol when dlopen()'d
- * after contrib/otel.
- */
-PGDLLEXPORT otel_span_emit_hook_type otel_span_emit_hook = NULL;
-
-/*
- * Sampler hook --- consulted only when the propagated traceparent's
- * sampled bit is UNSET, before contrib/otel does any allocation.
- * NULL means "default OTel-SDK ParentBasedSampler behaviour": respect
- * the unsampled state and skip the span.  Out-of-tree exporters /
- * SDK modules that implement OTel's Sampler abstraction (ratio,
- * rate-limit, etc.) register here.  See otel.h.
- */
-PGDLLEXPORT otel_sampler_hook_type otel_sampler_hook = NULL;
-
 /* In-memory derived state populated by the otel.traceparent assign-hook
  * (called by the GUC machinery on M-header arrival, SET, or
  * parallel-worker RestoreGUCState).  Read by the emit_log_hook in
@@ -379,6 +357,7 @@ _PG_init(void)
 
 	otel_log_install_hooks();
 	otel_trace_install_hooks();
+	otel_api_publish_rendezvous();
 }
 
 /*

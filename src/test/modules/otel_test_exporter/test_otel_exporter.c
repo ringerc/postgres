@@ -235,16 +235,37 @@ void		_PG_init(void);
 void
 _PG_init(void)
 {
+	void	  **slot;
+	const OtelTracingApi *api;
+
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
 				(errmsg("test_otel_exporter must be loaded via shared_preload_libraries")));
+
+	/*
+	 * Locate contrib/otel's API table via its rendezvous variable.
+	 * If the slot is NULL the operator has misordered
+	 * shared_preload_libraries: contrib/otel must come BEFORE this
+	 * module so that its _PG_init has populated the slot.
+	 */
+	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
+	api = (const OtelTracingApi *) *slot;
+	if (api == NULL)
+		ereport(ERROR,
+				(errmsg("test_otel_exporter requires contrib/otel to be loaded first"),
+				 errhint("Add 'otel' before '%s' in shared_preload_libraries.",
+						 "test_otel_exporter")));
+	if (api->version != OTEL_TRACING_API_VERSION)
+		ereport(ERROR,
+				(errmsg("OtelTracingApi version mismatch"),
+				 errdetail("Loaded contrib/otel exposes api version %u; this module was built against version %d.",
+						   api->version, OTEL_TRACING_API_VERSION)));
 
 	otel_test_cxt = AllocSetContextCreate(TopMemoryContext,
 										  "test_otel_exporter",
 										  ALLOCSET_DEFAULT_SIZES);
 
-	prev_emit_hook = otel_span_emit_hook;
-	otel_span_emit_hook = otel_test_emit_hook;
+	api->register_emit_hook(otel_test_emit_hook, &prev_emit_hook);
 }
 
 /* ----- SQL surface ----- */
