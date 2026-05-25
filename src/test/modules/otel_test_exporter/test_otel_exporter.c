@@ -31,6 +31,7 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -86,6 +87,35 @@ static int	ring_count;			/* number of valid entries */
 static MemoryContext otel_test_cxt = NULL;
 
 static otel_span_emit_hook_type prev_emit_hook = NULL;
+static otel_sampler_hook_type prev_sampler_hook = NULL;
+
+/*
+ * Cached api pointer so SQL surface fns can call set_sampler_policy
+ * without re-running find_rendezvous_variable each time.  Populated
+ * in _PG_init.
+ */
+static const OtelTracingApi *cached_api = NULL;
+
+/*
+ * GUC controlling what test_otel_sampler_hook returns.  Encoded as
+ * int matching OtelSamplerDecision (0=DROP, 1=RECORD_ONLY,
+ * 2=RECORD_AND_SAMPLE).  PGC_USERSET so TAP tests can flip it
+ * mid-session without restart.
+ *
+ * Default is DROP so that under the default policy
+ * (HOOK_ON_UNSAMPLED_BIT) a session without explicit override
+ * behaves the same as if no sampler hook were registered at all
+ * --- the existing 001_basic test predates the sampler hook and
+ * still expects "no span when wire bit is unset."
+ */
+static int test_otel_sampler_decision = OTEL_SAMPLE_DROP;
+
+static const struct config_enum_entry sampler_decision_options[] = {
+	{"drop", OTEL_SAMPLE_DROP, false},
+	{"record_only", OTEL_SAMPLE_RECORD_ONLY, false},
+	{"record_and_sample", OTEL_SAMPLE_RECORD_AND_SAMPLE, false},
+	{NULL, 0, false},
+};
 
 /* ----- helpers ----- */
 
@@ -230,13 +260,27 @@ otel_test_emit_hook(const OtelSpan *span)
 		prev_emit_hook(span);
 }
 
+/*
+ * Sampler hook --- returns whatever the test_otel_exporter.sampler_decision
+ * GUC currently holds.  TAP tests flip the GUC + the policy GUC (via
+ * test_otel_set_policy) to walk the policy matrix.
+ *
+ * Note: this hook is the LAST-registered sampler; PREV_SAMPLER chaining
+ * is not interesting for tests and is omitted.
+ */
+static OtelSamplerDecision
+otel_test_sampler_hook(const OtelSamplerInput *in)
+{
+	(void) in;
+	return (OtelSamplerDecision) test_otel_sampler_decision;
+}
+
 void		_PG_init(void);
 
 void
 _PG_init(void)
 {
 	void	  **slot;
-	const OtelTracingApi *api;
 
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
@@ -249,23 +293,41 @@ _PG_init(void)
 	 * module so that its _PG_init has populated the slot.
 	 */
 	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
-	api = (const OtelTracingApi *) *slot;
-	if (api == NULL)
+	cached_api = (const OtelTracingApi *) *slot;
+	if (cached_api == NULL)
 		ereport(ERROR,
 				(errmsg("test_otel_exporter requires contrib/otel to be loaded first"),
 				 errhint("Add 'otel' before '%s' in shared_preload_libraries.",
 						 "test_otel_exporter")));
-	if (api->version != OTEL_TRACING_API_VERSION)
+	if (cached_api->version != OTEL_TRACING_API_VERSION)
 		ereport(ERROR,
 				(errmsg("OtelTracingApi version mismatch"),
 				 errdetail("Loaded contrib/otel exposes api version %u; this module was built against version %d.",
-						   api->version, OTEL_TRACING_API_VERSION)));
+						   cached_api->version, OTEL_TRACING_API_VERSION)));
 
 	otel_test_cxt = AllocSetContextCreate(TopMemoryContext,
 										  "test_otel_exporter",
 										  ALLOCSET_DEFAULT_SIZES);
 
-	api->register_emit_hook(otel_test_emit_hook, &prev_emit_hook);
+	/*
+	 * GUC for sampler decision.  TAP tests SET this in-session to
+	 * control what the sampler hook returns for each iteration of
+	 * the policy matrix.
+	 */
+	DefineCustomEnumVariable("test_otel_exporter.sampler_decision",
+							 "Decision returned by test_otel_exporter's sampler hook.",
+							 NULL,
+							 &test_otel_sampler_decision,
+							 OTEL_SAMPLE_DROP,
+							 sampler_decision_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("test_otel_exporter");
+
+	cached_api->register_emit_hook(otel_test_emit_hook, &prev_emit_hook);
+	cached_api->register_sampler_hook(otel_test_sampler_hook, &prev_sampler_hook);
 }
 
 /* ----- SQL surface ----- */
@@ -370,5 +432,40 @@ test_otel_clear(PG_FUNCTION_ARGS)
 	if (otel_test_cxt)
 		MemoryContextReset(otel_test_cxt);
 
+	PG_RETURN_VOID();
+}
+
+/*
+ * Set the sampler-hook invocation policy via the v2 api.  Accepts
+ * the same four string values the contrib/otel rust demo accepts
+ * (hook_on_unsampled_bit, hook_always, never_respect_bit,
+ * never_always_sample); easier to test from TAP than a numeric enum.
+ *
+ * Bumps contrib/otel's policy GUC-equivalent without us having to
+ * expose the OtelSamplerHookPolicy enum to SQL.
+ */
+PG_FUNCTION_INFO_V1(test_otel_set_policy);
+Datum
+test_otel_set_policy(PG_FUNCTION_ARGS)
+{
+	text	   *t = PG_GETARG_TEXT_PP(0);
+	const char *s = text_to_cstring(t);
+	OtelSamplerHookPolicy policy;
+
+	if (strcmp(s, "hook_on_unsampled_bit") == 0)
+		policy = OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT;
+	else if (strcmp(s, "hook_always") == 0)
+		policy = OTEL_SAMPLER_HOOK_ALWAYS;
+	else if (strcmp(s, "never_respect_bit") == 0)
+		policy = OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT;
+	else if (strcmp(s, "never_always_sample") == 0)
+		policy = OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid sampler-hook policy: %s", s),
+				 errhint("Valid: hook_on_unsampled_bit, hook_always, never_respect_bit, never_always_sample.")));
+
+	cached_api->set_sampler_policy(policy);
 	PG_RETURN_VOID();
 }
