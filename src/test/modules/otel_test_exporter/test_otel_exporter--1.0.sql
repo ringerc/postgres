@@ -16,3 +16,8 @@ CREATE FUNCTION test_otel_clear()
 RETURNS void
 AS 'MODULE_PATHNAME', 'test_otel_clear'
 LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION test_otel_set_policy(policy text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'test_otel_set_policy'
+LANGUAGE C VOLATILE PARALLEL SAFE;
