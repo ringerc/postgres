@@ -399,6 +399,8 @@ start_span(QueryDesc *queryDesc)
 static void
 finalize_span(OtelSpanStatus status)
 {
+	otel_span_emit_hook_type emit_hook;
+
 	if (!span_active)
 		return;
 
@@ -409,11 +411,13 @@ finalize_span(OtelSpanStatus status)
 	if (span_storage.status == OTEL_STATUS_UNSET)
 		span_storage.status = status;
 
+	emit_hook = otel_get_span_emit_hook();
+
 	/* Hand off to exporter (best-effort, swallow errors). */
 	PG_TRY();
 	{
-		if (otel_span_emit_hook)
-			otel_span_emit_hook(&span_storage);
+		if (emit_hook)
+			emit_hook(&span_storage);
 
 		if (otel_emit_spans_to_log)
 			emit_span_as_log_line(&span_storage);
@@ -468,8 +472,11 @@ finalize_span(OtelSpanStatus status)
 static OtelSamplerDecision
 decide_whether_to_record(const char *name_hint)
 {
+	otel_span_emit_hook_type emit_hook = otel_get_span_emit_hook();
+	otel_sampler_hook_type sampler_hook = otel_get_sampler_hook();
+
 	/* Gate 1: no consumer */
-	if (otel_span_emit_hook == NULL && !otel_emit_spans_to_log)
+	if (emit_hook == NULL && !otel_emit_spans_to_log)
 		return OTEL_SAMPLE_DROP;
 
 	/* Gate 2: force-on overrides propagation entirely */
@@ -485,7 +492,7 @@ decide_whether_to_record(const char *name_hint)
 		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
 
 	/* Gate 5: defer to registered sampler */
-	if (otel_sampler_hook != NULL)
+	if (sampler_hook != NULL)
 	{
 		OtelSamplerInput in;
 
@@ -497,7 +504,7 @@ decide_whether_to_record(const char *name_hint)
 		in.name = name_hint;
 		in.kind = OTEL_SPAN_KIND_SERVER;
 
-		return otel_sampler_hook(&in);
+		return sampler_hook(&in);
 	}
 
 	/* Gate 6: default OTel ParentBased behaviour --- unsampled drops */
