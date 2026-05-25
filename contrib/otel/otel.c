@@ -126,8 +126,13 @@ PG_MODULE_MAGIC;
  * Exporter hook --- exporters in separate loadable modules register
  * a callback against this to receive completed spans.  See otel.h
  * for the contract.
+ *
+ * PGDLLEXPORT (== __attribute__((visibility("default"))) on ELF) is
+ * required so that out-of-tree exporter modules, themselves built
+ * with -fvisibility=hidden, can resolve the symbol when dlopen()'d
+ * after contrib/otel.
  */
-otel_span_emit_hook_type otel_span_emit_hook = NULL;
+PGDLLEXPORT otel_span_emit_hook_type otel_span_emit_hook = NULL;
 
 /* In-memory derived state populated by the otel.traceparent assign-hook
  * (called by the GUC machinery on M-header arrival, SET, or
@@ -137,7 +142,14 @@ OtelContext otel_ctx;
 
 /* GUC variables --- canonical storage. */
 static char *otel_traceparent_guc;
-static char *otel_tracestate_guc;
+char	   *otel_tracestate_guc;
+char	   *otel_current_span_id_guc;	/* leader-span-id for worker
+										 * parent linking --- not for user
+										 * SET semantics */
+
+/* Behaviour-controlling GUCs */
+bool		otel_emit_spans_to_log = false;
+bool		otel_trace_all_queries = false;
 
 
 static bool parse_traceparent(const char *s, OtelContext *out);
@@ -307,6 +319,35 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
+	DefineCustomStringVariable("otel.current_span_id",
+							   "Leader's currently-active span_id; propagated to parallel workers.",
+							   "Set automatically by the otel module's ExecutorStart hook; should not be set by end users.",
+							   &otel_current_span_id_guc,
+							   "",
+							   PGC_USERSET,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	DefineCustomBoolVariable("otel.emit_spans_to_log",
+							 "Emit completed spans as structured log lines.",
+							 NULL,
+							 &otel_emit_spans_to_log,
+							 false,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("otel.trace_all_queries",
+							 "Emit spans for all queries, even ones with no client-propagated trace context.",
+							 "When off (default), spans are only produced when the client has supplied an otel.traceparent header.",
+							 &otel_trace_all_queries,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("otel");
 
 	RegisterProtocolHeaderHandler("otel.",
@@ -316,6 +357,7 @@ _PG_init(void)
 								  NULL);
 
 	otel_log_install_hooks();
+	otel_trace_install_hooks();
 }
 
 /*
