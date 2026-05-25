@@ -47,6 +47,7 @@
 #include "utils/elog.h"
 #include "utils/errcodes.h"
 #include "utils/guc.h"
+#include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -120,6 +121,7 @@ static void restore_current_span_id_guc(void);
 static OtelSpanEvent *acquire_event_slot(void);
 static void capture_event_core(OtelEventCore *core, ErrorData *edata);
 static void capture_event_extended(OtelSpanEvent *event, ErrorData *edata);
+static void emit_span_as_log_line(const OtelSpan *span);
 
 
 /*
@@ -412,8 +414,8 @@ finalize_span(OtelSpanStatus status)
 		if (otel_span_emit_hook)
 			otel_span_emit_hook(&span_storage);
 
-		/* TODO step 5: built-in JSON log emitter when otel_emit_spans_to_log
-		 * is true.  Skipped here. */
+		if (otel_emit_spans_to_log)
+			emit_span_as_log_line(&span_storage);
 	}
 	PG_CATCH();
 	{
@@ -811,4 +813,155 @@ otel_span_record_log_event(ErrorData *edata)
 	 * event itself was captured. */
 	if (edata->elevel >= ERROR)
 		span_storage.status = OTEL_STATUS_ERROR;
+}
+
+
+/* ====================================================================
+ * emit_span_as_log_line --- zero-config JSON-log fallback emitter.
+ * ====================================================================
+ *
+ * Gated by the otel.emit_spans_to_log GUC.  Writes the span as a
+ * single structured LOG line; operators can ship those lines
+ * downstream via fluentd / vector / the OTel Collector's filelog
+ * receiver.
+ *
+ * Uses StringInfo (and palloc) so it is best-effort under memory
+ * pressure: an allocation failure causes the log line for this one
+ * span to be dropped, with no effect on the user's transaction.
+ * Caller (finalize_span) wraps in PG_TRY.
+ *
+ * The JSON shape is documented as stable for THIS PoC across minor
+ * revisions of contrib/otel; do not consider it OTLP and do not
+ * embed in production tooling expecting OTLP compatibility.
+ */
+static void
+emit_span_as_log_line(const OtelSpan *span)
+{
+	StringInfoData buf;
+	int			i;
+	bool		first;
+
+	initStringInfo(&buf);
+
+	appendStringInfoChar(&buf, '{');
+
+	appendStringInfoString(&buf, "\"trace_id\":");
+	escape_json(&buf, span->trace_id);
+	appendStringInfoString(&buf, ",\"span_id\":");
+	escape_json(&buf, span->span_id);
+	appendStringInfoString(&buf, ",\"parent_span_id\":");
+	escape_json(&buf, span->parent_span_id);
+	appendStringInfoString(&buf, ",\"trace_flags\":");
+	escape_json(&buf, span->trace_flags);
+	if (span->tracestate)
+	{
+		appendStringInfoString(&buf, ",\"tracestate\":");
+		escape_json(&buf, span->tracestate);
+	}
+	appendStringInfoString(&buf, ",\"name\":");
+	escape_json(&buf, span->name ? span->name : "");
+	appendStringInfo(&buf, ",\"kind\":%d", (int) span->kind);
+	appendStringInfo(&buf, ",\"status\":%d", (int) span->status);
+	appendStringInfo(&buf, ",\"start_time\":%" PRId64,
+					 (int64) span->start_time);
+	appendStringInfo(&buf, ",\"end_time\":%" PRId64,
+					 (int64) span->end_time);
+
+	/* Attributes object */
+	appendStringInfoString(&buf, ",\"attributes\":{");
+	first = true;
+	for (i = 0; i < span->n_attrs; i++)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		escape_json(&buf, span->attrs[i].key ? span->attrs[i].key : "");
+		appendStringInfoChar(&buf, ':');
+		escape_json(&buf, span->attrs[i].value ? span->attrs[i].value : "");
+	}
+	for (i = 0; i < span->n_overflow_attrs; i++)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		escape_json(&buf, span->overflow_attrs[i].key ? span->overflow_attrs[i].key : "");
+		appendStringInfoChar(&buf, ':');
+		escape_json(&buf, span->overflow_attrs[i].value ? span->overflow_attrs[i].value : "");
+	}
+	appendStringInfoChar(&buf, '}');
+
+	/* Events array */
+	appendStringInfoString(&buf, ",\"events\":[");
+	first = true;
+	if (span->inline_event_used)
+	{
+		const OtelSpanEvent *e = &span->inline_event;
+
+		appendStringInfoChar(&buf, '{');
+		appendStringInfo(&buf, "\"time\":%" PRId64,
+						 (int64) e->core.time);
+		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
+		appendStringInfoString(&buf, ",\"sqlstate\":");
+		escape_json(&buf, e->core.sqlstate);
+		if (e->core.filename)
+		{
+			appendStringInfoString(&buf, ",\"filename\":");
+			escape_json(&buf, e->core.filename);
+		}
+		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
+		if (e->message)
+		{
+			appendStringInfoString(&buf, ",\"message\":");
+			escape_json(&buf, e->message);
+		}
+		if (e->detail)
+		{
+			appendStringInfoString(&buf, ",\"detail\":");
+			escape_json(&buf, e->detail);
+		}
+		if (e->hint)
+		{
+			appendStringInfoString(&buf, ",\"hint\":");
+			escape_json(&buf, e->hint);
+		}
+		appendStringInfoChar(&buf, '}');
+		first = false;
+	}
+	for (i = 0; i < span->n_overflow_events; i++)
+	{
+		const OtelSpanEvent *e = &span->overflow_events[i];
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoChar(&buf, '{');
+		appendStringInfo(&buf, "\"time\":%" PRId64,
+						 (int64) e->core.time);
+		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
+		appendStringInfoString(&buf, ",\"sqlstate\":");
+		escape_json(&buf, e->core.sqlstate);
+		if (e->core.filename)
+		{
+			appendStringInfoString(&buf, ",\"filename\":");
+			escape_json(&buf, e->core.filename);
+		}
+		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
+		if (e->message)
+		{
+			appendStringInfoString(&buf, ",\"message\":");
+			escape_json(&buf, e->message);
+		}
+		appendStringInfoChar(&buf, '}');
+	}
+	appendStringInfoChar(&buf, ']');
+
+	appendStringInfoChar(&buf, '}');
+
+	/* Emit as a single LOG line with a distinctive prefix so log
+	 * collectors can filter for span records.  errmsg_internal
+	 * suppresses translation since the JSON is not localized. */
+	ereport(LOG,
+			(errmsg_internal("otel-span: %s", buf.data)));
+
+	pfree(buf.data);
 }
