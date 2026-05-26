@@ -287,6 +287,14 @@ write_jsonlog(ErrorData *edata)
 	appendJSONKeyValueFmt(&buf, "query_id", false, "%" PRId64,
 						  pgstat_get_my_query_id());
 
+	/* OpenTelemetry trace context */
+	if (edata->trace_id)
+		appendJSONKeyValue(&buf, "trace_id", edata->trace_id, true);
+	if (edata->span_id)
+		appendJSONKeyValue(&buf, "span_id", edata->span_id, true);
+	if (edata->trace_flags)
+		appendJSONKeyValue(&buf, "trace_flags", edata->trace_flags, true);
+
 	/* Finish string */
 	appendStringInfoChar(&buf, '}');
 	appendStringInfoChar(&buf, '\n');

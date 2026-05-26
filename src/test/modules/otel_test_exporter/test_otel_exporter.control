@@ -1,0 +1,5 @@
+# test_otel_exporter extension
+comment = 'test-only span exporter for contrib/otel'
+default_version = '1.0'
+module_pathname = '$libdir/test_otel_exporter'
+relocatable = true

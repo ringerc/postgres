@@ -11,8 +11,10 @@ SUBDIRS = \
 		  dummy_index_am \
 		  dummy_seclabel \
 		  index \
+		  libpq_headers \
 		  libpq_pipeline \
 		  oauth_validator \
+		  otel_test_exporter \
 		  plsample \
 		  spgist_name_ops \
 		  test_aio \
@@ -43,6 +45,7 @@ SUBDIRS = \
 		  test_pg_dump \
 		  test_plan_advice \
 		  test_predtest \
+		  test_protocol_headers \
 		  test_radixtree \
 		  test_rbtree \
 		  test_regex \
