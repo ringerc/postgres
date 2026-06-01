@@ -47,6 +47,63 @@
 
 #include "datatype/timestamp.h"
 
+/* W3C Trace Context lengths (excluding trailing NUL). */
+#define OTEL_TRACE_ID_LEN		32
+#define OTEL_SPAN_ID_LEN		16
+#define OTEL_TRACE_FLAGS_LEN	2
+
+/*
+ * SpanContext: the on-the-wire trace-context identifiers as a
+ * single struct, with all fields NUL-terminated lowercase hex
+ * strings.  Used by the producer API to return parent/current/root
+ * span identity to callers, and as an input to
+ * span_set_parent_explicit() for callers that already know the
+ * parent identity from some external source (e.g. a sibling trace
+ * managed independently of the active call-stack-based trace).
+ *
+ * `tracestate` is the W3C companion field carrying vendor-specific
+ * key=value entries.  May be NULL.  When non-NULL, the pointer is
+ * valid until the next API call that may modify the active stack
+ * or root context; callers that need a longer lifetime must copy.
+ */
+typedef struct OtelSpanContext
+{
+	char		trace_id[OTEL_TRACE_ID_LEN + 1];
+	char		span_id[OTEL_SPAN_ID_LEN + 1];
+	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
+	const char *tracestate;
+} OtelSpanContext;
+
+/*
+ * Behaviour when a pushed span is forcibly removed from the active
+ * span-stack without an explicit api->span_emit() call --- either
+ * because ereport() unwound through the producing code path before
+ * emit was reached, or because emit was called for an older span
+ * with newer spans still pushed above it.
+ *
+ *	 OTEL_UNWIND_DROP (default): silently pop, do not emit.  Best-
+ *	 effort instrumentation gets this --- a span lost due to error
+ *	 unwinding produces no record at all rather than a confusing
+ *	 phantom emission.
+ *
+ *	 OTEL_UNWIND_ERROR: read the OtelSpan via the stack entry's
+ *	 pointer (which is still valid during the MemoryContextCallback
+ *	 that drives this), set its status to OTEL_STATUS_ERROR with a
+ *	 descriptive message, set its end_time to now, and dispatch to
+ *	 registered exporters.  Statement-level spans use this so that
+ *	 aborted queries appear in traces.
+ *
+ * Set via otel_span_set_unwind_policy() before pushing the span.
+ * After push, the stack-entry's policy copy is authoritative;
+ * later changes to the OtelSpan's policy field are no-ops for that
+ * push.
+ */
+typedef enum OtelSpanUnwindPolicy
+{
+	OTEL_UNWIND_DROP = 0,
+	OTEL_UNWIND_ERROR = 1,
+} OtelSpanUnwindPolicy;
+
 /*
  * W3C / OpenTelemetry span status.  UNSET is the default; OK is set
  * only when the producer explicitly knows the operation succeeded;
@@ -202,6 +259,14 @@ typedef struct OtelSpan
 
 	TimestampTz start_time;
 	TimestampTz end_time;
+
+	/* Behaviour when this span is forcibly removed from the active
+	 * stack without an explicit emit (e.g. ereport unwind, or
+	 * emit-of-non-top).  Default OTEL_UNWIND_DROP; producers that
+	 * want abort-visibility (statement-level spans, etc.) opt in to
+	 * OTEL_UNWIND_ERROR via otel_span_set_unwind_policy() before push.
+	 * Read once at push time --- post-push changes are no-ops. */
+	OtelSpanUnwindPolicy unwind_policy;
 
 	/* Attributes: inline up to OTEL_INLINE_ATTRS, then overflow. */
 	int			n_attrs;		/* count of valid entries in attrs[] */
