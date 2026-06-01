@@ -213,11 +213,15 @@ _PG_init(void)
 		ereport(ERROR,
 				(errmsg("otel_demo_exporter requires contrib/otel to be loaded first"),
 				 errhint("Add 'otel' before 'otel_demo_exporter' in shared_preload_libraries.")));
-	if (api->version != OTEL_TRACING_API_VERSION)
+	if (OTEL_API_MAJOR(api->version) != OTEL_TRACING_API_MAJOR ||
+		OTEL_API_MINOR(api->version) < OTEL_TRACING_API_MINOR)
 		ereport(ERROR,
 				(errmsg("OtelTracingApi version mismatch"),
-				 errdetail("Loaded contrib/otel exposes api version %u; otel_demo_exporter was built against version %d.",
-						   api->version, OTEL_TRACING_API_VERSION)));
+				 errdetail("Loaded contrib/otel exposes api version %u.%u; otel_demo_exporter was built against version %u.%u.",
+						   OTEL_API_MAJOR(api->version),
+						   OTEL_API_MINOR(api->version),
+						   OTEL_TRACING_API_MAJOR,
+						   OTEL_TRACING_API_MINOR)));
 
 	DefineCustomStringVariable("otel_demo_exporter.output_file",
 							   "Path of the JSON-lines file to write spans to.",

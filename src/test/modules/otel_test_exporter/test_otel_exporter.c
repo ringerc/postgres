@@ -299,11 +299,15 @@ _PG_init(void)
 				(errmsg("test_otel_exporter requires contrib/otel to be loaded first"),
 				 errhint("Add 'otel' before '%s' in shared_preload_libraries.",
 						 "test_otel_exporter")));
-	if (cached_api->version != OTEL_TRACING_API_VERSION)
+	if (OTEL_API_MAJOR(cached_api->version) != OTEL_TRACING_API_MAJOR ||
+		OTEL_API_MINOR(cached_api->version) < OTEL_TRACING_API_MINOR)
 		ereport(ERROR,
 				(errmsg("OtelTracingApi version mismatch"),
-				 errdetail("Loaded contrib/otel exposes api version %u; this module was built against version %d.",
-						   cached_api->version, OTEL_TRACING_API_VERSION)));
+				 errdetail("Loaded contrib/otel exposes api version %u.%u; this module was built against version %u.%u.",
+						   OTEL_API_MAJOR(cached_api->version),
+						   OTEL_API_MINOR(cached_api->version),
+						   OTEL_TRACING_API_MAJOR,
+						   OTEL_TRACING_API_MINOR)));
 
 	otel_test_cxt = AllocSetContextCreate(TopMemoryContext,
 										  "test_otel_exporter",
