@@ -33,23 +33,49 @@
  * Version of the OtelTracingApi struct exposed via the rendezvous
  * variable named OTEL_TRACING_API_RENDEZVOUS_NAME.
  *
- * Versioning rules (semver-ish, single integer):
+ * Versioning rules (split major/minor in a single uint32):
  *
- *	 * The major number is bumped on any breaking change: a removed
- *	   or repurposed function pointer, a renamed/restructured field
- *	   in an input or output type that affects ABI.
- *	 * Appending new function pointers at the END of OtelTracingApi
- *	   is NOT a breaking change.  Old consumers do not dereference
- *	   past where they expect data and will continue to work.
- *	 * Bug fixes that do not change the ABI do not bump the version.
+ *	 The 32-bit version is split into two halfwords:
  *
- * External modules MUST check `api->version == OTEL_TRACING_API_VERSION`
- * (exact match, not >=) at registration time, and ereport(ERROR) on
- * mismatch.  This is intentionally stricter than "compatible with"
- * because an exporter built against v1 has no way to know whether a
- * later major's struct layout broke its assumptions.
+ *	   * High halfword (bits 31..16) -- MAJOR version, bumped on any
+ *	     incompatible layout change: a removed, retyped, reordered,
+ *	     or semantically-repurposed field.  Strict-equality required.
+ *	   * Low halfword (bits 15..0) -- MINOR version, a monotonic
+ *	     extension counter.  Bumped on each additive change (new
+ *	     field or function pointer APPENDED at the END of the
+ *	     struct).  The invariant is "it must be safe to interpret a
+ *	     (MAJOR, MINOR+k) struct as a (MAJOR, MINOR) struct" -- the
+ *	     layout prefix up to MINOR is identical; only suffix fields
+ *	     are added.
+ *	   * Bug fixes that do not change the ABI do not bump anything.
+ *
+ * External modules MUST verify both:
+ *
+ *	   OTEL_API_MAJOR(api->version) == OTEL_TRACING_API_MAJOR   // strict
+ *	   OTEL_API_MINOR(api->version) >= OTEL_TRACING_API_MINOR   // >=
+ *
+ * Strict equality on MAJOR is intentional: an exporter built against
+ * MAJOR=N has no way to know whether MAJOR=N+1 moved a function
+ * pointer, changed a struct layout, or repurposed a field.  Force
+ * the rebuild.
+ *
+ * MINOR is asymmetric: a producer at (M, N+k) is fine for a consumer
+ * built at (M, N) because additive changes only add fields after the
+ * prefix the consumer reads.  The other direction (consumer minor >
+ * producer minor) is not safe -- the consumer would read past the
+ * end of the producer's struct, hence the >= check.
+ *
+ * Use OTEL_MAKE_VERSION(maj, min) to construct version literals.
+ * Use OTEL_API_MAJOR(v) and OTEL_API_MINOR(v) to extract halfwords.
  */
-#define OTEL_TRACING_API_VERSION		2
+#define OTEL_MAKE_VERSION(maj, min)	(((uint32) (maj) << 16) | (uint16) (min))
+#define OTEL_API_MAJOR(v)			((v) >> 16)
+#define OTEL_API_MINOR(v)			((v) & 0xFFFFu)
+
+#define OTEL_TRACING_API_MAJOR		2
+#define OTEL_TRACING_API_MINOR		0
+#define OTEL_TRACING_API_VERSION	OTEL_MAKE_VERSION(OTEL_TRACING_API_MAJOR, \
+													  OTEL_TRACING_API_MINOR)
 
 /*
  * Rendezvous variable name (subject to NAMEDATALEN, currently 64).
@@ -78,8 +104,9 @@ typedef struct OtelTracingApi
 {
 	/*
 	 * Set to OTEL_TRACING_API_VERSION at module init.  External
-	 * consumers must verify this matches what they were compiled
-	 * against; see the comment on OTEL_TRACING_API_VERSION.
+	 * consumers must verify both halfwords match what they were
+	 * compiled against (strict on MAJOR, >= on MINOR); see the
+	 * comment on OTEL_TRACING_API_VERSION.
 	 */
 	uint32		version;
 
@@ -99,7 +126,9 @@ typedef struct OtelTracingApi
 	 *	 void _PG_init(void) {
 	 *	   void **slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
 	 *	   const OtelTracingApi *api = *slot;
-	 *	   ... check api != NULL, api->version == OTEL_TRACING_API_VERSION ...
+	 *	   ... check api != NULL, OTEL_API_MAJOR(api->version) ==
+	 *	   OTEL_TRACING_API_MAJOR, OTEL_API_MINOR(api->version) >=
+	 *	   OTEL_TRACING_API_MINOR ...
 	 *	   api->register_emit_hook(my_emit, &prev_emit);
 	 *	 }
 	 *
