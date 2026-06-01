@@ -18,10 +18,8 @@
 
 #include "otel.h"
 
-/* W3C Trace Context lengths. */
-#define OTEL_TRACE_ID_LEN		32
-#define OTEL_SPAN_ID_LEN		16
-#define OTEL_TRACE_FLAGS_LEN	2
+/* W3C Trace Context lengths are now declared in the public otel.h
+ * since OtelSpanContext uses them. */
 #define OTEL_TRACEPARENT_LEN	(2 + 1 + OTEL_TRACE_ID_LEN + 1 + \
 								 OTEL_SPAN_ID_LEN + 1 + OTEL_TRACE_FLAGS_LEN)
 
