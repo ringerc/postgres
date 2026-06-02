@@ -28,7 +28,7 @@ my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-$FLAGS";
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel'
+shared_preload_libraries = 'otel,otel_postgres_tracing'
 log_statement = 'all'
 log_min_messages = log
 log_line_prefix = 'TR[%T] SP[%S] '

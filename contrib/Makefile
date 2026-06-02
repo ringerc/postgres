@@ -30,6 +30,7 @@ SUBDIRS = \
 		oid2name	\
 		otel		\
 		otel_demo_exporter	\
+		otel_postgres_tracing	\
 		pageinspect	\
 		passwordcheck	\
 		pg_buffercache	\

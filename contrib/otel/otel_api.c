@@ -86,6 +86,95 @@ api_set_sampler_policy(OtelSamplerHookPolicy policy)
 	otel_sampler_hook_policy = policy;
 }
 
+
+/* ----------------------------------------------------------------
+ * Phase 4 helpers --- expose the bits the split-out query-tracing
+ * module needs to reach back into contrib/otel.  All thin wrappers
+ * around existing internal state / functions.
+ * ----------------------------------------------------------------
+ */
+
+static void
+api_get_root_context_snapshot(OtelRootContextSnapshot *out)
+{
+	if (out == NULL)
+		return;
+
+	out->is_set = otel_ctx.is_set;
+	out->sampled_flag_set = otel_ctx.sampled_flag_set;
+	out->from_comment = otel_ctx_from_comment;
+	memcpy(out->trace_id, otel_ctx.trace_id, sizeof(out->trace_id));
+	memcpy(out->span_id, otel_ctx.span_id, sizeof(out->span_id));
+	memcpy(out->trace_flags, otel_ctx.trace_flags, sizeof(out->trace_flags));
+	out->tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
+		? otel_tracestate_guc : NULL;
+}
+
+static void
+api_reset_root_context(void)
+{
+	otel_ctx_reset();
+	otel_ctx_from_comment = false;
+}
+
+static bool
+api_try_apply_sqlcommenter_context(const char *sql)
+{
+	/* Gated by the otel.parse_sqlcommenter GUC.  Returning false
+	 * without parsing matches the behaviour of "no comment
+	 * contained a traceparent" --- the caller can safely treat both
+	 * cases identically. */
+	if (!otel_parse_sqlcommenter)
+		return false;
+	return try_apply_sqlcommenter_context(sql);
+}
+
+/*
+ * Apply the registered sampler hook + the configured invocation
+ * policy and return a decision.  Caller has already done the
+ * "any consumer present?" + "trace_all_queries?" gates --- this
+ * function is invoked only when those gates passed.
+ */
+static OtelSamplerDecision
+api_compute_sampler_decision(const OtelSamplerInput *in, bool sampled_flag_set)
+{
+	otel_sampler_hook_type sampler_hook = otel_sampler_hook;
+	OtelSamplerHookPolicy policy = otel_sampler_hook_policy;
+
+	switch (policy)
+	{
+		case OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE:
+			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+
+		case OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT:
+			return sampled_flag_set
+				? OTEL_SAMPLE_RECORD_AND_SAMPLE
+				: OTEL_SAMPLE_DROP;
+
+		case OTEL_SAMPLER_HOOK_ALWAYS:
+			if (sampler_hook == NULL)
+				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+			break;					/* fall through to the hook call */
+
+		case OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT:
+		default:
+			if (sampled_flag_set)
+				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+			if (sampler_hook == NULL)
+				return OTEL_SAMPLE_DROP;
+			break;					/* fall through to the hook call */
+	}
+
+	/* Hook-call path. */
+	return sampler_hook(in);
+}
+
+static bool
+api_any_emit_consumer_present(void)
+{
+	return otel_span_emit_hook != NULL || otel_emit_spans_to_log;
+}
+
 /*
  * The api table installed into the rendezvous slot.  Static storage
  * duration means it lives forever and external consumers can cache
@@ -110,6 +199,18 @@ static const OtelTracingApi otel_tracing_api = {
 	 * cross-extension symbol-resolution boundary. */
 	.span_init = otel_span_init,
 	.span_add_attribute_string = otel_span_add_attribute_string,
+
+	/* Phase 4: surface needed by the split-out query-tracing
+	 * module. */
+	.span_push = otel_producer_span_push,
+	.parallel_publish_leader_context = otel_parallel_publish_leader_context,
+	.parallel_clear_leader_context = otel_parallel_clear_leader_context,
+	.parallel_get_leader_context = otel_parallel_get_leader_context,
+	.get_root_context_snapshot = api_get_root_context_snapshot,
+	.reset_root_context = api_reset_root_context,
+	.try_apply_sqlcommenter_context = api_try_apply_sqlcommenter_context,
+	.compute_sampler_decision = api_compute_sampler_decision,
+	.any_emit_consumer_present = api_any_emit_consumer_present,
 };
 
 

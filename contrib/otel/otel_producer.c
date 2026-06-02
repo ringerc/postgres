@@ -82,7 +82,9 @@
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "port.h"				/* pg_strong_random */
+#include "utils/builtins.h"		/* escape_json */
 #include "utils/elog.h"
+#include "utils/json.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -202,6 +204,146 @@ typedef struct OtelSpanUnwindNode
  * doesn't disrupt the producer.  Tracing failures must not break
  * the query.
  */
+/*
+ * Zero-config JSON-log fallback emitter.  Gated by
+ * otel.emit_spans_to_log.  Used by dispatch_span below.  Moved
+ * here from otel_trace.c when the query-tracing module split out
+ * in Phase 4 --- the log-line emitter is producer-side
+ * infrastructure, not query-tracing-specific.
+ *
+ * The JSON shape carries headline span identity, name, kind,
+ * status, timing, attributes, and events.  Emitted as a single
+ * LOG line prefixed with "otel-span: " for log-pipeline
+ * filtering.
+ */
+void
+otel_emit_span_as_log_line(const OtelSpan *span)
+{
+	StringInfoData buf;
+	int			i;
+	bool		first;
+
+	initStringInfo(&buf);
+
+	appendStringInfoChar(&buf, '{');
+
+	appendStringInfoString(&buf, "\"trace_id\":");
+	escape_json(&buf, span->trace_id);
+	appendStringInfoString(&buf, ",\"span_id\":");
+	escape_json(&buf, span->span_id);
+	appendStringInfoString(&buf, ",\"parent_span_id\":");
+	escape_json(&buf, span->parent_span_id);
+	appendStringInfoString(&buf, ",\"trace_flags\":");
+	escape_json(&buf, span->trace_flags);
+	if (span->tracestate)
+	{
+		appendStringInfoString(&buf, ",\"tracestate\":");
+		escape_json(&buf, span->tracestate);
+	}
+	appendStringInfoString(&buf, ",\"name\":");
+	escape_json(&buf, span->name ? span->name : "");
+	appendStringInfo(&buf, ",\"kind\":%d", (int) span->kind);
+	appendStringInfo(&buf, ",\"status\":%d", (int) span->status);
+	appendStringInfo(&buf, ",\"start_time\":%" PRId64,
+					 (int64) span->start_time);
+	appendStringInfo(&buf, ",\"end_time\":%" PRId64,
+					 (int64) span->end_time);
+
+	appendStringInfoString(&buf, ",\"attributes\":{");
+	first = true;
+	for (i = 0; i < span->n_attrs; i++)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		escape_json(&buf, span->attrs[i].key ? span->attrs[i].key : "");
+		appendStringInfoChar(&buf, ':');
+		escape_json(&buf, span->attrs[i].value ? span->attrs[i].value : "");
+	}
+	for (i = 0; i < span->n_overflow_attrs; i++)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		escape_json(&buf, span->overflow_attrs[i].key ? span->overflow_attrs[i].key : "");
+		appendStringInfoChar(&buf, ':');
+		escape_json(&buf, span->overflow_attrs[i].value ? span->overflow_attrs[i].value : "");
+	}
+	appendStringInfoChar(&buf, '}');
+
+	appendStringInfoString(&buf, ",\"events\":[");
+	first = true;
+	if (span->inline_event_used)
+	{
+		const OtelSpanEvent *e = &span->inline_event;
+
+		appendStringInfoChar(&buf, '{');
+		appendStringInfo(&buf, "\"time\":%" PRId64,
+						 (int64) e->core.time);
+		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
+		appendStringInfoString(&buf, ",\"sqlstate\":");
+		escape_json(&buf, e->core.sqlstate);
+		if (e->core.filename)
+		{
+			appendStringInfoString(&buf, ",\"filename\":");
+			escape_json(&buf, e->core.filename);
+		}
+		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
+		if (e->message)
+		{
+			appendStringInfoString(&buf, ",\"message\":");
+			escape_json(&buf, e->message);
+		}
+		if (e->detail)
+		{
+			appendStringInfoString(&buf, ",\"detail\":");
+			escape_json(&buf, e->detail);
+		}
+		if (e->hint)
+		{
+			appendStringInfoString(&buf, ",\"hint\":");
+			escape_json(&buf, e->hint);
+		}
+		appendStringInfoChar(&buf, '}');
+		first = false;
+	}
+	for (i = 0; i < span->n_overflow_events; i++)
+	{
+		const OtelSpanEvent *e = &span->overflow_events[i];
+
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		first = false;
+		appendStringInfoChar(&buf, '{');
+		appendStringInfo(&buf, "\"time\":%" PRId64,
+						 (int64) e->core.time);
+		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
+		appendStringInfoString(&buf, ",\"sqlstate\":");
+		escape_json(&buf, e->core.sqlstate);
+		if (e->core.filename)
+		{
+			appendStringInfoString(&buf, ",\"filename\":");
+			escape_json(&buf, e->core.filename);
+		}
+		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
+		if (e->message)
+		{
+			appendStringInfoString(&buf, ",\"message\":");
+			escape_json(&buf, e->message);
+		}
+		appendStringInfoChar(&buf, '}');
+	}
+	appendStringInfoChar(&buf, ']');
+
+	appendStringInfoChar(&buf, '}');
+
+	ereport(LOG,
+			(errmsg_internal("otel-span: %s", buf.data)));
+
+	pfree(buf.data);
+}
+
+
 static void
 dispatch_span(const OtelSpan *span)
 {

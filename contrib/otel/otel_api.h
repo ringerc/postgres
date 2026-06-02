@@ -248,6 +248,61 @@ typedef struct OtelTracingApi
 	bool	  (*span_add_attribute_string) (OtelSpan *span,
 											const char *key,
 											const char *value);
+
+	/*
+	 * --------------------------------------------------------------
+	 * Phase 4: surface needed by the split-out query-tracing module
+	 * (contrib/otel_postgres_tracing).  Other consumers won't
+	 * normally call these directly --- they're internal-style
+	 * helpers that must cross the module boundary because the
+	 * query-tracing module pre-populates parent fields itself
+	 * (parallel-worker leader override) and needs to read the
+	 * root-context snapshot, dispatch the sampler, etc.
+	 * --------------------------------------------------------------
+	 */
+
+	/* Push a span onto the active stack WITHOUT fetching a parent.
+	 * The caller is responsible for populating trace_id /
+	 * parent_span_id / trace_flags themselves.  External
+	 * consumers that just want "nest under whatever is active"
+	 * should use span_link_to_active_and_push instead. */
+	void	  (*span_push) (OtelSpan *span);
+
+	/* Parallel-worker leader context publishing / lookup.  See
+	 * OtelParallelContext above. */
+	void	  (*parallel_publish_leader_context) (const char *trace_id,
+												  const char *span_id,
+												  const char *trace_flags);
+	void	  (*parallel_clear_leader_context) (void);
+	bool	  (*parallel_get_leader_context) (OtelParallelContext *out);
+
+	/* Root-context (client-supplied trace context) inspection +
+	 * lifecycle.  See OtelRootContextSnapshot above.  Fills *out
+	 * with the current backend's root context.  reset clears it
+	 * (used by the statement-tracing module after consuming a
+	 * sqlcommenter-derived context). */
+	void	  (*get_root_context_snapshot) (OtelRootContextSnapshot *out);
+	void	  (*reset_root_context) (void);
+
+	/* Sqlcommenter parsing.  Parses trace-context out of a SQL
+	 * comment in `sql` and applies it to the backend root context.
+	 * Returns true iff a traceparent was found and applied. */
+	bool	  (*try_apply_sqlcommenter_context) (const char *sql);
+
+	/* Sampler dispatch.  Consumer fills `in` with the propagated
+	 * context bits + a name hint; this function applies the
+	 * registered sampler hook + policy and returns the decision.
+	 * Note: this does NOT do the "no exporter registered" or
+	 * "trace_all_queries" early-outs --- those are decisions for
+	 * the query-tracing module to make based on its own GUCs.
+	 * `sampled_flag_set` is the W3C `sampled=1` wire bit. */
+	OtelSamplerDecision (*compute_sampler_decision) (const OtelSamplerInput *in,
+													  bool sampled_flag_set);
+
+	/* True iff a consumer has registered an emit hook OR the
+	 * built-in JSON-log emission is enabled.  The query-tracing
+	 * module uses this for the "no consumer -> drop" early-out. */
+	bool	  (*any_emit_consumer_present) (void);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */

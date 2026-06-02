@@ -13,7 +13,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  contrib/otel/otel_log.c
+ *	  contrib/otel_postgres_tracing/otel_log.c
  *
  *-------------------------------------------------------------------------
  */
@@ -23,7 +23,7 @@
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
-#include "otel_internal.h"
+#include "otel_postgres_tracing.h"
 
 static emit_log_hook_type prev_emit_log_hook = NULL;
 
@@ -56,16 +56,20 @@ otel_log_install_hooks(void)
 static void
 otel_emit_log_hook(ErrorData *edata)
 {
-	if (otel_ctx.is_set)
+	OtelRootContextSnapshot rc;
+
+	otel_api->get_root_context_snapshot(&rc);
+
+	if (rc.is_set)
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(edata->assoc_context);
 
 		if (edata->trace_id == NULL)
-			edata->trace_id = pstrdup(otel_ctx.trace_id);
+			edata->trace_id = pstrdup(rc.trace_id);
 		if (edata->span_id == NULL)
-			edata->span_id = pstrdup(otel_ctx.span_id);
+			edata->span_id = pstrdup(rc.span_id);
 		if (edata->trace_flags == NULL)
-			edata->trace_flags = pstrdup(otel_ctx.trace_flags);
+			edata->trace_flags = pstrdup(rc.trace_flags);
 
 		MemoryContextSwitchTo(oldcxt);
 	}
