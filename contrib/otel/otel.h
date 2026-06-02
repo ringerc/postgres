@@ -248,6 +248,44 @@ typedef struct OtelResourceAttribute
  * other extensions that want to emit operational telemetry through the
  * same pipeline as traces.
  *
+ * Vocabulary (lining up with the OTel data model):
+ *
+ *   Instrument:  the producer-side handle returned from
+ *                metric_instrument_register and passed to
+ *                metric_counter_add.  One OtelInstrument * = one
+ *                OTel Instrument.  In operator-speak this is "a
+ *                metric" --- the instrument's `instrument_name`
+ *                (e.g. "postgres.log_events") appears verbatim as
+ *                the OTLP Metric.name downstream.  Identity within
+ *                a process is (meter_name, instrument_name);
+ *                registering the same pair twice is idempotent
+ *                and returns the same handle.  Different meters
+ *                may use the same instrument_name (the
+ *                InstrumentationScope keeps them distinct).
+ *
+ *   Meter:       the InstrumentationScope (meter_name + optional
+ *                meter_version + optional schema_url) that owns an
+ *                instrument.  Identifies the producer library;
+ *                downstream collectors group instruments by meter
+ *                into OTLP ScopeMetrics.  Example: a Counter
+ *                registered with meter_name = "contrib/otel" and
+ *                a Counter registered with meter_name = "my_ext"
+ *                are two distinct instruments even if they share
+ *                an instrument_name.
+ *
+ *   Time-series: one (instrument, attribute-value) pair.  An
+ *                instrument with no attribute produces one
+ *                time-series; an instrument with a single
+ *                attribute key over N declared values produces N
+ *                time-series.  Each time-series has its own
+ *                counter cell and emits one OTLP DataPoint per
+ *                collection.
+ *
+ *   Measurement: a single observation, recorded by
+ *                metric_counter_add(inst, value, attr_value).
+ *                Lands as an atomic add on the cell for the
+ *                (instrument, attr_value) time-series.
+ *
  * Storage model in this initial implementation is process-local: each
  * backend has its own instrument table and counter slots; cross-backend
  * aggregation happens downstream in the OTel collector after the
@@ -298,9 +336,16 @@ typedef enum OtelAggregationTemporality
 } OtelAggregationTemporality;
 
 /*
- * Opaque handle.  Returned from api->metric_instrument_register and
- * passed to api->metric_counter_add.  Lifetime is the backend; the
- * handle remains valid until the process exits.
+ * Opaque handle for one Instrument.  Returned from
+ * api->metric_instrument_register and passed to
+ * api->metric_counter_add.
+ *
+ * Identity within a backend is (meter_name, instrument_name);
+ * registration is idempotent on that pair and returns the same
+ * handle on repeat calls (so two modules that independently declare
+ * the same self-metric collapse to one).  Lifetime is the backend
+ * --- the handle remains valid until the process exits and may be
+ * cached freely in module-static state.
  */
 typedef struct OtelInstrument OtelInstrument;
 
