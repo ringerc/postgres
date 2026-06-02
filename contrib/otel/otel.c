@@ -182,7 +182,9 @@
 #include <string.h>
 
 #include "fmgr.h"
+#ifdef OTEL_HAVE_PROTOCOL_HEADERS
 #include "libpq/protocol_headers.h"
+#endif
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -285,6 +287,7 @@ assign_traceparent(const char *newval, void *extra)
 		otel_ctx_reset();
 }
 
+#ifdef OTEL_HAVE_PROTOCOL_HEADERS
 /*
  * Header set callback: invoked once per matching entry in an incoming
  * RequestHeaders message.  Routes through SetConfigOption so the GUC
@@ -342,6 +345,7 @@ otel_clear_cb(void *cb_ctx)
 {
 	otel_ctx_reset();
 }
+#endif							/* OTEL_HAVE_PROTOCOL_HEADERS */
 
 /*
  * SQL function: return the currently-active traceparent in W3C
@@ -462,11 +466,13 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("otel");
 
+#ifdef OTEL_HAVE_PROTOCOL_HEADERS
 	RegisterProtocolHeaderHandler("otel.",
 								  PROTOCOL_HEADER_SCOPE_TRANSACTION,
 								  otel_set_cb,
 								  otel_clear_cb,
 								  NULL);
+#endif
 
 	/* otel_log_install_hooks() and otel_trace_install_hooks() moved
 	 * to contrib/otel_postgres_tracing in Phase 4.  Operators must
