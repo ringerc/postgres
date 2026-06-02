@@ -88,4 +88,19 @@ extern bool otel_span_add_attribute_string(OtelSpan *span,
 										   const char *key,
 										   const char *value);
 
+/* Internal-only push (no parent-context fetch).  Used by
+ * otel_trace.c during Phase 2 migration so the existing
+ * start_span / start_utility_span code can populate span fields
+ * (including the parallel-worker leader-span-id parent linkage)
+ * itself and just push the result onto the active stack.  External
+ * consumers use api->span_link_to_active_and_push instead, which
+ * fetches the parent from the active stack / root context. */
+extern void otel_producer_span_push(OtelSpan *span);
+
+/* JSON-log fallback emitter; lives in otel_trace.c for now.  Phase
+ * 2 exposes it so otel_producer.c's dispatch can call it too,
+ * giving the producer-API emit path the same log-line emission as
+ * the legacy finalize_span path. */
+extern void otel_emit_span_as_log_line(const OtelSpan *span);
+
 #endif							/* CONTRIB_OTEL_INTERNAL_H */

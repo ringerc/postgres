@@ -214,12 +214,8 @@ dispatch_span(const OtelSpan *span)
 	{
 		if (emit_hook)
 			emit_hook(span);
-		/* The internal JSON-log emitter is declared in otel_internal.h
-		 * once we factor it out in Commit C; for now it lives in
-		 * otel_trace.c and is reachable only via finalize_span().
-		 * External consumers that want the log-line emission can set
-		 * otel.emit_spans_to_log and register a no-op hook.  This is
-		 * a known gap, addressed in Commit C. */
+		if (otel_emit_spans_to_log)
+			otel_emit_span_as_log_line(span);
 	}
 	PG_CATCH();
 	{
@@ -323,6 +319,64 @@ on_memory_context_reset(void *arg)
  * the same logical scope.  Commit C adds WARNING + counter for
  * observable overflow.
  */
+/*
+ * otel_producer_span_push --- push the span onto the active stack
+ * without fetching a parent context.  Used internally by
+ * otel_trace.c during Phase 2 migration so the existing
+ * start_span / start_utility_span code can populate parent fields
+ * themselves (including the parallel-worker leader-span-id logic
+ * that takes priority over otel_ctx.span_id) and just push the
+ * result onto the stack.
+ *
+ * Caller is responsible for populating span->span_id,
+ * span->trace_flags, and span->unwind_policy before calling.
+ *
+ * Behaviour on overflow / MemoryContextCallback registration is
+ * identical to otel_producer_span_link_to_active_and_push.
+ */
+void
+otel_producer_span_push(OtelSpan *span)
+{
+	if (span == NULL)
+		return;
+
+	if (span_stack_top + 1 < MAX_SPAN_STACK_DEPTH)
+	{
+		OtelSpanStackEntry *entry;
+		OtelSpanUnwindNode *node;
+
+		span_stack_top++;
+		entry = &span_stack[span_stack_top];
+		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
+		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
+		entry->unwind_policy = span->unwind_policy;
+		entry->span = span;
+
+		node = (OtelSpanUnwindNode *) MemoryContextAllocExtended(CurrentMemoryContext,
+																 sizeof(*node),
+																 MCXT_ALLOC_NO_OOM);
+		if (node != NULL)
+		{
+			memcpy(node->span_id, span->span_id, sizeof(node->span_id));
+			node->cb.func = on_memory_context_reset;
+			node->cb.arg = node;
+			MemoryContextRegisterResetCallback(CurrentMemoryContext, &node->cb);
+		}
+	}
+	else
+	{
+		if (!stack_overflow_warned)
+		{
+			ereport(WARNING,
+					(errmsg("otel: span-stack overflow at depth %d",
+							MAX_SPAN_STACK_DEPTH),
+					 errdetail("Further over-cap spans in this backend will still link to the deepest-pushed parent for correctness but will not be pushed onto the active stack."),
+					 errhint("Reduce instrumentation nesting or, if the workload genuinely needs deeper nesting, increase MAX_SPAN_STACK_DEPTH and rebuild contrib/otel.")));
+			stack_overflow_warned = true;
+		}
+	}
+}
+
 void
 otel_producer_span_link_to_active_and_push(OtelSpan *span)
 {

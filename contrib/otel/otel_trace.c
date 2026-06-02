@@ -122,7 +122,9 @@ static void restore_current_span_id_guc(void);
 static OtelSpanEvent *acquire_event_slot(void);
 static void capture_event_core(OtelEventCore *core, ErrorData *edata);
 static void capture_event_extended(OtelSpanEvent *event, ErrorData *edata);
-static void emit_span_as_log_line(const OtelSpan *span);
+/* otel_emit_span_as_log_line is declared in otel_internal.h --- it
+ * is non-static so otel_producer.c can call it via the unified
+ * dispatch path (Phase 2 migration). */
 
 
 /*
@@ -394,13 +396,20 @@ start_span(QueryDesc *queryDesc)
 
 	/* Update the GUC for parallel-worker propagation. */
 	update_current_span_id_guc(span_storage.span_id);
+
+	/* Phase 2 migration: opt this span into emit-as-ERROR on
+	 * ereport unwind, then push it onto the producer-side active
+	 * stack.  Aborted statements now appear in traces with
+	 * status = ERROR + descriptive reason rather than being
+	 * silently dropped, and external producer-API consumers can
+	 * read this span as their parent via api->span_current_context. */
+	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
+	otel_producer_span_push(&span_storage);
 }
 
 static void
 finalize_span(OtelSpanStatus status)
 {
-	otel_span_emit_hook_type emit_hook;
-
 	if (!span_active)
 		return;
 
@@ -411,22 +420,12 @@ finalize_span(OtelSpanStatus status)
 	if (span_storage.status == OTEL_STATUS_UNSET)
 		span_storage.status = status;
 
-	emit_hook = otel_get_span_emit_hook();
-
-	/* Hand off to exporter (best-effort, swallow errors). */
-	PG_TRY();
-	{
-		if (emit_hook)
-			emit_hook(&span_storage);
-
-		if (otel_emit_spans_to_log)
-			emit_span_as_log_line(&span_storage);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-	}
-	PG_END_TRY();
+	/* Phase 2 migration: emit through the producer-side dispatch
+	 * which pops the stack and calls the registered exporter hook
+	 * + the JSON-log fallback.  Equivalent to the inline dispatch
+	 * this code used to do, but goes through the same path
+	 * external consumers use. */
+	otel_producer_span_emit(&span_storage);
 
 	span_active = false;
 	span_originator = SPAN_ORIGIN_NONE;
@@ -687,6 +686,10 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 		span_add_attr("application_name", application_name);
 
 	update_current_span_id_guc(span_storage.span_id);
+
+	/* Phase 2 migration: see start_span() above. */
+	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
+	otel_producer_span_push(&span_storage);
 }
 
 /*
@@ -947,7 +950,7 @@ otel_span_record_log_event(ErrorData *edata)
 
 
 /* ====================================================================
- * emit_span_as_log_line --- zero-config JSON-log fallback emitter.
+ * otel_emit_span_as_log_line --- zero-config JSON-log fallback emitter.
  * ====================================================================
  *
  * Gated by the otel.emit_spans_to_log GUC.  Writes the span as a
@@ -964,8 +967,8 @@ otel_span_record_log_event(ErrorData *edata)
  * revisions of contrib/otel; do not consider it OTLP and do not
  * embed in production tooling expecting OTLP compatibility.
  */
-static void
-emit_span_as_log_line(const OtelSpan *span)
+void
+otel_emit_span_as_log_line(const OtelSpan *span)
 {
 	StringInfoData buf;
 	int			i;
