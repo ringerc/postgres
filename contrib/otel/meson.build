@@ -4,6 +4,7 @@ otel_sources = files(
   'otel.c',
   'otel_api.c',
   'otel_log.c',
+  'otel_producer.c',
   'otel_trace.c',
 )
 

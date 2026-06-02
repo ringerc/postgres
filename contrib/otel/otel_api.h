@@ -159,6 +159,59 @@ typedef struct OtelTracingApi
 	 * queries.
 	 */
 	void	  (*set_sampler_policy) (OtelSamplerHookPolicy policy);
+
+	/*
+	 * --------------------------------------------------------------
+	 * Producer-side API (added in Phase 1 of the contrib/otel split).
+	 * --------------------------------------------------------------
+	 *
+	 * These entry points let any postgres extension that wants to
+	 * emit OTel spans plug into contrib/otel's active-span stack
+	 * and exporter dispatch without taking a hard build-time
+	 * dependency on the OTel SDK.  Statement-level instrumentation,
+	 * PL handlers, replication apply workers, custom SPI callers
+	 * --- all use the same surface.
+	 *
+	 * Memory model: the consumer owns the OtelSpan allocation (in
+	 * its own MemoryContext, typically palloc'd in a per-statement
+	 * context or kept in a static slab).  The active-span stack
+	 * holds borrowed pointers; the consumer MUST emit before
+	 * destroying the underlying memory.  (Commit C will add a
+	 * MemoryContextCallback safety net for ereport-unwind cases.)
+	 *
+	 * Three variants for starting a span:
+	 *
+	 *	  1. Implicit-fetch + push (the common case):
+	 *	     api->span_link_to_active_and_push(&span)
+	 *	       - parent identity from top-of-stack, or root context
+	 *	         if stack empty, or none (root span on a new trace);
+	 *	       - new span pushed onto active stack.
+	 *
+	 *	  2. Explicit parent, no push (the independent-trace case):
+	 *	     api->span_set_parent_explicit(&span, &parent_ctx)
+	 *	       - parent identity from caller-supplied SpanContext;
+	 *	       - active stack untouched.  Used for traces that must
+	 *	         not appear as children of the call-stack-based
+	 *	         trace --- background apply work, etc.
+	 *
+	 *	  3. Neither: caller calls no link function.  fresh trace_id
+	 *	     and span_id from otel_span_init (Commit D); parent
+	 *	     stays zero.  Brand-new root span on its own trace.
+	 *
+	 * Inspection: api->span_current_context / span_root_context /
+	 * span_stack_depth let consumers reason about the active trace
+	 * without affecting it.
+	 *
+	 * Emit: api->span_emit dispatches the span to registered
+	 * exporter hooks; pops it from the stack if pushed.
+	 */
+	void	  (*span_link_to_active_and_push) (OtelSpan *span);
+	void	  (*span_set_parent_explicit) (OtelSpan *span,
+										   const OtelSpanContext *parent);
+	const OtelSpanContext *(*span_current_context) (void);
+	const OtelSpanContext *(*span_root_context) (void);
+	int		  (*span_stack_depth) (void);
+	void	  (*span_emit) (OtelSpan *span);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */

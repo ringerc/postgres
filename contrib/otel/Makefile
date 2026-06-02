@@ -6,6 +6,7 @@ OBJS = \
 	otel.o \
 	otel_api.o \
 	otel_log.o \
+	otel_producer.o \
 	otel_trace.o
 
 EXTENSION = otel
