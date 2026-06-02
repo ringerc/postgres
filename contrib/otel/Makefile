@@ -6,7 +6,8 @@ OBJS = \
 	otel.o \
 	otel_api.o \
 	otel_parallel.o \
-	otel_producer.o
+	otel_producer.o \
+	otel_resource.o
 
 EXTENSION = otel
 DATA = otel--1.0.sql

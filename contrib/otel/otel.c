@@ -422,6 +422,30 @@ _PG_init(void)
 	/* otel.trace_all_queries moved to contrib/otel_postgres_tracing
 	 * in Phase 4; it's a query-tracing-specific behaviour GUC. */
 
+	DefineCustomStringVariable("otel.service_name",
+							   "OTel Resource service.name attribute for this postmaster.",
+							   "Identifies the service emitting traces / metrics.  Default "
+							   "\"postgres\".  Operators typically set this to a deployment-"
+							   "specific name (e.g. \"orders-db-primary\").  Matches the "
+							   "OTel-standard OTEL_SERVICE_NAME environment variable.",
+							   &otel_service_name_guc,
+							   "postgres",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("otel.service_instance_id",
+							   "OTel Resource service.instance.id attribute for this postmaster.",
+							   "Uniquely identifies this postmaster instance among instances "
+							   "of the same service.  Empty string (the default) selects the "
+							   "cluster's pg_control system identifier, which is stable across "
+							   "postmaster restarts and unique per initdb.",
+							   &otel_service_instance_id_guc,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("otel.parse_sqlcommenter",
 							 "Extract trace context from sqlcommenter SQL comments when no other context is set.",
 							 "Default off.  WARNING: structurally broken under driver-side or "
@@ -450,6 +474,7 @@ _PG_init(void)
 	 * shared_preload_libraries to get query-tracing behaviour. */
 	otel_producer_init();
 	otel_parallel_init();
+	otel_resource_init();
 	otel_api_publish_rendezvous();
 }
 

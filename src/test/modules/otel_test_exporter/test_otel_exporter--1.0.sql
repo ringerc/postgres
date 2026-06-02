@@ -26,3 +26,8 @@ CREATE FUNCTION test_otel_producer_roundtrip(name text)
 RETURNS text
 AS 'MODULE_PATHNAME', 'test_otel_producer_roundtrip'
 LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION test_otel_resource_attributes()
+RETURNS text
+AS 'MODULE_PATHNAME', 'test_otel_resource_attributes'
+LANGUAGE C VOLATILE PARALLEL SAFE;
