@@ -43,7 +43,6 @@ extern bool otel_ctx_from_comment;
 
 /* Defined in otel.c. */
 extern char *otel_tracestate_guc;
-extern char *otel_current_span_id_guc;
 extern bool otel_emit_spans_to_log;
 extern bool otel_trace_all_queries;
 extern bool otel_parse_sqlcommenter;
@@ -66,6 +65,17 @@ extern void otel_trace_install_hooks(void);
 /* Called from otel_log.c's emit_log_hook to record an ereport as a
  * span event when a span is active.  No-op otherwise. */
 extern void otel_span_record_log_event(ErrorData *edata);
+
+/* Defined in otel_parallel.c.  Per-backend shared-memory slots
+ * carrying the leader's currently-active SpanContext for parallel
+ * workers to read.  Replaces the otel.current_span_id GUC that the
+ * Phase 3 split refactor removed. */
+extern void otel_parallel_init(void);
+extern void otel_parallel_publish_leader_context(const char *trace_id,
+												 const char *span_id,
+												 const char *trace_flags);
+extern void otel_parallel_clear_leader_context(void);
+extern bool otel_parallel_get_leader_context(OtelParallelContext *out);
 
 /* Defined in otel_producer.c.  Producer-side API plumbed into the
  * OtelTracingApi struct in otel_api.c. */

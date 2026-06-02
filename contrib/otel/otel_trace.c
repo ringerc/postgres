@@ -84,14 +84,10 @@ static bool		span_active = false;
 static SpanOriginator span_originator = SPAN_ORIGIN_NONE;
 static MemoryContext span_cxt = NULL;
 
-/*
- * To restore otel.current_span_id at ExecutorEnd we save what it was
- * before our span started.  Only one slot --- nested spans are not
- * tracked separately in this POC; they keep the outermost
- * current_span_id GUC and effectively all share the same parent.
- */
-static char	saved_current_span_id_guc[OTEL_SPAN_ID_LEN + 1];
-static bool	saved_current_span_id_set = false;
+/* Phase 3: the saved_current_span_id_guc + restore machinery is
+ * gone.  Parallel-worker propagation now uses the per-backend
+ * shared-memory slot in otel_parallel.c; the leader publishes at
+ * start_span and clears at finalize_span. */
 
 /* Hook chains */
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
@@ -117,8 +113,6 @@ static void finalize_span(OtelSpanStatus status);
 static void generate_span_id(char out[OTEL_SPAN_ID_LEN + 1]);
 static void bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst);
 static void span_add_attr(const char *key, const char *value);
-static void update_current_span_id_guc(const char *new_value);
-static void restore_current_span_id_guc(void);
 static OtelSpanEvent *acquire_event_slot(void);
 static void capture_event_core(OtelEventCore *core, ErrorData *edata);
 static void capture_event_extended(OtelSpanEvent *event, ErrorData *edata);
@@ -237,61 +231,11 @@ span_add_attr(const char *key, const char *value)
 	PG_END_TRY();
 }
 
-/*
- * Save the prior otel.current_span_id GUC, then set it to the
- * leader's new span_id so any parallel workers spawned during this
- * operation will use the leader's span as their parent.
- *
- * Wrapped in PG_TRY: GUC writes can allocate, and per the
- * best-effort principle we never propagate a tracing-side error
- * upward.
- */
-static void
-update_current_span_id_guc(const char *new_value)
-{
-	PG_TRY();
-	{
-		/* save what was there for restoration at span end */
-		if (otel_current_span_id_guc && otel_current_span_id_guc[0])
-			strlcpy(saved_current_span_id_guc, otel_current_span_id_guc,
-					sizeof(saved_current_span_id_guc));
-		else
-			saved_current_span_id_guc[0] = '\0';
-		saved_current_span_id_set = true;
-
-		(void) set_config_option("otel.current_span_id",
-								 (new_value && new_value[0]) ? new_value : NULL,
-								 PGC_USERSET, PGC_S_SESSION,
-								 GUC_ACTION_SET, true, LOG, false);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-		saved_current_span_id_set = false;
-	}
-	PG_END_TRY();
-}
-
-static void
-restore_current_span_id_guc(void)
-{
-	if (!saved_current_span_id_set)
-		return;
-	PG_TRY();
-	{
-		(void) set_config_option("otel.current_span_id",
-								 saved_current_span_id_guc[0]
-								 ? saved_current_span_id_guc : NULL,
-								 PGC_USERSET, PGC_S_SESSION,
-								 GUC_ACTION_SET, true, LOG, false);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-	}
-	PG_END_TRY();
-	saved_current_span_id_set = false;
-}
+/* Phase 3: update_current_span_id_guc and restore_current_span_id_guc
+ * are gone.  Their replacement is the per-backend shared-memory slot
+ * in otel_parallel.c: start_span calls
+ * otel_parallel_publish_leader_context, finalize_span calls
+ * otel_parallel_clear_leader_context. */
 
 /*
  * Initialize span_storage for a new span and populate attributes.
@@ -323,17 +267,26 @@ start_span(QueryDesc *queryDesc)
 	memset(&span_storage, 0, sizeof(span_storage));
 
 	/* Identity from propagated trace context if available; otherwise
-	 * synthesize parentless (only happens when trace_all_queries is on). */
+	 * synthesize parentless (only happens when trace_all_queries is on).
+	 *
+	 * Parent-span selection:
+	 *	 1. If we're a parallel worker AND our leader has a published
+	 *	    SpanContext, use the leader's span_id as parent.  This
+	 *	    overrides any client-propagated parent because the leader's
+	 *	    current span is closer to us in the trace hierarchy.
+	 *	 2. Otherwise, fall back to the client-propagated parent in
+	 *	    otel_ctx (set via 'M' header or SET otel.traceparent).
+	 */
 	if (otel_ctx.is_set)
 	{
+		OtelParallelContext leader_ctx;
+
 		memcpy(span_storage.trace_id, otel_ctx.trace_id, sizeof(span_storage.trace_id));
 		memcpy(span_storage.trace_flags, otel_ctx.trace_flags, sizeof(span_storage.trace_flags));
-		/* Parent: prefer the GUC's current_span_id (set by an outer
-		 * leader in a parallel-worker scenario); fall back to the
-		 * client-propagated parent. */
-		parent = (otel_current_span_id_guc && otel_current_span_id_guc[0])
-			? otel_current_span_id_guc
-			: otel_ctx.span_id;
+		if (otel_parallel_get_leader_context(&leader_ctx))
+			parent = leader_ctx.parent_span_id;
+		else
+			parent = otel_ctx.span_id;
 		strlcpy(span_storage.parent_span_id, parent,
 				sizeof(span_storage.parent_span_id));
 	}
@@ -395,7 +348,13 @@ start_span(QueryDesc *queryDesc)
 		span_add_attr("application_name", application_name);
 
 	/* Update the GUC for parallel-worker propagation. */
-	update_current_span_id_guc(span_storage.span_id);
+	/* Phase 3: publish our span's identity to the per-backend
+	 * shared-memory slot so any parallel workers we spawn during
+	 * this span will pick us up as parent.  Supersedes the
+	 * otel.current_span_id GUC. */
+	otel_parallel_publish_leader_context(span_storage.trace_id,
+										 span_storage.span_id,
+										 span_storage.trace_flags);
 
 	/* Phase 2 migration: opt this span into emit-as-ERROR on
 	 * ereport unwind, then push it onto the producer-side active
@@ -429,7 +388,10 @@ finalize_span(OtelSpanStatus status)
 
 	span_active = false;
 	span_originator = SPAN_ORIGIN_NONE;
-	restore_current_span_id_guc();
+	/* Phase 3: clear our published context so any workers spawned
+	 * AFTER this span ends (in a future query) don't read a stale
+	 * value. */
+	otel_parallel_clear_leader_context();
 
 	/*
 	 * Statement-scoped scrub for comment-derived context: a
@@ -632,10 +594,14 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 
 	if (otel_ctx.is_set)
 	{
+		OtelParallelContext leader_ctx;
+
 		memcpy(span_storage.trace_id, otel_ctx.trace_id, sizeof(span_storage.trace_id));
 		memcpy(span_storage.trace_flags, otel_ctx.trace_flags, sizeof(span_storage.trace_flags));
-		parent = (otel_current_span_id_guc && otel_current_span_id_guc[0])
-			? otel_current_span_id_guc : otel_ctx.span_id;
+		if (otel_parallel_get_leader_context(&leader_ctx))
+			parent = leader_ctx.parent_span_id;
+		else
+			parent = otel_ctx.span_id;
 		strlcpy(span_storage.parent_span_id, parent,
 				sizeof(span_storage.parent_span_id));
 	}
@@ -685,7 +651,11 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 	if (application_name && application_name[0])
 		span_add_attr("application_name", application_name);
 
-	update_current_span_id_guc(span_storage.span_id);
+	/* Phase 3: publish to per-backend slot for parallel workers
+	 * (see start_span() for the equivalent call). */
+	otel_parallel_publish_leader_context(span_storage.trace_id,
+										 span_storage.span_id,
+										 span_storage.trace_flags);
 
 	/* Phase 2 migration: see start_span() above. */
 	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
