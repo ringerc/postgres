@@ -33,6 +33,7 @@ tests += {
       't/003_sampler_policy.pl',
       't/004_sqlcommenter.pl',
       't/005_producer_api.pl',
+      't/006_pgbouncer.pl',
     ],
   },
 }
