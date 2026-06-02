@@ -203,9 +203,7 @@ OtelContext otel_ctx;
 /* GUC variables --- canonical storage. */
 static char *otel_traceparent_guc;
 char	   *otel_tracestate_guc;
-char	   *otel_current_span_id_guc;	/* leader-span-id for worker
-										 * parent linking --- not for user
-										 * SET semantics */
+/* Phase 3: otel_current_span_id_guc removed; see otel_parallel.c. */
 
 /* Behaviour-controlling GUCs */
 bool		otel_emit_spans_to_log = false;
@@ -407,16 +405,9 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
-	DefineCustomStringVariable("otel.current_span_id",
-							   "Leader's currently-active span_id; propagated to parallel workers.",
-							   "Set automatically by the otel module's ExecutorStart hook; should not be set by end users.",
-							   &otel_current_span_id_guc,
-							   "",
-							   PGC_USERSET,
-							   0,
-							   NULL,
-							   NULL,
-							   NULL);
+	/* Phase 3: the previous otel.current_span_id GUC has been
+	 * superseded by the per-backend shared-memory slot mechanism in
+	 * otel_parallel.c.  See OtelParallelContext in otel.h. */
 
 	DefineCustomBoolVariable("otel.emit_spans_to_log",
 							 "Emit completed spans as structured log lines.",
@@ -461,6 +452,7 @@ _PG_init(void)
 	otel_log_install_hooks();
 	otel_trace_install_hooks();
 	otel_producer_init();
+	otel_parallel_init();
 	otel_api_publish_rendezvous();
 }
 

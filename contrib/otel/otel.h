@@ -76,6 +76,28 @@ typedef struct OtelSpanContext
 } OtelSpanContext;
 
 /*
+ * Trace context propagated from a parallel-query leader to its
+ * workers.  Workers attribute their spans to the leader's
+ * currently-active span by reading this struct via
+ * otel_parallel_get_leader_context (declared in otel_internal.h)
+ * --- not via the GUC system, which is reserved for client-supplied
+ * context only.
+ *
+ * `version` is the OtelParallelContext layout version (currently
+ * OTEL_PARALLEL_CONTEXT_V1).  All other fields are lowercase-hex
+ * NUL-terminated strings matching the OtelSpan representation.
+ */
+#define OTEL_PARALLEL_CONTEXT_V1		1
+
+typedef struct OtelParallelContext
+{
+	uint32		version;
+	char		trace_id[OTEL_TRACE_ID_LEN + 1];
+	char		parent_span_id[OTEL_SPAN_ID_LEN + 1];
+	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
+} OtelParallelContext;
+
+/*
  * Behaviour when a pushed span is forcibly removed from the active
  * span-stack without an explicit api->span_emit() call --- either
  * because ereport() unwound through the producing code path before
