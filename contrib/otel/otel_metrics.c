@@ -47,17 +47,37 @@
 /*
  * Compile-time bounds.
  *
- * OTEL_MAX_INSTRUMENTS:  total instruments registered process-wide.
- * OTEL_MAX_ATTRSETS:     per-instrument cardinality.  Most instruments
- *                        register 1 (no attribute) or a small handful
- *                        like 4 (reasons, decisions).  The plan caps
- *                        this at 8.
+ * OTEL_MAX_INSTRUMENTS:
+ *     Total instruments that may be registered process-wide.
  *
- * Both bumpable by recompiling contrib/otel; they are not GUCs because
- * the per-backend storage cost is fully determined by their product.
+ * OTEL_MAX_VALUES_PER_INSTRUMENT:
+ *     For an instrument that declares an attribute, the maximum
+ *     number of distinct *values* allowed for that attribute key
+ *     (and therefore the maximum number of counter cells the
+ *     instrument exposes; one cell per attribute value).
+ *
+ *     This is NOT a cap on the number of attribute *keys* --- the
+ *     API supports exactly one attribute key per instrument by
+ *     design (OtelInstrumentSpec carries a single attr_key); this
+ *     cap is purely about the cardinality of values for that one
+ *     key.  An instrument with no attribute uses one cell at
+ *     slots[0]; an instrument with N declared values uses cells
+ *     slots[0..N-1] where N <= OTEL_MAX_VALUES_PER_INSTRUMENT.
+ *
+ *     A consumer that needs higher cardinality should split the
+ *     observation across multiple instruments rather than
+ *     bumping this cap; multi-key attribute combinations belong
+ *     at the OTel-collector aggregation tier, not in the
+ *     bounded-storage per-backend slot array.
+ *
+ * Both are bumpable by recompiling contrib/otel.  They are not
+ * GUCs because per-backend storage cost is fully determined at
+ * compile time by their product (and by MaxBackends, once the
+ * shared-memory storage planned in contrib-otel-metrics-plan.md
+ * lands).
  */
-#define OTEL_MAX_INSTRUMENTS	64
-#define OTEL_MAX_ATTRSETS		8
+#define OTEL_MAX_INSTRUMENTS			64
+#define OTEL_MAX_VALUES_PER_INSTRUMENT	8
 
 /*
  * Per-backend instrument table entry.  Strings are pstrdup'd into
@@ -82,19 +102,30 @@ struct OtelInstrument
 	char	   *description;
 	char	   *unit;
 
-	/* Attribute model: a single key with a closed set of values, or
-	 * (attr_key == NULL && n_attr_values == 0) for no attribute.  In
-	 * the no-attribute case, attr_value passed to metric_counter_add
-	 * must be NULL and slot 0 is used. */
+	/* Attribute model.  Each instrument carries at most ONE
+	 * attribute key (attr_key) with a closed set of allowed values
+	 * (attr_values, n of them used).  The N-attribute-keys case is
+	 * not supported in this minimal API; consumers that need it
+	 * register N separate instruments, one per attribute key.
+	 *
+	 * (attr_key == NULL && n_attr_values == 0) means the instrument
+	 * has no attribute at all --- one cell at slots[0], metric_counter_
+	 * add must pass attr_value=NULL.
+	 *
+	 * n_attr_values is bounded by OTEL_MAX_VALUES_PER_INSTRUMENT; it
+	 * is NOT a bound on the number of keys (which is always 1 by
+	 * design). */
 	char	   *attr_key;
-	char	   *attr_values[OTEL_MAX_ATTRSETS];
+	char	   *attr_values[OTEL_MAX_VALUES_PER_INSTRUMENT];
 	int			n_attr_values;
 
 	TimestampTz start_timestamp;
 
-	/* Counter slots --- one per attr_value, or slots[0] when
-	 * attr_key is NULL. */
-	pg_atomic_uint64 slots[OTEL_MAX_ATTRSETS];
+	/* Counter cells, one per attribute value (or slots[0] only when
+	 * attr_key is NULL).  Cell count therefore equals
+	 * max(1, n_attr_values), capped by
+	 * OTEL_MAX_VALUES_PER_INSTRUMENT. */
+	pg_atomic_uint64 slots[OTEL_MAX_VALUES_PER_INSTRUMENT];
 };
 
 
@@ -214,13 +245,15 @@ otel_metric_instrument_register(const OtelInstrumentSpec *spec)
 				 errmsg("otel: instrument \"%s\": attr_key and n_attr_values must agree (both set or both unset)",
 						spec->instrument_name)));
 
-	if (spec->n_attr_values > OTEL_MAX_ATTRSETS)
+	if (spec->n_attr_values > OTEL_MAX_VALUES_PER_INSTRUMENT)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("otel: instrument \"%s\" declares %d attribute values; cap is OTEL_MAX_ATTRSETS = %d",
+				 errmsg("otel: instrument \"%s\" declares %d attribute values for attribute key \"%s\"; cap is OTEL_MAX_VALUES_PER_INSTRUMENT = %d",
 						spec->instrument_name,
 						spec->n_attr_values,
-						OTEL_MAX_ATTRSETS)));
+						spec->attr_key ? spec->attr_key : "(none)",
+						OTEL_MAX_VALUES_PER_INSTRUMENT),
+				 errhint("Reduce the value cardinality, split into multiple instruments, or increase OTEL_MAX_VALUES_PER_INSTRUMENT and rebuild contrib/otel.")));
 
 	/* Idempotent: same (meter, instrument) -> same handle.  Repeated
 	 * description / unit / attribute declarations are ignored. */
@@ -266,7 +299,7 @@ otel_metric_instrument_register(const OtelInstrumentSpec *spec)
 		inst->n_attr_values = 0;
 	}
 
-	for (i = 0; i < OTEL_MAX_ATTRSETS; i++)
+	for (i = 0; i < OTEL_MAX_VALUES_PER_INSTRUMENT; i++)
 		pg_atomic_init_u64(&inst->slots[i], 0);
 
 	n_instruments++;

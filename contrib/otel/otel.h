@@ -328,10 +328,30 @@ typedef struct OtelInstrumentSpec
 	const char *description;	/* NULL ok */
 	const char *unit;			/* OTel unit annotation, e.g. "1", "ms"; NULL ok */
 
-	/* Bounded-cardinality single-key attributes.  attr_key NULL means
-	 * "no attribute"; otherwise n_attr_values must be > 0 and
-	 * attr_values lists each allowed value.  Bounded by
-	 * OTEL_MAX_ATTRSETS (see otel_metrics.c). */
+	/* Attribute model: zero or one attribute key, with a closed set
+	 * of allowed values for that key.
+	 *
+	 *   attr_key == NULL && n_attr_values == 0
+	 *     The instrument has no attribute.  metric_counter_add must
+	 *     pass attr_value=NULL.  One counter cell per backend.
+	 *
+	 *   attr_key != NULL && n_attr_values >= 1
+	 *     The instrument has one attribute key whose allowed values
+	 *     are listed in attr_values[0..n_attr_values-1].  Each value
+	 *     gets its own counter cell.  metric_counter_add(inst, ...,
+	 *     attr_value) must pass an attr_value matching one of the
+	 *     declared strings; unknown values are silently dropped.
+	 *
+	 * n_attr_values is bounded by OTEL_MAX_VALUES_PER_INSTRUMENT
+	 * (compile-time, currently 8; see otel_metrics.c).  This caps
+	 * the number of distinct *values* for the single attribute key,
+	 * which is the same as the number of counter cells / time-
+	 * series per instrument.  It is NOT a cap on the number of
+	 * attribute *keys*: this API supports exactly one key per
+	 * instrument by design.  Consumers that need an N-keys
+	 * Cartesian product should register N separate instruments,
+	 * or push the additional dimensions to a downstream OTel
+	 * collector. */
 	const char *attr_key;
 	const char *const *attr_values;
 	int			n_attr_values;
