@@ -104,6 +104,12 @@ static const OtelTracingApi otel_tracing_api = {
 	.span_root_context = otel_producer_span_root_context,
 	.span_stack_depth = otel_producer_span_stack_depth,
 	.span_emit = otel_producer_span_emit,
+
+	/* Producer-side convenience helpers, routed through the
+	 * rendezvous-struct so they remain reachable across the
+	 * cross-extension symbol-resolution boundary. */
+	.span_init = otel_span_init,
+	.span_add_attribute_string = otel_span_add_attribute_string,
 };
 
 
