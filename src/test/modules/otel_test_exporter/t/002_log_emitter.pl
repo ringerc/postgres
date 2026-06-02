@@ -21,7 +21,7 @@ my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-01";
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,test_otel_exporter'
+shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
 otel.emit_spans_to_log = on
 log_min_messages = warning
 log_statement = 'none'
