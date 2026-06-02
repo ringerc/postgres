@@ -379,6 +379,42 @@ typedef struct OtelMetricSnapshot
 typedef void (*otel_metric_visitor) (const OtelMetricSnapshot *snap, void *ctx);
 
 /*
+ * Per-dispatch batch wrapper.  Built by api->dispatch_metrics_now and
+ * handed to every registered metrics emit hook.  Carries Resource
+ * attributes alongside the snapshot stream so exporters that ship
+ * OTLP can populate the surrounding ResourceMetrics envelope without
+ * having to call get_resource_attributes themselves.
+ *
+ * The batch and everything it points at is valid only for the
+ * duration of the emit-hook call; exporters that defer must copy.
+ */
+typedef struct OtelMetricBatch
+{
+	/* Resource attributes describing the emitting postmaster.  Same
+	 * Resource applies to every snapshot in this batch and matches
+	 * what get_resource_attributes returns. */
+	const OtelResourceAttribute *resource_attrs;
+	int			n_resource_attrs;
+
+	/* Per-tick snapshot stream. */
+	const OtelMetricSnapshot *snapshots;
+	int			n_snapshots;
+
+	/* Same TimestampTz as each snapshot's collection_time. */
+	TimestampTz collection_time;
+} OtelMetricBatch;
+
+/*
+ * Hook for exporters.  Invoked once per dispatch_metrics_now() call.
+ * Multiple hooks chain in install order; each is responsible for
+ * calling the previous hook (if any) so all exporters see the batch.
+ *
+ * The pointer and everything it transitively contains is owned by
+ * contrib/otel and only valid for the duration of the call.
+ */
+typedef void (*otel_metrics_emit_hook_type) (const OtelMetricBatch *batch);
+
+/*
  * Common substrate of every captured event.
  *
  * The core is what gets captured first, unconditionally, with NO

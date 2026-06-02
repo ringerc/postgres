@@ -82,6 +82,9 @@ extern void otel_metric_counter_add(OtelInstrument *inst,
 									uint64 value,
 									const char *attr_value);
 extern void otel_metric_collect_self(otel_metric_visitor visitor, void *ctx);
+extern void otel_register_metrics_emit_hook(otel_metrics_emit_hook_type new_hook,
+											otel_metrics_emit_hook_type *prev_out);
+extern void otel_dispatch_metrics_now(void);
 
 /* Defined in otel_parallel.c.  Per-backend shared-memory slots
  * carrying the leader's currently-active SpanContext for parallel

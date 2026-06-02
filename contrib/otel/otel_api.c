@@ -221,6 +221,8 @@ static const OtelTracingApi otel_tracing_api = {
 	.metric_instrument_register = otel_metric_instrument_register,
 	.metric_counter_add = otel_metric_counter_add,
 	.metric_collect_self = otel_metric_collect_self,
+	.register_metrics_emit_hook = otel_register_metrics_emit_hook,
+	.dispatch_metrics_now = otel_dispatch_metrics_now,
 };
 
 

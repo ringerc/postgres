@@ -365,6 +365,27 @@ typedef struct OtelTracingApi
 									 uint64 value,
 									 const char *attr_value);
 	void	  (*metric_collect_self) (otel_metric_visitor visitor, void *ctx);
+
+	/* --------------------------------------------------------------
+	 * Metrics dispatch: hook registration + manual flush.
+	 *
+	 * Exporters register an emit-hook at _PG_init (chained the same
+	 * way as register_emit_hook for spans).  dispatch_metrics_now()
+	 * walks this backend's instrument table, builds a snapshot batch
+	 * with this backend's Resource attached, and invokes the
+	 * registered hook chain.
+	 *
+	 * Today the trigger is left to the consumer: a backend-exit
+	 * proc_exit callback in the exporter is the obvious place, since
+	 * it ships whatever counters this backend accumulated during
+	 * its session.  A future bgworker in contrib/otel will take
+	 * ownership of periodic dispatch across all backends (planned in
+	 * contrib-otel-metrics-plan.md); the API shape here is forward-
+	 * compatible with that.
+	 * -------------------------------------------------------------- */
+	void	  (*register_metrics_emit_hook) (otel_metrics_emit_hook_type new_hook,
+											 otel_metrics_emit_hook_type *prev_out);
+	void	  (*dispatch_metrics_now) (void);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */

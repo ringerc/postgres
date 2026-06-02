@@ -385,11 +385,107 @@ otel_metric_collect_self(otel_metric_visitor visitor, void *ctx)
 }
 
 
+/* ---- dispatch ------------------------------------------------------ */
+
+/*
+ * Registered emit-hook chain.  Single slot; chained exporters
+ * follow the same prev-hook convention as the span-emit chain.
+ */
+static otel_metrics_emit_hook_type otel_metrics_emit_hook = NULL;
+
+void
+otel_register_metrics_emit_hook(otel_metrics_emit_hook_type new_hook,
+								otel_metrics_emit_hook_type *prev_out)
+{
+	if (prev_out)
+		*prev_out = otel_metrics_emit_hook;
+	otel_metrics_emit_hook = new_hook;
+}
+
+/*
+ * Visitor used internally by dispatch_metrics_now to gather snapshots
+ * into a single OtelMetricBatch.  The snapshot pointers borrow from
+ * the instrument table; we copy by value into a palloc'd array, with
+ * pointer fields preserved since they reference TopMemoryContext
+ * strings that outlive any per-dispatch context.
+ */
+typedef struct
+{
+	OtelMetricSnapshot *snapshots;
+	int			n;
+	int			capacity;
+	MemoryContext cxt;
+} DispatchCollect;
+
+static void
+dispatch_collect_visitor(const OtelMetricSnapshot *snap, void *vctx)
+{
+	DispatchCollect *dc = (DispatchCollect *) vctx;
+
+	if (dc->n >= dc->capacity)
+	{
+		int			newcap = dc->capacity ? dc->capacity * 2 : 16;
+
+		if (dc->snapshots == NULL)
+			dc->snapshots = (OtelMetricSnapshot *)
+				palloc(sizeof(OtelMetricSnapshot) * newcap);
+		else
+			dc->snapshots = (OtelMetricSnapshot *)
+				repalloc(dc->snapshots, sizeof(OtelMetricSnapshot) * newcap);
+		dc->capacity = newcap;
+	}
+	dc->snapshots[dc->n++] = *snap;
+}
+
+void
+otel_dispatch_metrics_now(void)
+{
+	OtelMetricBatch batch;
+	DispatchCollect dc;
+	int			n_res;
+	const OtelResourceAttribute *res;
+	MemoryContext oldcxt;
+	MemoryContext dispatch_cxt;
+
+	if (otel_metrics_emit_hook == NULL)
+		return;					/* nothing to do --- no consumer */
+
+	/* All allocations from here on go into a short-lived dispatch
+	 * context so emit hooks don't see leftovers across calls. */
+	dispatch_cxt = AllocSetContextCreate(CurrentMemoryContext,
+										 "otel metrics dispatch",
+										 ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(dispatch_cxt);
+
+	dc.snapshots = NULL;
+	dc.n = 0;
+	dc.capacity = 0;
+	dc.cxt = dispatch_cxt;
+
+	otel_metric_collect_self(dispatch_collect_visitor, &dc);
+
+	res = otel_resource_attrs_get(&n_res);
+
+	batch.resource_attrs = res;
+	batch.n_resource_attrs = n_res;
+	batch.snapshots = dc.snapshots;
+	batch.n_snapshots = dc.n;
+	batch.collection_time = (dc.n > 0) ? dc.snapshots[0].collection_time
+									   : GetCurrentTimestamp();
+
+	otel_metrics_emit_hook(&batch);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(dispatch_cxt);
+}
+
+
 /* ---- init ---------------------------------------------------------- */
 
 void
 otel_metrics_init(void)
 {
 	n_instruments = 0;
+	otel_metrics_emit_hook = NULL;
 	metrics_initialised = true;
 }
