@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	otel.o \
 	otel_api.o \
+	otel_metrics.o \
 	otel_parallel.o \
 	otel_producer.o \
 	otel_resource.o

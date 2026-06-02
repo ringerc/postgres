@@ -3,6 +3,7 @@
 otel_sources = files(
   'otel.c',
   'otel_api.c',
+  'otel_metrics.c',
   'otel_parallel.c',
   'otel_producer.c',
   'otel_resource.c',

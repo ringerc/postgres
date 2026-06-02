@@ -593,3 +593,100 @@ test_otel_resource_attributes(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
+
+/*
+ * test_otel_force_drop_spans(n_total int) → int
+ *
+ * Push n_total spans onto the active stack with OTEL_UNWIND_DROP
+ * policy and return without emitting any.  Forces:
+ *   * "overflow" drops for spans beyond MAX_SPAN_STACK_DEPTH (64)
+ *   * "unwound" drops for the pushed ones when the per-call memory
+ *     context resets after this function returns.
+ *
+ * Returns the number of spans actually pushed (i.e.
+ * min(n_total, MAX_SPAN_STACK_DEPTH)).  Used by the metrics TAP
+ * test to verify the otel.spans.dropped counter.
+ *
+ * Spans are palloc'd in CurrentMemoryContext so the
+ * MemoryContextCallback registered by span_link_to_active_and_push
+ * fires on context reset.
+ */
+PG_FUNCTION_INFO_V1(test_otel_force_drop_spans);
+Datum
+test_otel_force_drop_spans(PG_FUNCTION_ARGS)
+{
+	int			n_total = PG_GETARG_INT32(0);
+	OtelSpan   *spans;
+	int			depth_before;
+	int			pushed;
+	int			i;
+
+	if (n_total <= 0)
+		PG_RETURN_INT32(0);
+
+	spans = palloc0(n_total * sizeof(OtelSpan));
+	depth_before = cached_api->span_stack_depth();
+
+	for (i = 0; i < n_total; i++)
+	{
+		cached_api->span_init(&spans[i], test_tracer, "drop.test",
+							  OTEL_SPAN_KIND_INTERNAL);
+		otel_span_set_unwind_policy(&spans[i], OTEL_UNWIND_DROP);
+		cached_api->span_link_to_active_and_push(&spans[i]);
+	}
+
+	pushed = cached_api->span_stack_depth() - depth_before;
+
+	/* Don't emit.  When this function returns and CurrentMemoryContext
+	 * is reset, the registered MemoryContextCallback unwinds the
+	 * pushed entries; OTEL_UNWIND_DROP means they're counted as
+	 * "unwound" drops. */
+
+	PG_RETURN_INT32(pushed);
+}
+
+/*
+ * test_otel_metrics_dump() → text
+ *
+ * Calls api->metric_collect_self and accumulates each emitted snapshot
+ * into a "key=val;key=val;...|key=val;..." text representation.  One
+ * record per snapshot, "|" separating records.  Used by TAP tests to
+ * pattern-match emitted counter values.
+ */
+typedef struct
+{
+	StringInfoData buf;
+	int			n;
+} MetricsDumpCtx;
+
+static void
+metrics_dump_visitor(const OtelMetricSnapshot *snap, void *vctx)
+{
+	MetricsDumpCtx *ctx = (MetricsDumpCtx *) vctx;
+
+	if (ctx->n > 0)
+		appendStringInfoChar(&ctx->buf, '|');
+	appendStringInfo(&ctx->buf,
+					 "meter=%s;instrument=%s;unit=%s;kind=%d;"
+					 "attr_key=%s;attr_value=%s;value=" UINT64_FORMAT,
+					 snap->meter_name,
+					 snap->instrument_name,
+					 snap->unit ? snap->unit : "",
+					 (int) snap->kind,
+					 snap->attr_key ? snap->attr_key : "",
+					 snap->attr_value ? snap->attr_value : "",
+					 snap->value);
+	ctx->n++;
+}
+
+PG_FUNCTION_INFO_V1(test_otel_metrics_dump);
+Datum
+test_otel_metrics_dump(PG_FUNCTION_ARGS)
+{
+	MetricsDumpCtx ctx;
+
+	initStringInfo(&ctx.buf);
+	ctx.n = 0;
+	cached_api->metric_collect_self(metrics_dump_visitor, &ctx);
+	PG_RETURN_TEXT_P(cstring_to_text(ctx.buf.data));
+}

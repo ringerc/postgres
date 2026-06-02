@@ -75,6 +75,14 @@ extern OtelInstrumentationScope *otel_tracer_register(const char *name,
 extern char *otel_service_name_guc;
 extern char *otel_service_instance_id_guc;
 
+/* Defined in otel_metrics.c.  Process-local Counter implementation. */
+extern void otel_metrics_init(void);
+extern OtelInstrument *otel_metric_instrument_register(const OtelInstrumentSpec *spec);
+extern void otel_metric_counter_add(OtelInstrument *inst,
+									uint64 value,
+									const char *attr_value);
+extern void otel_metric_collect_self(otel_metric_visitor visitor, void *ctx);
+
 /* Defined in otel_parallel.c.  Per-backend shared-memory slots
  * carrying the leader's currently-active SpanContext for parallel
  * workers to read.  Replaces the otel.current_span_id GUC that the

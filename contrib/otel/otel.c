@@ -478,7 +478,8 @@ _PG_init(void)
 	 * to contrib/otel_postgres_tracing in Phase 4.  Operators must
 	 * add 'otel_postgres_tracing' (after 'otel') to
 	 * shared_preload_libraries to get query-tracing behaviour. */
-	otel_producer_init();
+	otel_metrics_init();		/* before any module's registration */
+	otel_producer_init();		/* registers otel.spans.dropped */
 	otel_parallel_init();
 	otel_resource_init();
 	otel_api_publish_rendezvous();

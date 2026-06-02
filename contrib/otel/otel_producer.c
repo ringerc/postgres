@@ -167,6 +167,21 @@ static bool stack_overflow_warned = false;
 
 
 /*
+ * Self-metric: count of spans dropped before emission, broken down by
+ * reason.  Registered in otel_producer_init via the metrics API;
+ * incremented at each drop site below.  Handle is NULL only on
+ * capacity exhaustion (extremely unlikely with the default cap of
+ * OTEL_MAX_INSTRUMENTS = 64), and otel_metric_counter_add is a no-op
+ * when given a NULL handle.
+ */
+static OtelInstrument *spans_dropped_counter = NULL;
+
+#define SPANS_DROPPED_REASON_OVERFLOW		"overflow"
+#define SPANS_DROPPED_REASON_OUT_OF_ORDER	"out_of_order"
+#define SPANS_DROPPED_REASON_UNWOUND		"unwound"
+
+
+/*
  * MemoryContextCallback support.  When a consumer pushes a span via
  * api->span_link_to_active_and_push, we allocate a small node in
  * CurrentMemoryContext and register it as a reset callback.  When
@@ -400,7 +415,7 @@ dispatch_span(const OtelSpan *span)
  * For OTEL_UNWIND_DROP entries: nothing besides the pop.
  */
 static void
-unwind_to(int target_top, const char *reason)
+unwind_to(int target_top, const char *reason, const char *metric_reason)
 {
 	while (span_stack_top > target_top)
 	{
@@ -413,6 +428,11 @@ unwind_to(int target_top, const char *reason)
 			e->span->status_description = reason;
 			e->span->end_time = GetCurrentTimestamp();
 			dispatch_span(e->span);
+		}
+		else
+		{
+			/* OTEL_UNWIND_DROP: span goes silently, count it. */
+			otel_metric_counter_add(spans_dropped_counter, 1, metric_reason);
 		}
 		/* Clear before decrementing so a future re-push to this slot
 		 * starts with a clean slate. */
@@ -442,7 +462,8 @@ on_memory_context_reset(void *arg)
 			/* Found it.  Drain from current top down to and including
 			 * this entry.  Drain target is i - 1 because unwind_to is
 			 * exclusive (drains while top > target). */
-			unwind_to(i - 1, "unwound by ereport");
+			unwind_to(i - 1, "unwound by ereport",
+					  SPANS_DROPPED_REASON_UNWOUND);
 			return;
 		}
 	}
@@ -533,6 +554,8 @@ otel_producer_span_push(OtelSpan *span)
 					 errhint("Reduce instrumentation nesting or, if the workload genuinely needs deeper nesting, increase MAX_SPAN_STACK_DEPTH and rebuild contrib/otel.")));
 			stack_overflow_warned = true;
 		}
+		otel_metric_counter_add(spans_dropped_counter, 1,
+								SPANS_DROPPED_REASON_OVERFLOW);
 	}
 }
 
@@ -625,6 +648,8 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 					 errhint("Reduce instrumentation nesting or, if the workload genuinely needs deeper nesting, increase MAX_SPAN_STACK_DEPTH and rebuild contrib/otel.")));
 			stack_overflow_warned = true;
 		}
+		otel_metric_counter_add(spans_dropped_counter, 1,
+								SPANS_DROPPED_REASON_OVERFLOW);
 	}
 }
 
@@ -752,7 +777,8 @@ otel_producer_span_emit(OtelSpan *span)
 				/* Drain entries above the target, honouring each
 				 * one's unwind_policy.  Drain target is i so that i
 				 * itself stays on top after this call. */
-				unwind_to(i, "unwound by out-of-order emit");
+				unwind_to(i, "unwound by out-of-order emit",
+						  SPANS_DROPPED_REASON_OUT_OF_ORDER);
 			}
 			/* Pop the target entry itself. */
 			span_stack[span_stack_top].span = NULL;
@@ -875,7 +901,28 @@ otel_span_add_attribute_string(OtelSpan *span, const char *key, const char *valu
 void
 otel_producer_init(void)
 {
+	static const char *const reasons[] = {
+		SPANS_DROPPED_REASON_OVERFLOW,
+		SPANS_DROPPED_REASON_OUT_OF_ORDER,
+		SPANS_DROPPED_REASON_UNWOUND,
+	};
+	OtelInstrumentSpec spec = {
+		.kind = OTEL_INSTRUMENT_COUNTER,
+		.meter_name = "contrib/otel",
+		.meter_version = PG_VERSION,
+		.instrument_name = "otel.spans.dropped",
+		.description = "Spans dropped before emission, by reason",
+		.unit = "1",
+		.attr_key = "reason",
+		.attr_values = reasons,
+		.n_attr_values = lengthof(reasons),
+	};
+
 	/* Zero-initialise active-stack state; static storage is already
 	 * zero, so this is effectively a documentation site. */
 	span_stack_top = -1;
+
+	/* Self-metric registration.  Caller is contrib/otel's _PG_init
+	 * after otel_metrics_init has run. */
+	spans_dropped_counter = otel_metric_instrument_register(&spec);
 }

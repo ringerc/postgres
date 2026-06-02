@@ -36,6 +36,7 @@ tests += {
       't/006_pgbouncer.pl',
       't/007_resource.pl',
       't/008_scope.pl',
+      't/009_metrics.pl',
     ],
   },
 }

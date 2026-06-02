@@ -240,6 +240,144 @@ typedef struct OtelResourceAttribute
 	const char *value;
 } OtelResourceAttribute;
 
+/* ====================================================================
+ * Metrics API.
+ *
+ * OTel-shaped Counter metrics for contrib/otel's own self-observability
+ * (dropped spans, sampler decisions, parallel-worker rates) and for
+ * other extensions that want to emit operational telemetry through the
+ * same pipeline as traces.
+ *
+ * Storage model in this initial implementation is process-local: each
+ * backend has its own instrument table and counter slots; cross-backend
+ * aggregation happens downstream in the OTel collector after the
+ * counters are exposed (planned via a bgworker collection tick that
+ * isn't yet implemented).  A producer module registers an instrument
+ * once at _PG_init, caches the handle, and increments the counter on
+ * its hot path:
+ *
+ *     static OtelInstrument *dropped_spans;
+ *
+ *     void _PG_init(void) {
+ *         static const char *const reasons[] = {"overflow", "oom",
+ *                                               "out_of_order", "unwound"};
+ *         OtelInstrumentSpec spec = {
+ *             .kind             = OTEL_INSTRUMENT_COUNTER,
+ *             .meter_name       = "contrib/otel",
+ *             .meter_version    = PG_VERSION,
+ *             .instrument_name  = "otel.spans.dropped",
+ *             .description      = "Spans dropped before emission",
+ *             .unit             = "1",
+ *             .attr_key         = "reason",
+ *             .attr_values      = reasons,
+ *             .n_attr_values    = lengthof(reasons),
+ *         };
+ *         dropped_spans = api->metric_instrument_register(&spec);
+ *     }
+ *
+ *     ... at the drop site ...
+ *     api->metric_counter_add(dropped_spans, 1, "overflow");
+ *
+ * MVP: Counter only.  UpDownCounter / Histogram / Gauge / Observable
+ * are reserved by the OtelInstrumentKind enum.
+ * ==================================================================== */
+
+typedef enum OtelInstrumentKind
+{
+	OTEL_INSTRUMENT_COUNTER = 1,
+	/* OTEL_INSTRUMENT_UPDOWNCOUNTER, _HISTOGRAM, _GAUGE,
+	 * _OBSERVABLE_COUNTER, _OBSERVABLE_UPDOWNCOUNTER, _OBSERVABLE_GAUGE
+	 * reserved for later. */
+} OtelInstrumentKind;
+
+typedef enum OtelAggregationTemporality
+{
+	OTEL_AGGREGATION_TEMPORALITY_CUMULATIVE = 1,
+	/* OTEL_AGGREGATION_TEMPORALITY_DELTA reserved; cumulative is the
+	 * only thing produced today. */
+} OtelAggregationTemporality;
+
+/*
+ * Opaque handle.  Returned from api->metric_instrument_register and
+ * passed to api->metric_counter_add.  Lifetime is the backend; the
+ * handle remains valid until the process exits.
+ */
+typedef struct OtelInstrument OtelInstrument;
+
+/*
+ * Instrument registration parameters.  Struct rather than positional
+ * args so the field set can grow without breaking the API.  Caller
+ * keeps the strings live for the duration of the
+ * api->metric_instrument_register call; the implementation pstrdup's
+ * what it needs.
+ */
+typedef struct OtelInstrumentSpec
+{
+	OtelInstrumentKind kind;
+
+	/* InstrumentationScope: meter_name is required; the other two are
+	 * optional (NULL = not declared). */
+	const char *meter_name;
+	const char *meter_version;
+	const char *schema_url;
+
+	/* Instrument identity.  instrument_name follows OTel naming syntax
+	 * (first char alphabetic, then [A-Za-z0-9_./-], max 255 chars);
+	 * registration ereport(ERROR)s on violation. */
+	const char *instrument_name;
+	const char *description;	/* NULL ok */
+	const char *unit;			/* OTel unit annotation, e.g. "1", "ms"; NULL ok */
+
+	/* Bounded-cardinality single-key attributes.  attr_key NULL means
+	 * "no attribute"; otherwise n_attr_values must be > 0 and
+	 * attr_values lists each allowed value.  Bounded by
+	 * OTEL_MAX_ATTRSETS (see otel_metrics.c). */
+	const char *attr_key;
+	const char *const *attr_values;
+	int			n_attr_values;
+} OtelInstrumentSpec;
+
+/*
+ * Per-datapoint snapshot, produced by api->metric_collect_self for
+ * exporters (today: test fixtures; tomorrow: the bgworker tick that
+ * dispatches to a registered emit hook).  One snapshot per
+ * (instrument, attribute-set) cell of this backend.
+ */
+typedef struct OtelMetricSnapshot
+{
+	/* InstrumentationScope --- the producer library. */
+	const char *meter_name;
+	const char *meter_version;	/* NULL if not declared */
+	const char *schema_url;		/* NULL if not declared */
+
+	/* Instrument identity. */
+	const char *instrument_name;
+	const char *description;	/* NULL if not declared */
+	const char *unit;			/* NULL if not declared */
+	OtelInstrumentKind kind;
+	OtelAggregationTemporality temporality;	/* CUMULATIVE in MVP */
+
+	/* Per-datapoint attribute.  attr_key NULL when the instrument has
+	 * no attribute. */
+	const char *attr_key;
+	const char *attr_value;
+
+	/* Timestamps.  start_timestamp is fixed at instrument-registration
+	 * time so cumulative reset detection by downstream collectors works
+	 * the same way as it does for stateful OTel SDKs. */
+	TimestampTz start_timestamp;
+	TimestampTz collection_time;
+
+	uint64		value;			/* cumulative count for COUNTER */
+} OtelMetricSnapshot;
+
+/*
+ * Callback invoked by api->metric_collect_self once per
+ * (instrument, attribute-set) cell.  ctx is the opaque user pointer
+ * passed alongside the callback to metric_collect_self.
+ */
+typedef void (*otel_metric_visitor) (const OtelMetricSnapshot *snap, void *ctx);
+
 /*
  * Common substrate of every captured event.
  *

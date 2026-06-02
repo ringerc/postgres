@@ -216,6 +216,11 @@ static const OtelTracingApi otel_tracing_api = {
 	 * InstrumentationScope registration. */
 	.get_resource_attributes = otel_resource_attrs_get,
 	.tracer_register = otel_tracer_register,
+
+	/* Metrics API --- Counter only, process-local storage today. */
+	.metric_instrument_register = otel_metric_instrument_register,
+	.metric_counter_add = otel_metric_counter_add,
+	.metric_collect_self = otel_metric_collect_self,
 };
 
 

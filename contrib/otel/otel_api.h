@@ -335,6 +335,36 @@ typedef struct OtelTracingApi
 	OtelInstrumentationScope *(*tracer_register) (const char *name,
 												  const char *version,
 												  const char *schema_url);
+
+	/* --------------------------------------------------------------
+	 * Metrics API (initial: Counter only, process-local storage).
+	 *
+	 * metric_instrument_register publishes a new Counter (or returns
+	 * an existing handle if a previous call in this backend supplied
+	 * an equal (meter_name, instrument_name) pair --- idempotent
+	 * within the process).  Returns NULL on capacity exhaustion
+	 * after logging WARNING; callers should be prepared for NULL
+	 * and treat subsequent metric_counter_add as a no-op.
+	 *
+	 * metric_counter_add atomically adds value to the counter cell
+	 * for (this backend, inst, attr_value).  attr_value must match
+	 * one of the values declared at registration; mismatches are
+	 * silently dropped today (see contrib-otel-metrics-plan.md for
+	 * the planned WARNING + self-metric).  inst == NULL is a no-op
+	 * so callers don't need to guard the call themselves when
+	 * registration failed.
+	 *
+	 * metric_collect_self walks this backend's instruments and
+	 * invokes visitor once per (instrument, attribute-set) cell
+	 * with a snapshot view.  Used by tests today; intended to be
+	 * driven from a future bgworker tick that ships the snapshots
+	 * to a registered exporter hook.
+	 * -------------------------------------------------------------- */
+	OtelInstrument *(*metric_instrument_register) (const OtelInstrumentSpec *spec);
+	void	  (*metric_counter_add) (OtelInstrument *inst,
+									 uint64 value,
+									 const char *attr_value);
+	void	  (*metric_collect_self) (otel_metric_visitor visitor, void *ctx);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */

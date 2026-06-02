@@ -31,3 +31,13 @@ CREATE FUNCTION test_otel_resource_attributes()
 RETURNS text
 AS 'MODULE_PATHNAME', 'test_otel_resource_attributes'
 LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION test_otel_metrics_dump()
+RETURNS text
+AS 'MODULE_PATHNAME', 'test_otel_metrics_dump'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION test_otel_force_drop_spans(n_total integer)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'test_otel_force_drop_spans'
+LANGUAGE C VOLATILE PARALLEL SAFE;
