@@ -64,9 +64,13 @@ extern OtelSamplerHookPolicy	otel_get_sampler_hook_policy(void);
 /* Defined in otel_resource.c.  Resource attributes describing the
  * postmaster process, populated at _PG_init from GUCs and runtime
  * facts (cluster system id, hostname).  Exposed to exporters via the
- * OtelTracingApi rendezvous struct. */
+ * OtelTracingApi rendezvous struct.  Also home to the
+ * InstrumentationScope registry (otel_tracer_register). */
 extern void otel_resource_init(void);
 extern const OtelResourceAttribute *otel_resource_attrs_get(int *n_out);
+extern OtelInstrumentationScope *otel_tracer_register(const char *name,
+													  const char *version,
+													  const char *schema_url);
 
 extern char *otel_service_name_guc;
 extern char *otel_service_instance_id_guc;
@@ -98,7 +102,10 @@ extern void otel_producer_span_emit(OtelSpan *span);
  * symbol resolution is not portable.  Consumers reach them via the
  * OtelTracingApi function pointers; the rendezvous-struct
  * initialiser in otel_api.c uses the names below. */
-extern void otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind);
+extern void otel_span_init(OtelSpan *span,
+						   const OtelInstrumentationScope *scope,
+						   const char *name,
+						   OtelSpanKind kind);
 extern bool otel_span_add_attribute_string(OtelSpan *span,
 										   const char *key,
 										   const char *value);

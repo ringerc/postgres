@@ -35,6 +35,7 @@ tests += {
       't/005_producer_api.pl',
       't/006_pgbouncer.pl',
       't/007_resource.pl',
+      't/008_scope.pl',
     ],
   },
 }

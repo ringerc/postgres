@@ -153,6 +153,26 @@ format_span_json(const OtelSpan *span, StringInfo out)
 		appendStringInfoString(out, ",\"db_statement\":");
 		escape_json(out, db_stmt);
 	}
+	if (span->scope)
+	{
+		/* Scope last so simple regex-based field extractors (the TAP
+		 * harness uses one) match the top-level "name" before the
+		 * nested scope.name. */
+		appendStringInfoString(out, ",\"scope\":{");
+		appendStringInfoString(out, "\"name\":");
+		escape_json(out, span->scope->name ? span->scope->name : "");
+		if (span->scope->version)
+		{
+			appendStringInfoString(out, ",\"version\":");
+			escape_json(out, span->scope->version);
+		}
+		if (span->scope->schema_url)
+		{
+			appendStringInfoString(out, ",\"schema_url\":");
+			escape_json(out, span->scope->schema_url);
+		}
+		appendStringInfoString(out, "}");
+	}
 	appendStringInfoChar(out, '}');
 }
 

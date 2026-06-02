@@ -265,6 +265,7 @@ start_span(QueryDesc *queryDesc)
 	}
 
 	memset(&span_storage, 0, sizeof(span_storage));
+	span_storage.scope = otel_pg_tracer;
 
 	/* Snapshot the root context (client-supplied via 'M' header or
 	 * SET otel.traceparent or sqlcommenter parse). */
@@ -559,6 +560,7 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 		MemoryContextReset(span_cxt);
 
 	memset(&span_storage, 0, sizeof(span_storage));
+	span_storage.scope = otel_pg_tracer;
 
 	{
 		OtelRootContextSnapshot rc;
