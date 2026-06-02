@@ -28,6 +28,14 @@ extern const OtelTracingApi *otel_api;
  * _PG_init.  Tagged onto every OtelSpan produced by otel_trace.c. */
 extern const OtelInstrumentationScope *otel_pg_tracer;
 
+/* Counter for emitted ereport/elog events, broken down by severity
+ * (LOG/NOTICE/WARNING/ERROR/FATAL/PANIC).  Registered at _PG_init
+ * and incremented from otel_emit_log_hook for every event whose
+ * elevel maps to one of the six tracked severities.  Demonstrates
+ * the metrics API for postgres state that no pg_stat_* view
+ * exposes at this granularity. */
+extern OtelInstrument *otel_pg_log_events_counter;
+
 /* Behaviour GUCs owned by this module. */
 extern bool otel_trace_all_queries;
 

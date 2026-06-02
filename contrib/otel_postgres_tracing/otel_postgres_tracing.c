@@ -64,6 +64,15 @@ const OtelTracingApi *otel_api = NULL;
 const OtelInstrumentationScope *otel_pg_tracer = NULL;
 
 /*
+ * Counter for ereport/elog events emitted by this backend, broken
+ * down by severity.  Registered at _PG_init; incremented by
+ * otel_emit_log_hook from a fixed enum of 6 severities (the rest
+ * --- DEBUG levels, INFO, COMMERROR --- are not counted to keep
+ * cardinality predictable).  Declared in otel_postgres_tracing.h.
+ */
+OtelInstrument *otel_pg_log_events_counter = NULL;
+
+/*
  * GUC controlling whether spans are emitted for queries that
  * carry no propagated trace context.  Off by default --- the
  * common case is "trace only what the client asked for".
@@ -122,6 +131,25 @@ _PG_init(void)
 	otel_pg_tracer = otel_api->tracer_register("contrib/otel_postgres_tracing",
 											   PG_VERSION,
 											   NULL);
+
+	{
+		static const char *const severities[] = {
+			"LOG", "NOTICE", "WARNING", "ERROR", "FATAL", "PANIC",
+		};
+		OtelInstrumentSpec spec = {
+			.kind = OTEL_INSTRUMENT_COUNTER,
+			.meter_name = "contrib/otel_postgres_tracing",
+			.meter_version = PG_VERSION,
+			.instrument_name = "postgres.log_events",
+			.description = "ereport/elog events emitted by this backend, by severity",
+			.unit = "1",
+			.attr_key = "severity",
+			.attr_values = severities,
+			.n_attr_values = lengthof(severities),
+		};
+
+		otel_pg_log_events_counter = otel_api->metric_instrument_register(&spec);
+	}
 
 	otel_trace_install_hooks();
 	otel_log_install_hooks();

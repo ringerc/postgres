@@ -39,6 +39,7 @@
 static emit_log_hook_type prev_emit_log_hook = NULL;
 
 static void otel_emit_log_hook(ErrorData *edata);
+static const char *severity_label(int elevel);
 
 
 /*
@@ -114,8 +115,51 @@ otel_emit_log_hook(ErrorData *edata)
 		MemoryContextSwitchTo(oldcxt);
 	}
 
+	/*
+	 * Count this ereport against the per-severity Counter.
+	 * severity_label returns NULL for elevels we don't track
+	 * (DEBUG levels, INFO, COMMERROR, WARNING_CLIENT_ONLY); those
+	 * are skipped to keep cardinality bounded.  Note: emit_log_hook
+	 * only fires for events that pass log_min_messages, so the
+	 * NOTICE counter is only meaningful when log_min_messages is
+	 * relaxed below the WARNING default.
+	 */
+	{
+		const char *sev = severity_label(edata->elevel);
+
+		if (sev != NULL)
+			otel_api->metric_counter_add(otel_pg_log_events_counter, 1, sev);
+	}
+
 	otel_span_record_log_event(edata);
 
 	if (prev_emit_log_hook)
 		prev_emit_log_hook(edata);
+}
+
+/*
+ * Map an elog.h elevel constant to the severity label used as the
+ * Counter's attribute value.  Returns NULL for elevels we don't
+ * count (DEBUG*, INFO, COMMERROR, WARNING_CLIENT_ONLY).
+ */
+static const char *
+severity_label(int elevel)
+{
+	switch (elevel)
+	{
+		case LOG:
+			return "LOG";
+		case NOTICE:
+			return "NOTICE";
+		case WARNING:
+			return "WARNING";
+		case ERROR:
+			return "ERROR";
+		case FATAL:
+			return "FATAL";
+		case PANIC:
+			return "PANIC";
+		default:
+			return NULL;
+	}
 }

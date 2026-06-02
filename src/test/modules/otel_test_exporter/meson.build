@@ -37,6 +37,7 @@ tests += {
       't/007_resource.pl',
       't/008_scope.pl',
       't/009_metrics.pl',
+      't/010_log_events.pl',
     ],
   },
 }
