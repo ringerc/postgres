@@ -46,6 +46,7 @@
 #define CONTRIB_OTEL_H
 
 #include "datatype/timestamp.h"
+#include "utils/timestamp.h"		/* for GetCurrentTimestamp in inline helpers */
 
 /* W3C Trace Context lengths (excluding trailing NUL). */
 #define OTEL_TRACE_ID_LEN		32
@@ -426,50 +427,38 @@ typedef void (*otel_span_emit_hook_type) (const OtelSpan *span);
  * ==================================================================== */
 
 /*
- * Initialise a fresh span.  Generates a new span_id, captures
- * start_time = now, zeroes the rest of the struct, and stores
- * caller-supplied name + kind.  parent_span_id and trace_id stay
- * empty (zero); the api->span_link_to_active_and_push or
- * api->span_set_parent_explicit call will populate them.
+ * Initialise a fresh span and append a string attribute --- both
+ * exposed via the OtelTracingApi rendezvous struct, NOT as direct
+ * extern functions, because peer-extension symbol resolution is
+ * not portable (Windows lacks the import library; POSIX builds
+ * with -fvisibility=hidden hide the symbols).  See the design
+ * note in otel-trace-context-notes.md.
  *
- * `name` MUST point at memory that remains valid until span_emit
- * returns (a string literal, a long-lived const char *, or a
- * palloc'd buffer in the same MemoryContext as anything else the
- * span references).  contrib/otel does not copy.
+ * Use api->span_init(&span, "name", KIND) and
+ *	   api->span_add_attribute_string(&span, "k", "v")
+ * (declared in otel_api.h via the OtelTracingApi struct).
  *
- * Out-of-line --- generates random bytes for span_id, which is
- * not appropriate to inline.
+ * Out-of-line because of the random-bytes / hex encoding (init)
+ * and the overflow-allocation path (add_attribute_string);
+ * neither is appropriate to inline.
  */
-extern void otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind);
-
-/*
- * Append a string attribute to the span.  Writes into the inline
- * attrs[] array if there's room; otherwise allocates an entry in
- * the overflow_attrs array (in the consumer's CurrentMemoryContext
- * for now --- callers wanting tighter control should set
- * MemoryContext before calling).  Returns true on success, false
- * on overflow allocation failure (silent drop --- best-effort
- * instrumentation).
- *
- * `key` and `value` MUST be long-lived (see otel_span_init
- * lifetime note).  contrib/otel does not copy.
- *
- * Out-of-line because of the overflow palloc; the common
- * inline-attrs path is a 2-write fast path inside the function.
- */
-extern bool otel_span_add_attribute_string(OtelSpan *span,
-										   const char *key,
-										   const char *value);
 
 /*
  * Capture end_time = now.  Status is left at whatever the consumer
  * set via otel_span_set_status (or OTEL_STATUS_UNSET if never
  * set).
  *
- * Out-of-line to avoid pulling utils/timestamp.h into otel.h.
- * One function call per span is irrelevant overhead.
+ * Inline because it's a single struct write; GetCurrentTimestamp
+ * is a postgres backend symbol available from any loaded module
+ * (it lives in the main postgres binary, not a peer extension)
+ * so the inline path is safe across the contrib/otel module
+ * boundary.
  */
-extern void otel_span_finalize(OtelSpan *span);
+static inline void
+otel_span_finalize(OtelSpan *span)
+{
+	span->end_time = GetCurrentTimestamp();
+}
 
 /*
  * Set span status + description.  description may be NULL (typical

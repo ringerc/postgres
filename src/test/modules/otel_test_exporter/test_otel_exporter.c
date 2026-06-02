@@ -473,3 +473,66 @@ test_otel_set_policy(PG_FUNCTION_ARGS)
 	cached_api->set_sampler_policy(policy);
 	PG_RETURN_VOID();
 }
+
+/*
+ * test_otel_producer_roundtrip(name text) → text
+ *
+ * Exercises the producer-side API end-to-end in a single SQL
+ * call:  otel_span_init → set_unwind_policy → api->span_link_to
+ * _active_and_push → otel_span_add_attribute_string ×2 →
+ * otel_span_set_status → otel_span_finalize → api->span_emit.
+ *
+ * Returns the generated span_id so the TAP test can correlate it
+ * with what the emit-hook captures.
+ */
+PG_FUNCTION_INFO_V1(test_otel_producer_roundtrip);
+Datum
+test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
+{
+	text	   *name_arg = PG_GETARG_TEXT_PP(0);
+	const char *name;
+	OtelSpan	span;
+	int			depth_before;
+	int			depth_during;
+	int			depth_after;
+	const OtelSpanContext *ctx;
+
+	/*
+	 * Copy the name into long-lived storage so it stays valid through
+	 * the producer-API call sequence.  text_to_cstring palloc's in
+	 * CurrentMemoryContext --- fine for a single SQL call.
+	 */
+	name = text_to_cstring(name_arg);
+
+	depth_before = cached_api->span_stack_depth();
+
+	cached_api->span_init(&span, name, OTEL_SPAN_KIND_INTERNAL);
+	otel_span_set_unwind_policy(&span, OTEL_UNWIND_DROP);
+
+	cached_api->span_link_to_active_and_push(&span);
+
+	depth_during = cached_api->span_stack_depth();
+	if (depth_during != depth_before + 1)
+		elog(ERROR, "producer roundtrip: stack depth did not increase (before=%d during=%d)",
+			 depth_before, depth_during);
+
+	/* Verify span_current_context returns this span. */
+	ctx = cached_api->span_current_context();
+	if (ctx == NULL || strcmp(ctx->span_id, span.span_id) != 0)
+		elog(ERROR, "producer roundtrip: span_current_context did not return the pushed span (ctx=%s pushed=%s)",
+			 ctx ? ctx->span_id : "(null)", span.span_id);
+
+	cached_api->span_add_attribute_string(&span, "test.case", "roundtrip");
+	cached_api->span_add_attribute_string(&span, "test.name", name);
+	otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
+	otel_span_finalize(&span);
+
+	cached_api->span_emit(&span);
+
+	depth_after = cached_api->span_stack_depth();
+	if (depth_after != depth_before)
+		elog(ERROR, "producer roundtrip: stack depth did not return to baseline (before=%d after=%d)",
+			 depth_before, depth_after);
+
+	PG_RETURN_TEXT_P(cstring_to_text(span.span_id));
+}

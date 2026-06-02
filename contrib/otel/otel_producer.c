@@ -604,11 +604,8 @@ otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind)
 	span->start_time = GetCurrentTimestamp();
 }
 
-void
-otel_span_finalize(OtelSpan *span)
-{
-	span->end_time = GetCurrentTimestamp();
-}
+/* otel_span_finalize is a static inline in otel.h (single struct
+ * write to end_time = now); no out-of-line definition needed. */
 
 bool
 otel_span_add_attribute_string(OtelSpan *span, const char *key, const char *value)

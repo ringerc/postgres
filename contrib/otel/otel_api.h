@@ -212,6 +212,33 @@ typedef struct OtelTracingApi
 	const OtelSpanContext *(*span_root_context) (void);
 	int		  (*span_stack_depth) (void);
 	void	  (*span_emit) (OtelSpan *span);
+
+	/*
+	 * Producer-side convenience helpers exposed via the rendezvous
+	 * struct (not as extern functions) so they remain reachable from
+	 * consumer modules across the cross-extension symbol-resolution
+	 * boundary on every supported platform.
+	 *
+	 *	   api->span_init(&span, "operation.name", KIND);
+	 *	     Generates fresh span_id, sets start_time = now, name,
+	 *	     kind; zeroes other fields including unwind_policy =
+	 *	     OTEL_UNWIND_DROP and sampler_decision =
+	 *	     RECORD_AND_SAMPLE.
+	 *
+	 *	   api->span_add_attribute_string(&span, "key", "value");
+	 *	     Appends to the inline attrs[] array if room, else
+	 *	     allocates / repalloc's the overflow array via
+	 *	     MCXT_ALLOC_NO_OOM (silent drop on OOM).  Returns true
+	 *	     on success, false on overflow allocation failure.
+	 *	     Neither key nor value is copied --- caller must keep
+	 *	     them alive until api->span_emit returns.
+	 */
+	void	  (*span_init) (OtelSpan *span,
+						    const char *name,
+						    OtelSpanKind kind);
+	bool	  (*span_add_attribute_string) (OtelSpan *span,
+											const char *key,
+											const char *value);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */
