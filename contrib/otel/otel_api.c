@@ -96,6 +96,14 @@ static const OtelTracingApi otel_tracing_api = {
 	.register_emit_hook = api_register_emit_hook,
 	.register_sampler_hook = api_register_sampler_hook,
 	.set_sampler_policy = api_set_sampler_policy,
+
+	/* Producer-side API; implementations live in otel_producer.c. */
+	.span_link_to_active_and_push = otel_producer_span_link_to_active_and_push,
+	.span_set_parent_explicit = otel_producer_span_set_parent_explicit,
+	.span_current_context = otel_producer_span_current_context,
+	.span_root_context = otel_producer_span_root_context,
+	.span_stack_depth = otel_producer_span_stack_depth,
+	.span_emit = otel_producer_span_emit,
 };
 
 

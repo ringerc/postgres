@@ -460,6 +460,7 @@ _PG_init(void)
 
 	otel_log_install_hooks();
 	otel_trace_install_hooks();
+	otel_producer_init();
 	otel_api_publish_rendezvous();
 }
 
