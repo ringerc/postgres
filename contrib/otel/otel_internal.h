@@ -78,4 +78,14 @@ extern const OtelSpanContext *otel_producer_span_root_context(void);
 extern int otel_producer_span_stack_depth(void);
 extern void otel_producer_span_emit(OtelSpan *span);
 
+/* Producer-side convenience helpers (also in otel_producer.c) ---
+ * not exposed via otel.h as extern symbols because peer-extension
+ * symbol resolution is not portable.  Consumers reach them via the
+ * OtelTracingApi function pointers; the rendezvous-struct
+ * initialiser in otel_api.c uses the names below. */
+extern void otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind);
+extern bool otel_span_add_attribute_string(OtelSpan *span,
+										   const char *key,
+										   const char *value);
+
 #endif							/* CONTRIB_OTEL_INTERNAL_H */
