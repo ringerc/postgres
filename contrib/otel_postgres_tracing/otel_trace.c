@@ -27,7 +27,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  contrib/otel/otel_trace.c
+ *	  contrib/otel_postgres_tracing/otel_trace.c
  *
  *-------------------------------------------------------------------------
  */
@@ -53,7 +53,7 @@
 #include "utils/timestamp.h"
 
 #include "otel.h"
-#include "otel_internal.h"
+#include "otel_postgres_tracing.h"
 
 /*
  * Span lifecycle state --- per backend.
@@ -116,9 +116,9 @@ static void span_add_attr(const char *key, const char *value);
 static OtelSpanEvent *acquire_event_slot(void);
 static void capture_event_core(OtelEventCore *core, ErrorData *edata);
 static void capture_event_extended(OtelSpanEvent *event, ErrorData *edata);
-/* otel_emit_span_as_log_line is declared in otel_internal.h --- it
- * is non-static so otel_producer.c can call it via the unified
- * dispatch path (Phase 2 migration). */
+/* otel_emit_span_as_log_line: the JSON log-line fallback emitter
+ * lives in contrib/otel; this module reaches it via the producer
+ * dispatch when otel.emit_spans_to_log is on. */
 
 
 /*
@@ -214,7 +214,7 @@ span_add_attr(const char *key, const char *value)
 		OtelKeyValue *newarr;
 
 		if (span_storage.overflow_attrs == NULL)
-			newarr = palloc(sizeof(OtelKeyValue) * 4);
+			newarr = palloc(sizeof(OtelKeyValue) * newcnt);
 		else
 			newarr = repalloc(span_storage.overflow_attrs,
 							  sizeof(OtelKeyValue) * newcnt);
@@ -234,8 +234,8 @@ span_add_attr(const char *key, const char *value)
 /* Phase 3: update_current_span_id_guc and restore_current_span_id_guc
  * are gone.  Their replacement is the per-backend shared-memory slot
  * in otel_parallel.c: start_span calls
- * otel_parallel_publish_leader_context, finalize_span calls
- * otel_parallel_clear_leader_context. */
+ * otel_api->parallel_publish_leader_context, finalize_span calls
+ * otel_api->parallel_clear_leader_context. */
 
 /*
  * Initialize span_storage for a new span and populate attributes.
@@ -266,46 +266,52 @@ start_span(QueryDesc *queryDesc)
 
 	memset(&span_storage, 0, sizeof(span_storage));
 
-	/* Identity from propagated trace context if available; otherwise
-	 * synthesize parentless (only happens when trace_all_queries is on).
-	 *
-	 * Parent-span selection:
-	 *	 1. If we're a parallel worker AND our leader has a published
-	 *	    SpanContext, use the leader's span_id as parent.  This
-	 *	    overrides any client-propagated parent because the leader's
-	 *	    current span is closer to us in the trace hierarchy.
-	 *	 2. Otherwise, fall back to the client-propagated parent in
-	 *	    otel_ctx (set via 'M' header or SET otel.traceparent).
-	 */
-	if (otel_ctx.is_set)
+	/* Snapshot the root context (client-supplied via 'M' header or
+	 * SET otel.traceparent or sqlcommenter parse). */
 	{
-		OtelParallelContext leader_ctx;
+		OtelRootContextSnapshot rc;
+		otel_api->get_root_context_snapshot(&rc);
 
-		memcpy(span_storage.trace_id, otel_ctx.trace_id, sizeof(span_storage.trace_id));
-		memcpy(span_storage.trace_flags, otel_ctx.trace_flags, sizeof(span_storage.trace_flags));
-		if (otel_parallel_get_leader_context(&leader_ctx))
-			parent = leader_ctx.parent_span_id;
+		/* Identity from propagated trace context if available; otherwise
+		 * synthesize parentless (only happens when trace_all_queries is on).
+		 *
+		 * Parent-span selection:
+		 *	 1. If we're a parallel worker AND our leader has a published
+		 *	    SpanContext, use the leader's span_id as parent.  This
+		 *	    overrides any client-propagated parent because the leader's
+		 *	    current span is closer to us in the trace hierarchy.
+		 *	 2. Otherwise, fall back to the client-propagated parent in
+		 *	    the root context.
+		 */
+		if (rc.is_set)
+		{
+			OtelParallelContext leader_ctx;
+
+			memcpy(span_storage.trace_id, rc.trace_id, sizeof(span_storage.trace_id));
+			memcpy(span_storage.trace_flags, rc.trace_flags, sizeof(span_storage.trace_flags));
+			if (otel_api->parallel_get_leader_context(&leader_ctx))
+				parent = leader_ctx.parent_span_id;
+			else
+				parent = rc.span_id;
+			strlcpy(span_storage.parent_span_id, parent,
+					sizeof(span_storage.parent_span_id));
+		}
 		else
-			parent = otel_ctx.span_id;
-		strlcpy(span_storage.parent_span_id, parent,
-				sizeof(span_storage.parent_span_id));
+		{
+			/* trace_all_queries path: synthesize a trace id too. */
+			unsigned char buf[16];
+
+			if (!pg_strong_random(buf, sizeof(buf)))
+				memset(buf, 0xa5, sizeof(buf));
+			bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
+			strcpy(span_storage.trace_flags, "00");
+			span_storage.parent_span_id[0] = '\0';
+		}
+
+		generate_span_id(span_storage.span_id);
+
+		span_storage.tracestate = rc.tracestate;
 	}
-	else
-	{
-		/* trace_all_queries path: synthesize a trace id too. */
-		unsigned char buf[16];
-
-		if (!pg_strong_random(buf, sizeof(buf)))
-			memset(buf, 0xa5, sizeof(buf));
-		bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
-		strcpy(span_storage.trace_flags, "00");
-		span_storage.parent_span_id[0] = '\0';
-	}
-
-	generate_span_id(span_storage.span_id);
-
-	span_storage.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
-		? otel_tracestate_guc : NULL;
 
 	span_storage.name = GetCommandTagName(queryDesc->operation == CMD_UNKNOWN
 										  ? CMDTAG_UNKNOWN
@@ -352,7 +358,7 @@ start_span(QueryDesc *queryDesc)
 	 * shared-memory slot so any parallel workers we spawn during
 	 * this span will pick us up as parent.  Supersedes the
 	 * otel.current_span_id GUC. */
-	otel_parallel_publish_leader_context(span_storage.trace_id,
+	otel_api->parallel_publish_leader_context(span_storage.trace_id,
 										 span_storage.span_id,
 										 span_storage.trace_flags);
 
@@ -363,7 +369,7 @@ start_span(QueryDesc *queryDesc)
 	 * silently dropped, and external producer-API consumers can
 	 * read this span as their parent via api->span_current_context. */
 	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
-	otel_producer_span_push(&span_storage);
+	otel_api->span_push(&span_storage);
 }
 
 static void
@@ -384,26 +390,26 @@ finalize_span(OtelSpanStatus status)
 	 * + the JSON-log fallback.  Equivalent to the inline dispatch
 	 * this code used to do, but goes through the same path
 	 * external consumers use. */
-	otel_producer_span_emit(&span_storage);
+	otel_api->span_emit(&span_storage);
 
 	span_active = false;
 	span_originator = SPAN_ORIGIN_NONE;
 	/* Phase 3: clear our published context so any workers spawned
 	 * AFTER this span ends (in a future query) don't read a stale
 	 * value. */
-	otel_parallel_clear_leader_context();
+	otel_api->parallel_clear_leader_context();
 
 	/*
 	 * Statement-scoped scrub for comment-derived context: a
 	 * sqlcommenter traceparent applies to ONE statement and must
-	 * not bleed into the next.  Reset otel_ctx now.  ('M' / GUC
-	 * paths are not affected; they sit on otel_ctx until the
-	 * client clears them or the transaction ends.)
+	 * not bleed into the next.  Reset root context now.  ('M' /
+	 * GUC paths are not affected; reset is a no-op for those.)
 	 */
-	if (otel_ctx_from_comment)
 	{
-		otel_ctx_reset();
-		otel_ctx_from_comment = false;
+		OtelRootContextSnapshot rc;
+		otel_api->get_root_context_snapshot(&rc);
+		if (rc.from_comment)
+			otel_api->reset_root_context();
 	}
 }
 
@@ -436,12 +442,10 @@ finalize_span(OtelSpanStatus status)
 static OtelSamplerDecision
 decide_whether_to_record(const char *name_hint)
 {
-	otel_span_emit_hook_type emit_hook = otel_get_span_emit_hook();
-	otel_sampler_hook_type sampler_hook = otel_get_sampler_hook();
-	OtelSamplerHookPolicy policy = otel_get_sampler_hook_policy();
+	OtelRootContextSnapshot rc;
 
 	/* Gate 1: no consumer */
-	if (emit_hook == NULL && !otel_emit_spans_to_log)
+	if (!otel_api->any_emit_consumer_present())
 		return OTEL_SAMPLE_DROP;
 
 	/* Gate 2: force-on overrides propagation entirely */
@@ -449,62 +453,22 @@ decide_whether_to_record(const char *name_hint)
 		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
 
 	/* Gate 3: no propagated context */
-	if (!otel_ctx.is_set)
+	otel_api->get_root_context_snapshot(&rc);
+	if (!rc.is_set)
 		return OTEL_SAMPLE_DROP;
 
-	/*
-	 * Gates 4-6: policy-driven dispatch.
-	 *
-	 * The four policies map onto four straight-line decision paths
-	 * with no further branching:
-	 */
-	switch (policy)
-	{
-		case OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE:
-			/* Record everything that has a propagated context, no
-			 * sampler call, no W3C bit check. */
-			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-
-		case OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT:
-			/* Pure W3C ParentBased; sampler hook is never consulted. */
-			return otel_ctx.sampled_flag_set
-				? OTEL_SAMPLE_RECORD_AND_SAMPLE
-				: OTEL_SAMPLE_DROP;
-
-		case OTEL_SAMPLER_HOOK_ALWAYS:
-			/* Defer EVERY decision to the hook, regardless of the
-			 * wire bit.  If no hook is registered, fall back to
-			 * always-record (a no-hook + ALWAYS combination is a
-			 * configuration error, but recording is the safer
-			 * default than silently dropping). */
-			if (sampler_hook == NULL)
-				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-			break;				/* fall through to the hook call below */
-
-		case OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT:
-		default:
-			/* Default: honour wire bit; only call hook on unset. */
-			if (otel_ctx.sampled_flag_set)
-				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-			if (sampler_hook == NULL)
-				return OTEL_SAMPLE_DROP;
-			break;				/* fall through to the hook call below */
-	}
-
-	/* Hook-call path (reached only by ALWAYS or ON_UNSAMPLED_BIT
-	 * after their wire-bit checks). */
+	/* Gates 4-6: policy-driven dispatch handled inside the api. */
 	{
 		OtelSamplerInput in;
 
-		in.trace_id = otel_ctx.trace_id;
-		in.parent_span_id = otel_ctx.span_id;
-		in.trace_flags = otel_ctx.trace_flags;
-		in.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
-			? otel_tracestate_guc : NULL;
+		in.trace_id = rc.trace_id;
+		in.parent_span_id = rc.span_id;
+		in.trace_flags = rc.trace_flags;
+		in.tracestate = rc.tracestate;
 		in.name = name_hint;
 		in.kind = OTEL_SPAN_KIND_SERVER;
 
-		return sampler_hook(&in);
+		return otel_api->compute_sampler_decision(&in, rc.sampled_flag_set);
 	}
 }
 
@@ -519,11 +483,15 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 	/*
 	 * If no in-memory context yet (no 'M' header, no SET) AND
-	 * sqlcommenter parsing is enabled, try the SQL text.  No-op
-	 * when the GUC is off (the cheap path is one boolean read).
+	 * sqlcommenter parsing is enabled (checked inside the api),
+	 * try the SQL text.  No-op when sqlcommenter is disabled.
 	 */
-	if (!otel_ctx.is_set && otel_parse_sqlcommenter && queryDesc != NULL)
-		(void) try_apply_sqlcommenter_context(queryDesc->sourceText);
+	{
+		OtelRootContextSnapshot rc_pre;
+		otel_api->get_root_context_snapshot(&rc_pre);
+		if (!rc_pre.is_set && queryDesc != NULL)
+			(void) otel_api->try_apply_sqlcommenter_context(queryDesc->sourceText);
+	}
 
 	decision = decide_whether_to_record("pgsql.execute");
 
@@ -592,34 +560,38 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 
 	memset(&span_storage, 0, sizeof(span_storage));
 
-	if (otel_ctx.is_set)
 	{
-		OtelParallelContext leader_ctx;
+		OtelRootContextSnapshot rc;
+		otel_api->get_root_context_snapshot(&rc);
 
-		memcpy(span_storage.trace_id, otel_ctx.trace_id, sizeof(span_storage.trace_id));
-		memcpy(span_storage.trace_flags, otel_ctx.trace_flags, sizeof(span_storage.trace_flags));
-		if (otel_parallel_get_leader_context(&leader_ctx))
-			parent = leader_ctx.parent_span_id;
+		if (rc.is_set)
+		{
+			OtelParallelContext leader_ctx;
+
+			memcpy(span_storage.trace_id, rc.trace_id, sizeof(span_storage.trace_id));
+			memcpy(span_storage.trace_flags, rc.trace_flags, sizeof(span_storage.trace_flags));
+			if (otel_api->parallel_get_leader_context(&leader_ctx))
+				parent = leader_ctx.parent_span_id;
+			else
+				parent = rc.span_id;
+			strlcpy(span_storage.parent_span_id, parent,
+					sizeof(span_storage.parent_span_id));
+		}
 		else
-			parent = otel_ctx.span_id;
-		strlcpy(span_storage.parent_span_id, parent,
-				sizeof(span_storage.parent_span_id));
+		{
+			unsigned char buf[16];
+
+			if (!pg_strong_random(buf, sizeof(buf)))
+				memset(buf, 0xa5, sizeof(buf));
+			bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
+			strcpy(span_storage.trace_flags, "00");
+			span_storage.parent_span_id[0] = '\0';
+		}
+
+		generate_span_id(span_storage.span_id);
+
+		span_storage.tracestate = rc.tracestate;
 	}
-	else
-	{
-		unsigned char buf[16];
-
-		if (!pg_strong_random(buf, sizeof(buf)))
-			memset(buf, 0xa5, sizeof(buf));
-		bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
-		strcpy(span_storage.trace_flags, "00");
-		span_storage.parent_span_id[0] = '\0';
-	}
-
-	generate_span_id(span_storage.span_id);
-
-	span_storage.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
-		? otel_tracestate_guc : NULL;
 
 	/* Use the utility statement's command tag as the span name.
 	 * GetCommandTagName returns a pointer into rodata --- safe to
@@ -653,13 +625,13 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 
 	/* Phase 3: publish to per-backend slot for parallel workers
 	 * (see start_span() for the equivalent call). */
-	otel_parallel_publish_leader_context(span_storage.trace_id,
+	otel_api->parallel_publish_leader_context(span_storage.trace_id,
 										 span_storage.span_id,
 										 span_storage.trace_flags);
 
 	/* Phase 2 migration: see start_span() above. */
 	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
-	otel_producer_span_push(&span_storage);
+	otel_api->span_push(&span_storage);
 }
 
 /*
@@ -689,8 +661,12 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	{
 		/* sqlcommenter fallback --- see equivalent block in
 		 * otel_ExecutorStart for rationale. */
-		if (!otel_ctx.is_set && otel_parse_sqlcommenter)
-			(void) try_apply_sqlcommenter_context(queryString);
+		{
+			OtelRootContextSnapshot rc_pre;
+			otel_api->get_root_context_snapshot(&rc_pre);
+			if (!rc_pre.is_set)
+				(void) otel_api->try_apply_sqlcommenter_context(queryString);
+		}
 
 		decision = decide_whether_to_record("pgsql.utility");
 		if (decision != OTEL_SAMPLE_DROP)
@@ -805,13 +781,12 @@ acquire_event_slot(void)
 		OtelSpanEvent *newarr;
 
 		if (span_storage.overflow_events == NULL)
-			newarr = palloc0(sizeof(OtelSpanEvent) * 4);
+			newarr = palloc(sizeof(OtelSpanEvent) * newcnt);
 		else
 			newarr = repalloc(span_storage.overflow_events,
 							  sizeof(OtelSpanEvent) * newcnt);
-		/* Zero only the new slot (older slots are already populated) */
-		if (newcnt > 1)
-			memset(&newarr[newcnt - 1], 0, sizeof(OtelSpanEvent));
+		/* Zero the new slot; older slots are already populated. */
+		memset(&newarr[newcnt - 1], 0, sizeof(OtelSpanEvent));
 		span_storage.overflow_events = newarr;
 		span_storage.n_overflow_events = newcnt;
 		slot = &span_storage.overflow_events[newcnt - 1];
@@ -916,155 +891,4 @@ otel_span_record_log_event(ErrorData *edata)
 	 * event itself was captured. */
 	if (edata->elevel >= ERROR)
 		span_storage.status = OTEL_STATUS_ERROR;
-}
-
-
-/* ====================================================================
- * otel_emit_span_as_log_line --- zero-config JSON-log fallback emitter.
- * ====================================================================
- *
- * Gated by the otel.emit_spans_to_log GUC.  Writes the span as a
- * single structured LOG line; operators can ship those lines
- * downstream via fluentd / vector / the OTel Collector's filelog
- * receiver.
- *
- * Uses StringInfo (and palloc) so it is best-effort under memory
- * pressure: an allocation failure causes the log line for this one
- * span to be dropped, with no effect on the user's transaction.
- * Caller (finalize_span) wraps in PG_TRY.
- *
- * The JSON shape is documented as stable for THIS PoC across minor
- * revisions of contrib/otel; do not consider it OTLP and do not
- * embed in production tooling expecting OTLP compatibility.
- */
-void
-otel_emit_span_as_log_line(const OtelSpan *span)
-{
-	StringInfoData buf;
-	int			i;
-	bool		first;
-
-	initStringInfo(&buf);
-
-	appendStringInfoChar(&buf, '{');
-
-	appendStringInfoString(&buf, "\"trace_id\":");
-	escape_json(&buf, span->trace_id);
-	appendStringInfoString(&buf, ",\"span_id\":");
-	escape_json(&buf, span->span_id);
-	appendStringInfoString(&buf, ",\"parent_span_id\":");
-	escape_json(&buf, span->parent_span_id);
-	appendStringInfoString(&buf, ",\"trace_flags\":");
-	escape_json(&buf, span->trace_flags);
-	if (span->tracestate)
-	{
-		appendStringInfoString(&buf, ",\"tracestate\":");
-		escape_json(&buf, span->tracestate);
-	}
-	appendStringInfoString(&buf, ",\"name\":");
-	escape_json(&buf, span->name ? span->name : "");
-	appendStringInfo(&buf, ",\"kind\":%d", (int) span->kind);
-	appendStringInfo(&buf, ",\"status\":%d", (int) span->status);
-	appendStringInfo(&buf, ",\"start_time\":%" PRId64,
-					 (int64) span->start_time);
-	appendStringInfo(&buf, ",\"end_time\":%" PRId64,
-					 (int64) span->end_time);
-
-	/* Attributes object */
-	appendStringInfoString(&buf, ",\"attributes\":{");
-	first = true;
-	for (i = 0; i < span->n_attrs; i++)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		escape_json(&buf, span->attrs[i].key ? span->attrs[i].key : "");
-		appendStringInfoChar(&buf, ':');
-		escape_json(&buf, span->attrs[i].value ? span->attrs[i].value : "");
-	}
-	for (i = 0; i < span->n_overflow_attrs; i++)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		escape_json(&buf, span->overflow_attrs[i].key ? span->overflow_attrs[i].key : "");
-		appendStringInfoChar(&buf, ':');
-		escape_json(&buf, span->overflow_attrs[i].value ? span->overflow_attrs[i].value : "");
-	}
-	appendStringInfoChar(&buf, '}');
-
-	/* Events array */
-	appendStringInfoString(&buf, ",\"events\":[");
-	first = true;
-	if (span->inline_event_used)
-	{
-		const OtelSpanEvent *e = &span->inline_event;
-
-		appendStringInfoChar(&buf, '{');
-		appendStringInfo(&buf, "\"time\":%" PRId64,
-						 (int64) e->core.time);
-		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
-		appendStringInfoString(&buf, ",\"sqlstate\":");
-		escape_json(&buf, e->core.sqlstate);
-		if (e->core.filename)
-		{
-			appendStringInfoString(&buf, ",\"filename\":");
-			escape_json(&buf, e->core.filename);
-		}
-		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
-		if (e->message)
-		{
-			appendStringInfoString(&buf, ",\"message\":");
-			escape_json(&buf, e->message);
-		}
-		if (e->detail)
-		{
-			appendStringInfoString(&buf, ",\"detail\":");
-			escape_json(&buf, e->detail);
-		}
-		if (e->hint)
-		{
-			appendStringInfoString(&buf, ",\"hint\":");
-			escape_json(&buf, e->hint);
-		}
-		appendStringInfoChar(&buf, '}');
-		first = false;
-	}
-	for (i = 0; i < span->n_overflow_events; i++)
-	{
-		const OtelSpanEvent *e = &span->overflow_events[i];
-
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		appendStringInfoChar(&buf, '{');
-		appendStringInfo(&buf, "\"time\":%" PRId64,
-						 (int64) e->core.time);
-		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
-		appendStringInfoString(&buf, ",\"sqlstate\":");
-		escape_json(&buf, e->core.sqlstate);
-		if (e->core.filename)
-		{
-			appendStringInfoString(&buf, ",\"filename\":");
-			escape_json(&buf, e->core.filename);
-		}
-		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
-		if (e->message)
-		{
-			appendStringInfoString(&buf, ",\"message\":");
-			escape_json(&buf, e->message);
-		}
-		appendStringInfoChar(&buf, '}');
-	}
-	appendStringInfoChar(&buf, ']');
-
-	appendStringInfoChar(&buf, '}');
-
-	/* Emit as a single LOG line with a distinctive prefix so log
-	 * collectors can filter for span records.  errmsg_internal
-	 * suppresses translation since the JSON is not localized. */
-	ereport(LOG,
-			(errmsg_internal("otel-span: %s", buf.data)));
-
-	pfree(buf.data);
 }

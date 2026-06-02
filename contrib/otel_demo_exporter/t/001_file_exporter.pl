@@ -35,7 +35,7 @@ $node->init;
 my $span_file = $node->data_dir . '/otel_spans.jsonl';
 
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_demo_exporter'
+shared_preload_libraries = 'otel,otel_postgres_tracing,otel_demo_exporter'
 otel_demo_exporter.output_file = '$span_file'
 log_min_messages = warning
 log_statement = 'none'

@@ -5,10 +5,8 @@ OBJS = \
 	$(WIN32RES) \
 	otel.o \
 	otel_api.o \
-	otel_log.o \
 	otel_parallel.o \
-	otel_producer.o \
-	otel_trace.o
+	otel_producer.o
 
 EXTENSION = otel
 DATA = otel--1.0.sql

@@ -205,9 +205,10 @@ static char *otel_traceparent_guc;
 char	   *otel_tracestate_guc;
 /* Phase 3: otel_current_span_id_guc removed; see otel_parallel.c. */
 
-/* Behaviour-controlling GUCs */
+/* Behaviour-controlling GUCs.  trace_all_queries moved to
+ * contrib/otel_postgres_tracing along with the query-tracing
+ * hooks in Phase 4. */
 bool		otel_emit_spans_to_log = false;
-bool		otel_trace_all_queries = false;
 bool		otel_parse_sqlcommenter = false;
 
 /*
@@ -418,14 +419,8 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("otel.trace_all_queries",
-							 "Emit spans for all queries, even ones with no client-propagated trace context.",
-							 "When off (default), spans are only produced when the client has supplied an otel.traceparent header.",
-							 &otel_trace_all_queries,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
+	/* otel.trace_all_queries moved to contrib/otel_postgres_tracing
+	 * in Phase 4; it's a query-tracing-specific behaviour GUC. */
 
 	DefineCustomBoolVariable("otel.parse_sqlcommenter",
 							 "Extract trace context from sqlcommenter SQL comments when no other context is set.",
@@ -449,8 +444,10 @@ _PG_init(void)
 								  otel_clear_cb,
 								  NULL);
 
-	otel_log_install_hooks();
-	otel_trace_install_hooks();
+	/* otel_log_install_hooks() and otel_trace_install_hooks() moved
+	 * to contrib/otel_postgres_tracing in Phase 4.  Operators must
+	 * add 'otel_postgres_tracing' (after 'otel') to
+	 * shared_preload_libraries to get query-tracing behaviour. */
 	otel_producer_init();
 	otel_parallel_init();
 	otel_api_publish_rendezvous();

@@ -98,6 +98,34 @@ typedef struct OtelParallelContext
 } OtelParallelContext;
 
 /*
+ * Snapshot of the backend's root context as supplied by the client
+ * via the 'M' protocol header, SET otel.traceparent, or sqlcommenter
+ * SQL-comment parsing.  Exposed via the OtelTracingApi rendezvous
+ * struct so the query-instrumentation module (and other consumers)
+ * can inspect the root context without taking a direct symbol
+ * dependency on contrib/otel's internal storage.
+ *
+ *	   is_set            true iff a traceparent has been parsed and
+ *	                     stored; false means "no propagated context".
+ *	   sampled_flag_set  W3C `sampled=1` bit observed on the wire.
+ *	                     Honoured (or overridden) by the sampler
+ *	                     policy.
+ *	   from_comment      true if the most recent context came from a
+ *	                     sqlcommenter parse.  Used by the statement-
+ *	                     tracing module to scrub at statement end.
+ */
+typedef struct OtelRootContextSnapshot
+{
+	bool		is_set;
+	bool		sampled_flag_set;
+	bool		from_comment;
+	char		trace_id[OTEL_TRACE_ID_LEN + 1];
+	char		span_id[OTEL_SPAN_ID_LEN + 1];
+	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
+	const char *tracestate;		/* may be NULL; valid until next change */
+} OtelRootContextSnapshot;
+
+/*
  * Behaviour when a pushed span is forcibly removed from the active
  * span-stack without an explicit api->span_emit() call --- either
  * because ereport() unwound through the producing code path before

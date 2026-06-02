@@ -44,8 +44,9 @@ extern bool otel_ctx_from_comment;
 /* Defined in otel.c. */
 extern char *otel_tracestate_guc;
 extern bool otel_emit_spans_to_log;
-extern bool otel_trace_all_queries;
 extern bool otel_parse_sqlcommenter;
+/* otel_trace_all_queries moved to contrib/otel_postgres_tracing
+ * in Phase 4. */
 
 extern void otel_ctx_reset(void);
 extern bool try_apply_sqlcommenter_context(const char *sql);
@@ -56,15 +57,9 @@ extern otel_span_emit_hook_type otel_get_span_emit_hook(void);
 extern otel_sampler_hook_type	otel_get_sampler_hook(void);
 extern OtelSamplerHookPolicy	otel_get_sampler_hook_policy(void);
 
-/* Defined in otel_log.c.  Called once from _PG_init. */
-extern void otel_log_install_hooks(void);
-
-/* Defined in otel_trace.c.  Called once from _PG_init. */
-extern void otel_trace_install_hooks(void);
-
-/* Called from otel_log.c's emit_log_hook to record an ereport as a
- * span event when a span is active.  No-op otherwise. */
-extern void otel_span_record_log_event(ErrorData *edata);
+/* otel_log_install_hooks / otel_trace_install_hooks /
+ * otel_span_record_log_event moved to contrib/otel_postgres_tracing
+ * in Phase 4. */
 
 /* Defined in otel_parallel.c.  Per-backend shared-memory slots
  * carrying the leader's currently-active SpanContext for parallel
