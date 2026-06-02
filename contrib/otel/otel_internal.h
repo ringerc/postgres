@@ -61,6 +61,16 @@ extern OtelSamplerHookPolicy	otel_get_sampler_hook_policy(void);
  * otel_span_record_log_event moved to contrib/otel_postgres_tracing
  * in Phase 4. */
 
+/* Defined in otel_resource.c.  Resource attributes describing the
+ * postmaster process, populated at _PG_init from GUCs and runtime
+ * facts (cluster system id, hostname).  Exposed to exporters via the
+ * OtelTracingApi rendezvous struct. */
+extern void otel_resource_init(void);
+extern const OtelResourceAttribute *otel_resource_attrs_get(int *n_out);
+
+extern char *otel_service_name_guc;
+extern char *otel_service_instance_id_guc;
+
 /* Defined in otel_parallel.c.  Per-backend shared-memory slots
  * carrying the leader's currently-active SpanContext for parallel
  * workers to read.  Replaces the otel.current_span_id GUC that the
