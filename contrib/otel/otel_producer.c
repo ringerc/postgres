@@ -335,6 +335,23 @@ otel_emit_span_as_log_line(const OtelSpan *span)
 	}
 	appendStringInfoChar(&buf, ']');
 
+	if (span->scope)
+	{
+		appendStringInfoString(&buf, ",\"scope\":{\"name\":");
+		escape_json(&buf, span->scope->name ? span->scope->name : "");
+		if (span->scope->version)
+		{
+			appendStringInfoString(&buf, ",\"version\":");
+			escape_json(&buf, span->scope->version);
+		}
+		if (span->scope->schema_url)
+		{
+			appendStringInfoString(&buf, ",\"schema_url\":");
+			escape_json(&buf, span->scope->schema_url);
+		}
+		appendStringInfoString(&buf, "}");
+	}
+
 	appendStringInfoChar(&buf, '}');
 
 	ereport(LOG,
@@ -772,7 +789,10 @@ bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst)
 }
 
 void
-otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind)
+otel_span_init(OtelSpan *span,
+			   const OtelInstrumentationScope *scope,
+			   const char *name,
+			   OtelSpanKind kind)
 {
 	unsigned char buf[OTEL_SPAN_ID_LEN / 2];
 
@@ -792,6 +812,7 @@ otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind)
 	}
 	bytes_to_lower_hex(buf, sizeof(buf), span->span_id);
 
+	span->scope = scope;
 	span->name = name;
 	span->kind = kind;
 	span->status = OTEL_STATUS_UNSET;

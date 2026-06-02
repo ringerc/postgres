@@ -24,6 +24,10 @@
  * returns successfully (the lookup ereport(ERROR)s on failure). */
 extern const OtelTracingApi *otel_api;
 
+/* InstrumentationScope handle for this module, registered at
+ * _PG_init.  Tagged onto every OtelSpan produced by otel_trace.c. */
+extern const OtelInstrumentationScope *otel_pg_tracer;
+
 /* Behaviour GUCs owned by this module. */
 extern bool otel_trace_all_queries;
 

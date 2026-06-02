@@ -61,6 +61,12 @@ typedef struct CapturedEvent
 
 typedef struct CapturedSpan
 {
+	/* InstrumentationScope copied by value at capture time so the
+	 * test fixture survives past producer teardown. */
+	char	   *scope_name;
+	char	   *scope_version;
+	char	   *scope_schema_url;
+
 	char		trace_id[33];
 	char		span_id[17];
 	char		parent_span_id[17];
@@ -95,6 +101,13 @@ static otel_sampler_hook_type prev_sampler_hook = NULL;
  * in _PG_init.
  */
 static const OtelTracingApi *cached_api = NULL;
+
+/*
+ * InstrumentationScope handle for spans this module produces via
+ * the producer-API path (test_otel_producer_roundtrip).  Registered
+ * once at _PG_init.
+ */
+static const OtelInstrumentationScope *test_tracer = NULL;
 
 /*
  * GUC controlling what test_otel_sampler_hook returns.  Encoded as
@@ -160,6 +173,13 @@ copy_span(const OtelSpan *span, CapturedSpan *slot)
 	int			n_attrs;
 
 	clear_slot(slot);
+
+	if (span->scope)
+	{
+		slot->scope_name = copy_str(span->scope->name);
+		slot->scope_version = copy_str(span->scope->version);
+		slot->scope_schema_url = copy_str(span->scope->schema_url);
+	}
 
 	memcpy(slot->trace_id, span->trace_id, sizeof(slot->trace_id));
 	memcpy(slot->span_id, span->span_id, sizeof(slot->span_id));
@@ -332,6 +352,8 @@ _PG_init(void)
 
 	cached_api->register_emit_hook(otel_test_emit_hook, &prev_emit_hook);
 	cached_api->register_sampler_hook(otel_test_sampler_hook, &prev_sampler_hook);
+
+	test_tracer = cached_api->tracer_register("test_otel_exporter", "1.0", NULL);
 }
 
 /* ----- SQL surface ----- */
@@ -371,6 +393,12 @@ test_otel_pop_span(PG_FUNCTION_ARGS)
 	s = &ring[idx];
 
 	initStringInfo(&buf);
+	appendStringInfo(&buf, "scope.name=%s\n",
+					 s->scope_name ? s->scope_name : "");
+	appendStringInfo(&buf, "scope.version=%s\n",
+					 s->scope_version ? s->scope_version : "");
+	appendStringInfo(&buf, "scope.schema_url=%s\n",
+					 s->scope_schema_url ? s->scope_schema_url : "");
 	appendStringInfo(&buf, "name=%s\n", s->name ? s->name : "");
 	appendStringInfo(&buf, "kind=%d\n", (int) s->kind);
 	appendStringInfo(&buf, "status=%d\n", (int) s->status);
@@ -506,7 +534,7 @@ test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
 
 	depth_before = cached_api->span_stack_depth();
 
-	cached_api->span_init(&span, name, OTEL_SPAN_KIND_INTERNAL);
+	cached_api->span_init(&span, test_tracer, name, OTEL_SPAN_KIND_INTERNAL);
 	otel_span_set_unwind_policy(&span, OTEL_UNWIND_DROP);
 
 	cached_api->span_link_to_active_and_push(&span);

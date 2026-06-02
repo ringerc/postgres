@@ -56,6 +56,14 @@ PG_MODULE_MAGIC;
 const OtelTracingApi *otel_api = NULL;
 
 /*
+ * InstrumentationScope handle for this module's spans.  Registered
+ * at _PG_init via otel_api->tracer_register; cached forever in
+ * TopMemoryContext.  Used by otel_trace.c to tag every span it
+ * produces.  Declared in otel_postgres_tracing.h.
+ */
+const OtelInstrumentationScope *otel_pg_tracer = NULL;
+
+/*
  * GUC controlling whether spans are emitted for queries that
  * carry no propagated trace context.  Off by default --- the
  * common case is "trace only what the client asked for".
@@ -110,6 +118,10 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("otel_postgres_tracing");
+
+	otel_pg_tracer = otel_api->tracer_register("contrib/otel_postgres_tracing",
+											   PG_VERSION,
+											   NULL);
 
 	otel_trace_install_hooks();
 	otel_log_install_hooks();
