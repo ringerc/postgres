@@ -81,6 +81,7 @@
 
 #include "miscadmin.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 #include "otel.h"
@@ -152,6 +153,42 @@ static OtelSpanContext root_ctx_buf;
 
 
 /*
+ * Backend-local flag --- set the first time we decline to push due
+ * to stack overflow.  Used to emit at most one WARNING per backend
+ * (the postmaster log fills up fast otherwise on pathological
+ * recursive PL/pgSQL).  Reset never; we'd rather miss a second
+ * warning than spam.
+ */
+static bool stack_overflow_warned = false;
+
+
+/*
+ * MemoryContextCallback support.  When a consumer pushes a span via
+ * api->span_link_to_active_and_push, we allocate a small node in
+ * CurrentMemoryContext and register it as a reset callback.  When
+ * that context is reset or deleted (typically by ereport unwinding
+ * past the producer's PG_TRY) the callback pops the matching stack
+ * entry, applying its unwind_policy.
+ *
+ * The node is freed automatically with the context; we never need
+ * to free it explicitly.  If the consumer's span_emit pops the
+ * entry first, the callback later finds nothing to do and harmless-
+ * ly returns.
+ *
+ * The node lives in the same MemoryContext as the consumer's
+ * CurrentMemoryContext at push time --- typically a per-statement
+ * or per-function context, but the consumer can choose otherwise
+ * by switching MemoryContext before calling
+ * span_link_to_active_and_push.
+ */
+typedef struct OtelSpanUnwindNode
+{
+	MemoryContextCallback cb;
+	char		span_id[OTEL_SPAN_ID_LEN + 1];
+} OtelSpanUnwindNode;
+
+
+/*
  * Helper: dispatch a span to the registered emit hook + the
  * built-in JSON-log emitter.  Both code paths (the existing
  * finalize_span in otel_trace.c, and the new api->span_emit
@@ -187,6 +224,74 @@ dispatch_span(const OtelSpan *span)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+}
+
+
+/*
+ * Pop entries from the top of the stack down to (but excluding) a
+ * target index, applying each entry's unwind_policy.  Used by both
+ * the MemoryContextCallback (which is then called with target -1
+ * to drain everything matching the callback) and by span_emit on
+ * the out-of-order path.
+ *
+ * For OTEL_UNWIND_ERROR entries with a non-NULL span pointer:
+ *	   * status is set to OTEL_STATUS_ERROR (unless already set);
+ *	   * status_description is set to the supplied reason string;
+ *	   * end_time is set to now;
+ *	   * dispatch_span is called.
+ *
+ * For OTEL_UNWIND_DROP entries: nothing besides the pop.
+ */
+static void
+unwind_to(int target_top, const char *reason)
+{
+	while (span_stack_top > target_top)
+	{
+		OtelSpanStackEntry *e = &span_stack[span_stack_top];
+
+		if (e->unwind_policy == OTEL_UNWIND_ERROR && e->span != NULL)
+		{
+			if (e->span->status == OTEL_STATUS_UNSET)
+				e->span->status = OTEL_STATUS_ERROR;
+			e->span->status_description = reason;
+			e->span->end_time = GetCurrentTimestamp();
+			dispatch_span(e->span);
+		}
+		/* Clear before decrementing so a future re-push to this slot
+		 * starts with a clean slate. */
+		e->span = NULL;
+		span_stack_top--;
+	}
+}
+
+/*
+ * MemoryContextCallback driver.  Called when the consumer's
+ * CurrentMemoryContext (at push time) is reset or deleted ---
+ * typically because ereport unwound through it.  Find the matching
+ * span_id in the stack and unwind everything from that entry up to
+ * the current top.
+ */
+static void
+on_memory_context_reset(void *arg)
+{
+	OtelSpanUnwindNode *node = (OtelSpanUnwindNode *) arg;
+	int			i;
+
+	for (i = span_stack_top; i >= 0; i--)
+	{
+		if (memcmp(span_stack[i].span_id, node->span_id,
+				   sizeof(node->span_id)) == 0)
+		{
+			/* Found it.  Drain from current top down to and including
+			 * this entry.  Drain target is i - 1 because unwind_to is
+			 * exclusive (drains while top > target). */
+			unwind_to(i - 1, "unwound by ereport");
+			return;
+		}
+	}
+	/* Not found: span_emit already popped it, so this callback is a
+	 * no-op.  This is the common success path: explicit emit beats
+	 * the callback every time. */
 }
 
 
@@ -248,6 +353,7 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 	if (span_stack_top + 1 < MAX_SPAN_STACK_DEPTH)
 	{
 		OtelSpanStackEntry *entry;
+		OtelSpanUnwindNode *node;
 
 		span_stack_top++;
 		entry = &span_stack[span_stack_top];
@@ -255,10 +361,56 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
 		entry->span = span;
+
+		/*
+		 * Register a MemoryContextCallback against CurrentMemoryContext
+		 * so that an ereport unwind through the producer's context
+		 * correctly pops this entry and applies its unwind_policy.
+		 * The node lives in CurrentMemoryContext and is freed
+		 * automatically when that context is reset/deleted (after the
+		 * callback fires).
+		 *
+		 * On allocation failure the call is downgraded: we still push
+		 * the entry, but no callback is installed.  An ereport-unwind
+		 * in that case leaves a stale stack entry that span_emit /
+		 * span_link_to_active_and_push will eventually find and step
+		 * past (the next emit with a matching span_id pops it; pushes
+		 * past stack-overflow keep parent linkage correct).  The
+		 * cost is one missing emit-as-ERROR on unwind for an
+		 * OTEL_UNWIND_ERROR span --- acceptable under OOM.
+		 */
+		node = (OtelSpanUnwindNode *) MemoryContextAllocExtended(CurrentMemoryContext,
+																 sizeof(*node),
+																 MCXT_ALLOC_NO_OOM);
+		if (node != NULL)
+		{
+			memcpy(node->span_id, span->span_id, sizeof(node->span_id));
+			node->cb.func = on_memory_context_reset;
+			node->cb.arg = node;
+			MemoryContextRegisterResetCallback(CurrentMemoryContext, &node->cb);
+		}
 	}
-	/* else overflow: see comment above; Commit C adds WARNING +
-	 * counter.  Parent linkage was set above so traces stay
-	 * connected even when nesting exceeds the stack bound. */
+	else
+	{
+		/* Stack overflow.  Parent linkage was set above so the new
+		 * span still threads correctly into the trace; we just don't
+		 * push it.  Subsequent pushes beyond MAX_SPAN_STACK_DEPTH
+		 * will all chain to the same deepest-pushed parent ---
+		 * approximately right since they share the same logical
+		 * scope.
+		 *
+		 * Emit one WARNING per backend session; otherwise pathologic-
+		 * ally recursive instrumentation could spam the log. */
+		if (!stack_overflow_warned)
+		{
+			ereport(WARNING,
+					(errmsg("otel: span-stack overflow at depth %d",
+							MAX_SPAN_STACK_DEPTH),
+					 errdetail("Further over-cap spans in this backend will still link to the deepest-pushed parent for correctness but will not be pushed onto the active stack."),
+					 errhint("Reduce instrumentation nesting or, if the workload genuinely needs deeper nesting, increase MAX_SPAN_STACK_DEPTH and rebuild contrib/otel.")));
+			stack_overflow_warned = true;
+		}
+	}
 }
 
 /*
@@ -378,10 +530,17 @@ otel_producer_span_emit(OtelSpan *span)
 				   sizeof(span_stack[i].span_id)) == 0)
 		{
 			if (i != span_stack_top)
+			{
 				ereport(WARNING,
-						(errmsg("otel: span emitted out of stack order; %d span(s) above will be silently dropped",
+						(errmsg("otel: span emitted out of stack order; %d span(s) above will be unwound",
 								span_stack_top - i)));
-			/* Pop down to (and including) this entry. */
+				/* Drain entries above the target, honouring each
+				 * one's unwind_policy.  Drain target is i so that i
+				 * itself stays on top after this call. */
+				unwind_to(i, "unwound by out-of-order emit");
+			}
+			/* Pop the target entry itself. */
+			span_stack[span_stack_top].span = NULL;
 			span_stack_top = i - 1;
 			break;
 		}
