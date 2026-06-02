@@ -212,8 +212,10 @@ static const OtelTracingApi otel_tracing_api = {
 	.compute_sampler_decision = api_compute_sampler_decision,
 	.any_emit_consumer_present = api_any_emit_consumer_present,
 
-	/* Minor 1: Resource attributes for the postmaster process. */
+	/* Resource attributes for the postmaster process + per-producer
+	 * InstrumentationScope registration. */
 	.get_resource_attributes = otel_resource_attrs_get,
+	.tracer_register = otel_tracer_register,
 };
 
 

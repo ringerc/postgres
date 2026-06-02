@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * otel_resource.c
- *	  OTel Resource attributes for the postmaster process.
+ *	  OTel Resource attributes and InstrumentationScope registry for
+ *	  the postmaster process.
  *
  * The OTel data model identifies a metric stream / span batch by
  * (Resource, InstrumentationScope, name, attributes).  Resource
@@ -9,6 +10,12 @@
  * keys: service.name, service.instance.id, host.name.  A single
  * Resource therefore applies to every signal (traces, metrics) a
  * given postmaster emits.
+ *
+ * InstrumentationScope identifies the *library* within that process
+ * that created the signal --- e.g. "contrib/otel_postgres_tracing"
+ * vs an out-of-tree extension that uses the producer API to emit
+ * its own spans.  Producers obtain a scope handle once at _PG_init
+ * via otel_tracer_register() and cache it module-statically.
  *
  * This module populates a process-local OtelResourceAttribute array
  * once at _PG_init and exposes it to exporters via
@@ -133,4 +140,42 @@ otel_resource_attrs_get(int *n_out)
 	if (n_out)
 		*n_out = otel_resource_n_attrs;
 	return otel_resource_attrs;
+}
+
+
+/*
+ * tracer_register --- construct an OtelInstrumentationScope handle.
+ *
+ * Called once per producer extension from _PG_init.  Strings are
+ * pstrdup'd into TopMemoryContext so the handle outlives any
+ * per-statement context; producers cache the returned pointer
+ * module-statically and pass it to every otel_span_init() call.
+ *
+ * version and schema_url may be NULL.  No dedup: each call allocates
+ * a fresh handle.  Two producers that happen to declare identical
+ * triples get separate handles, but exporters compare scopes by
+ * content (string equality on name/version/schema_url), so the
+ * observable behaviour is the same.
+ */
+OtelInstrumentationScope *
+otel_tracer_register(const char *name,
+					 const char *version,
+					 const char *schema_url)
+{
+	MemoryContext oldcxt;
+	OtelInstrumentationScope *scope;
+
+	if (name == NULL || name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("otel_tracer_register: name must be non-empty")));
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	scope = palloc(sizeof(*scope));
+	scope->name = pstrdup(name);
+	scope->version = version ? pstrdup(version) : NULL;
+	scope->schema_url = schema_url ? pstrdup(schema_url) : NULL;
+	MemoryContextSwitchTo(oldcxt);
+
+	return scope;
 }

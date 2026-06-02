@@ -197,6 +197,27 @@ typedef struct OtelKeyValue
 } OtelKeyValue;
 
 /*
+ * OTel InstrumentationScope: identifies the producer library that
+ * created a given span.  Exporters group spans by Scope into the
+ * "ScopeSpans" message in OTLP.
+ *
+ * A producer extension obtains a scope handle once at _PG_init via
+ * api->tracer_register() and caches it module-statically; every
+ * subsequent api->span_init() call takes the handle as its scope
+ * argument.  Pointers inside the struct (and the struct itself) are
+ * owned by contrib/otel and remain valid for the backend's lifetime,
+ * so exporters may cache them.
+ *
+ * Fields version and schema_url are optional and may be NULL.
+ */
+typedef struct OtelInstrumentationScope
+{
+	const char *name;			/* required: e.g. "contrib/otel_postgres_tracing" */
+	const char *version;		/* NULL if not declared */
+	const char *schema_url;		/* NULL if not declared */
+} OtelInstrumentationScope;
+
+/*
  * OTel Resource attribute: a key/value pair describing the postmaster
  * process emitting telemetry.  The full Resource is the array of such
  * attributes returned by OtelTracingApi.get_resource_attributes().
@@ -307,6 +328,15 @@ typedef enum OtelSamplerDecision
  */
 typedef struct OtelSpan
 {
+	/* InstrumentationScope --- which producer library created this
+	 * span.  Required.  Handle obtained at _PG_init via
+	 * api->tracer_register and cached module-statically; pointer
+	 * is borrowed and remains valid for the backend's lifetime.
+	 * Exporters group spans by scope into OTLP's ScopeSpans
+	 * messages; if NULL (a producer built against a stale header),
+	 * exporters fall back to a Resource-derived default scope. */
+	const OtelInstrumentationScope *scope;
+
 	/* W3C identity (lowercase hex, NUL-terminated).  trace_id and
 	 * trace_flags come from the propagated trace context; span_id is
 	 * generated locally; parent_span_id is the propagated parent
@@ -488,8 +518,15 @@ typedef void (*otel_span_emit_hook_type) (const OtelSpan *span);
  *
  * Pair with the rendezvous-struct entry points:
  *
+ *	   static const OtelInstrumentationScope *tracer;
+ *
+ *	   void _PG_init(void) {
+ *	       ...
+ *	       tracer = api->tracer_register("my_extension", "1.0", NULL);
+ *	   }
+ *
  *	   OtelSpan span;
- *	   otel_span_init(&span, "my.operation", OTEL_SPAN_KIND_INTERNAL);
+ *	   api->span_init(&span, tracer, "my.operation", OTEL_SPAN_KIND_INTERNAL);
  *	   otel_span_set_unwind_policy(&span, OTEL_UNWIND_ERROR);
  *	   api->span_link_to_active_and_push(&span);
  *	   ...
@@ -507,7 +544,7 @@ typedef void (*otel_span_emit_hook_type) (const OtelSpan *span);
  * with -fvisibility=hidden hide the symbols).  See the design
  * note in otel-trace-context-notes.md.
  *
- * Use api->span_init(&span, "name", KIND) and
+ * Use api->span_init(&span, scope, "name", KIND) and
  *	   api->span_add_attribute_string(&span, "k", "v")
  * (declared in otel_api.h via the OtelTracingApi struct).
  *

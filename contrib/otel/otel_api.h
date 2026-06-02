@@ -228,11 +228,15 @@ typedef struct OtelTracingApi
 	 * consumer modules across the cross-extension symbol-resolution
 	 * boundary on every supported platform.
 	 *
-	 *	   api->span_init(&span, "operation.name", KIND);
-	 *	     Generates fresh span_id, sets start_time = now, name,
-	 *	     kind; zeroes other fields including unwind_policy =
+	 *	   api->span_init(&span, scope, "operation.name", KIND);
+	 *	     Generates fresh span_id, sets start_time = now, scope,
+	 *	     name, kind; zeroes other fields including unwind_policy =
 	 *	     OTEL_UNWIND_DROP and sampler_decision =
-	 *	     RECORD_AND_SAMPLE.
+	 *	     RECORD_AND_SAMPLE.  `scope` must be a handle previously
+	 *	     returned by api->tracer_register (see below); NULL is
+	 *	     accepted only for compatibility with old producers and
+	 *	     causes exporters to fall back to a Resource-derived
+	 *	     default scope.
 	 *
 	 *	   api->span_add_attribute_string(&span, "key", "value");
 	 *	     Appends to the inline attrs[] array if room, else
@@ -243,6 +247,7 @@ typedef struct OtelTracingApi
 	 *	     them alive until api->span_emit returns.
 	 */
 	void	  (*span_init) (OtelSpan *span,
+							const OtelInstrumentationScope *scope,
 						    const char *name,
 						    OtelSpanKind kind);
 	bool	  (*span_add_attribute_string) (OtelSpan *span,
@@ -305,21 +310,31 @@ typedef struct OtelTracingApi
 	bool	  (*any_emit_consumer_present) (void);
 
 	/* --------------------------------------------------------------
-	 * Added in OTEL_TRACING_API minor 1:
+	 * Resource + InstrumentationScope identity.
 	 *
-	 * OTel Resource attributes describing the postmaster process.
-	 * Exporters apply these to every span batch / metric stream they
-	 * emit so the downstream collector can group telemetry by its
-	 * emitting process.  Returns a pointer to a process-local array
-	 * populated at _PG_init; writes the count into *n_out.  Pointers
-	 * within the returned array remain valid for the lifetime of the
-	 * backend, so exporters may cache them.
-	 *
+	 * get_resource_attributes returns a pointer to a process-local
+	 * array populated at _PG_init and writes the count into *n_out.
+	 * Resource describes the postmaster process; exporters apply it
+	 * to every span batch / metric stream they emit so the downstream
+	 * collector can group telemetry by its emitting process.
 	 * Consumers that want richer Resource (host.arch, os.type, ...)
-	 * merge their own attributes on top of what this function
-	 * returns.  See OtelResourceAttribute in otel.h.
+	 * merge their own attributes on top.  See OtelResourceAttribute
+	 * in otel.h.
+	 *
+	 * tracer_register is the producer-side InstrumentationScope
+	 * constructor.  Each producer extension calls it once from
+	 * _PG_init, caches the returned handle module-statically, and
+	 * passes the handle as the `scope` argument to every
+	 * api->span_init call.  Returns a pointer owned by contrib/otel;
+	 * valid for the backend's lifetime.  See OtelInstrumentationScope
+	 * in otel.h.  name must be non-empty; version and schema_url may
+	 * be NULL.
 	 * -------------------------------------------------------------- */
 	const OtelResourceAttribute *(*get_resource_attributes) (int *n_out);
+
+	OtelInstrumentationScope *(*tracer_register) (const char *name,
+												  const char *version,
+												  const char *schema_url);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */
