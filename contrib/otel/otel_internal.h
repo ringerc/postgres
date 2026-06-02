@@ -67,4 +67,15 @@ extern void otel_trace_install_hooks(void);
  * span event when a span is active.  No-op otherwise. */
 extern void otel_span_record_log_event(ErrorData *edata);
 
+/* Defined in otel_producer.c.  Producer-side API plumbed into the
+ * OtelTracingApi struct in otel_api.c. */
+extern void otel_producer_init(void);
+extern void otel_producer_span_link_to_active_and_push(OtelSpan *span);
+extern void otel_producer_span_set_parent_explicit(OtelSpan *span,
+												   const OtelSpanContext *parent);
+extern const OtelSpanContext *otel_producer_span_current_context(void);
+extern const OtelSpanContext *otel_producer_span_root_context(void);
+extern int otel_producer_span_stack_depth(void);
+extern void otel_producer_span_emit(OtelSpan *span);
+
 #endif							/* CONTRIB_OTEL_INTERNAL_H */
