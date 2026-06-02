@@ -536,3 +536,32 @@ test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(span.span_id));
 }
+
+/*
+ * test_otel_resource_attributes() → text
+ *
+ * Fetches the postmaster's Resource attribute array via the v2.1 API
+ * and serialises it as "key1=val1;key2=val2;..." for the TAP test to
+ * pattern-match.  Attribute order matches what otel_resource_init()
+ * pushes.
+ */
+PG_FUNCTION_INFO_V1(test_otel_resource_attributes);
+Datum
+test_otel_resource_attributes(PG_FUNCTION_ARGS)
+{
+	const OtelResourceAttribute *attrs;
+	int			n_attrs = 0;
+	StringInfoData buf;
+
+	attrs = cached_api->get_resource_attributes(&n_attrs);
+
+	initStringInfo(&buf);
+	for (int i = 0; i < n_attrs; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&buf, ';');
+		appendStringInfo(&buf, "%s=%s", attrs[i].key, attrs[i].value);
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}

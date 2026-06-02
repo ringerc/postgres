@@ -197,6 +197,29 @@ typedef struct OtelKeyValue
 } OtelKeyValue;
 
 /*
+ * OTel Resource attribute: a key/value pair describing the postmaster
+ * process emitting telemetry.  The full Resource is the array of such
+ * attributes returned by OtelTracingApi.get_resource_attributes().
+ *
+ * Resource attributes describe the *process* (service.name,
+ * service.instance.id, host.name, ...), in contrast to span
+ * attributes which describe an individual operation.  Exporters
+ * include the Resource alongside every metric stream / span batch
+ * they emit so a downstream OTel collector can group telemetry by
+ * its emitting process.
+ *
+ * The same Resource applies to traces and (when implemented) metrics
+ * emitted by the same postmaster.  Pointers in this struct are owned
+ * by contrib/otel and remain valid for the lifetime of the backend
+ * --- exporters may cache them without copying.
+ */
+typedef struct OtelResourceAttribute
+{
+	const char *key;
+	const char *value;
+} OtelResourceAttribute;
+
+/*
  * Common substrate of every captured event.
  *
  * The core is what gets captured first, unconditionally, with NO

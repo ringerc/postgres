@@ -34,6 +34,7 @@ tests += {
       't/004_sqlcommenter.pl',
       't/005_producer_api.pl',
       't/006_pgbouncer.pl',
+      't/007_resource.pl',
     ],
   },
 }

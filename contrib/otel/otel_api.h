@@ -82,7 +82,7 @@
 #define OTEL_API_MINOR(v)			((v) & OTEL_API_MINOR_MASK)
 
 #define OTEL_TRACING_API_MAJOR		2
-#define OTEL_TRACING_API_MINOR		0
+#define OTEL_TRACING_API_MINOR		1
 #define OTEL_TRACING_API_VERSION	OTEL_MAKE_VERSION(OTEL_TRACING_API_MAJOR, \
 													  OTEL_TRACING_API_MINOR)
 
@@ -303,6 +303,23 @@ typedef struct OtelTracingApi
 	 * built-in JSON-log emission is enabled.  The query-tracing
 	 * module uses this for the "no consumer -> drop" early-out. */
 	bool	  (*any_emit_consumer_present) (void);
+
+	/* --------------------------------------------------------------
+	 * Added in OTEL_TRACING_API minor 1:
+	 *
+	 * OTel Resource attributes describing the postmaster process.
+	 * Exporters apply these to every span batch / metric stream they
+	 * emit so the downstream collector can group telemetry by its
+	 * emitting process.  Returns a pointer to a process-local array
+	 * populated at _PG_init; writes the count into *n_out.  Pointers
+	 * within the returned array remain valid for the lifetime of the
+	 * backend, so exporters may cache them.
+	 *
+	 * Consumers that want richer Resource (host.arch, os.type, ...)
+	 * merge their own attributes on top of what this function
+	 * returns.  See OtelResourceAttribute in otel.h.
+	 * -------------------------------------------------------------- */
+	const OtelResourceAttribute *(*get_resource_attributes) (int *n_out);
 } OtelTracingApi;
 
 #endif							/* CONTRIB_OTEL_API_H */
