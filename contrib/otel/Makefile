@@ -27,9 +27,31 @@ ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+OTEL_PROBE_INC := $(shell $(PG_CONFIG) --includedir-server)
 else
 subdir = contrib/otel
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
+OTEL_PROBE_INC := $(top_srcdir)/src/include
+endif
+
+# Optional dependencies on core-postgres features.  contrib/otel can
+# build against an unpatched server by detecting these at compile time
+# and falling back to alternative paths when the features are absent.
+#
+#   OTEL_HAVE_PROTOCOL_HEADERS --- the 'M' RequestHeaders protocol
+#       message + RegisterProtocolHeaderHandler.  Without it, trace
+#       context can only enter via SET otel.traceparent or
+#       sqlcommenter.
+#
+#   OTEL_HAVE_ERRTRACE --- ErrorData.trace_id/span_id/trace_flags +
+#       errtrace() helper + %T/%S in log_line_prefix.  Without it,
+#       emit_log_hook injects trace context into edata->context
+#       instead so it still surfaces in textual log destinations.
+ifneq (,$(wildcard $(OTEL_PROBE_INC)/libpq/protocol_headers.h))
+PG_CPPFLAGS += -DOTEL_HAVE_PROTOCOL_HEADERS
+endif
+ifneq (,$(shell grep -l '^extern int[[:space:]].*errtrace' $(OTEL_PROBE_INC)/utils/elog.h 2>/dev/null))
+PG_CPPFLAGS += -DOTEL_HAVE_ERRTRACE
 endif
