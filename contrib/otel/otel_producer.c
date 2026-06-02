@@ -79,7 +79,9 @@
 
 #include <string.h>
 
+#include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "port.h"				/* pg_strong_random */
 #include "utils/elog.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -547,6 +549,106 @@ otel_producer_span_emit(OtelSpan *span)
 	}
 
 	dispatch_span(span);
+}
+
+
+/* ====================================================================
+ * Producer-side convenience helpers --- out-of-line companions to
+ * the static inlines in otel.h.
+ * ==================================================================== */
+
+/*
+ * Convert raw bytes to lowercase-hex.  Local copy because the
+ * matching helper in otel_trace.c is module-static.
+ */
+static void
+bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst)
+{
+	static const char hex[] = "0123456789abcdef";
+	size_t		i;
+
+	for (i = 0; i < n; i++)
+	{
+		dst[i * 2] = hex[(src[i] >> 4) & 0xF];
+		dst[i * 2 + 1] = hex[src[i] & 0xF];
+	}
+	dst[n * 2] = '\0';
+}
+
+void
+otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind)
+{
+	unsigned char buf[OTEL_SPAN_ID_LEN / 2];
+
+	memset(span, 0, sizeof(*span));
+
+	/* Generate fresh span_id.  pg_strong_random is overkill for
+	 * span IDs (8 random bytes is enough collision resistance for
+	 * any realistic trace volume) but it's the available API and
+	 * does the right thing. */
+	if (!pg_strong_random(buf, sizeof(buf)))
+	{
+		/* Random source unavailable --- degrade gracefully.  Use a
+		 * timestamp + pid mix for at least some uniqueness within
+		 * the backend. */
+		uint64		fallback = (uint64) GetCurrentTimestamp() ^ (uint64) MyProcPid;
+		memcpy(buf, &fallback, sizeof(buf));
+	}
+	bytes_to_lower_hex(buf, sizeof(buf), span->span_id);
+
+	span->name = name;
+	span->kind = kind;
+	span->status = OTEL_STATUS_UNSET;
+	span->sampler_decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
+	span->unwind_policy = OTEL_UNWIND_DROP;
+	span->start_time = GetCurrentTimestamp();
+}
+
+void
+otel_span_finalize(OtelSpan *span)
+{
+	span->end_time = GetCurrentTimestamp();
+}
+
+bool
+otel_span_add_attribute_string(OtelSpan *span, const char *key, const char *value)
+{
+	if (span->n_attrs < OTEL_INLINE_ATTRS)
+	{
+		span->attrs[span->n_attrs].key = key;
+		span->attrs[span->n_attrs].value = value;
+		span->n_attrs++;
+		return true;
+	}
+
+	/* Inline slots full; grow the overflow array by one.  Matches the
+	 * existing pattern in otel_trace.c's span_add_attr.  repalloc is
+	 * routed through the pointer's owning MemoryContext, so this is
+	 * safe across CurrentMemoryContext switches between calls.  On
+	 * OOM we silently drop the attribute --- best-effort
+	 * instrumentation. */
+	{
+		int			newcnt = span->n_overflow_attrs + 1;
+		OtelKeyValue *newarr;
+
+		if (span->overflow_attrs == NULL)
+			newarr = (OtelKeyValue *)
+				MemoryContextAllocExtended(CurrentMemoryContext,
+										   sizeof(OtelKeyValue) * newcnt,
+										   MCXT_ALLOC_NO_OOM);
+		else
+			newarr = (OtelKeyValue *)
+				repalloc_extended(span->overflow_attrs,
+								  sizeof(OtelKeyValue) * newcnt,
+								  MCXT_ALLOC_NO_OOM);
+		if (newarr == NULL)
+			return false;
+		newarr[newcnt - 1].key = key;
+		newarr[newcnt - 1].value = value;
+		span->overflow_attrs = newarr;
+		span->n_overflow_attrs = newcnt;
+		return true;
+	}
 }
 
 

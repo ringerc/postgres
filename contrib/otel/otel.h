@@ -402,4 +402,102 @@ typedef void (*otel_span_emit_hook_type) (const OtelSpan *span);
  */
 #include "otel_api.h"
 
+
+/* ====================================================================
+ * Producer-side convenience helpers.
+ *
+ * Inline / out-of-line helpers consumers use to construct spans
+ * before handing them to the OtelTracingApi.  All of these operate
+ * directly on the public OtelSpan struct --- no cross-module
+ * function-pointer calls --- so per-attribute overhead is a
+ * direct struct write.
+ *
+ * Pair with the rendezvous-struct entry points:
+ *
+ *	   OtelSpan span;
+ *	   otel_span_init(&span, "my.operation", OTEL_SPAN_KIND_INTERNAL);
+ *	   otel_span_set_unwind_policy(&span, OTEL_UNWIND_ERROR);
+ *	   api->span_link_to_active_and_push(&span);
+ *	   ...
+ *	   otel_span_add_attribute_string(&span, "key", "value");
+ *	   otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
+ *	   otel_span_finalize(&span);
+ *	   api->span_emit(&span);
+ * ==================================================================== */
+
+/*
+ * Initialise a fresh span.  Generates a new span_id, captures
+ * start_time = now, zeroes the rest of the struct, and stores
+ * caller-supplied name + kind.  parent_span_id and trace_id stay
+ * empty (zero); the api->span_link_to_active_and_push or
+ * api->span_set_parent_explicit call will populate them.
+ *
+ * `name` MUST point at memory that remains valid until span_emit
+ * returns (a string literal, a long-lived const char *, or a
+ * palloc'd buffer in the same MemoryContext as anything else the
+ * span references).  contrib/otel does not copy.
+ *
+ * Out-of-line --- generates random bytes for span_id, which is
+ * not appropriate to inline.
+ */
+extern void otel_span_init(OtelSpan *span, const char *name, OtelSpanKind kind);
+
+/*
+ * Append a string attribute to the span.  Writes into the inline
+ * attrs[] array if there's room; otherwise allocates an entry in
+ * the overflow_attrs array (in the consumer's CurrentMemoryContext
+ * for now --- callers wanting tighter control should set
+ * MemoryContext before calling).  Returns true on success, false
+ * on overflow allocation failure (silent drop --- best-effort
+ * instrumentation).
+ *
+ * `key` and `value` MUST be long-lived (see otel_span_init
+ * lifetime note).  contrib/otel does not copy.
+ *
+ * Out-of-line because of the overflow palloc; the common
+ * inline-attrs path is a 2-write fast path inside the function.
+ */
+extern bool otel_span_add_attribute_string(OtelSpan *span,
+										   const char *key,
+										   const char *value);
+
+/*
+ * Capture end_time = now.  Status is left at whatever the consumer
+ * set via otel_span_set_status (or OTEL_STATUS_UNSET if never
+ * set).
+ *
+ * Out-of-line to avoid pulling utils/timestamp.h into otel.h.
+ * One function call per span is irrelevant overhead.
+ */
+extern void otel_span_finalize(OtelSpan *span);
+
+/*
+ * Set span status + description.  description may be NULL (typical
+ * for OTEL_STATUS_OK and _UNSET).  description, if non-NULL, must
+ * be long-lived per the lifetime note above.
+ *
+ * Inline; two struct writes.
+ */
+static inline void
+otel_span_set_status(OtelSpan *span,
+					 OtelSpanStatus code,
+					 const char *description)
+{
+	span->status = code;
+	span->status_description = description;
+}
+
+/*
+ * Set the span's unwind policy.  Must be called before
+ * api->span_link_to_active_and_push --- the stack-entry copy is
+ * captured at push time; post-push changes are no-ops.
+ *
+ * Inline; one struct write.
+ */
+static inline void
+otel_span_set_unwind_policy(OtelSpan *span, OtelSpanUnwindPolicy policy)
+{
+	span->unwind_policy = policy;
+}
+
 #endif							/* CONTRIB_OTEL_H */
