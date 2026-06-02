@@ -12,9 +12,24 @@ if host_system == 'windows'
     '--FILEDESC', 'otel_postgres_tracing - OpenTelemetry instrumentation for PostgreSQL query execution',])
 endif
 
+# See contrib/otel/meson.build for the OTEL_HAVE_* feature gates.
+# otel_postgres_tracing only depends on OTEL_HAVE_ERRTRACE.
+otel_pgt_include_args = [
+  '-I' + meson.project_source_root() / 'src/include',
+  '-I' + meson.project_build_root() / 'src/include',
+]
+otel_pgt_cppflags = []
+if cc.compiles('''
+    #include "postgres.h"
+    #include "utils/elog.h"
+    int main(void) { return (int)(uintptr_t)&errtrace; }
+    ''', args: otel_pgt_include_args, name: 'errtrace declared in utils/elog.h')
+  otel_pgt_cppflags += '-DOTEL_HAVE_ERRTRACE'
+endif
+
 otel_postgres_tracing = shared_module('otel_postgres_tracing',
   otel_postgres_tracing_sources,
-  c_args: ['-I' + meson.project_source_root() / 'contrib' / 'otel'],
+  c_args: ['-I' + meson.project_source_root() / 'contrib' / 'otel'] + otel_pgt_cppflags,
   kwargs: contrib_mod_args,
 )
 contrib_targets += otel_postgres_tracing
