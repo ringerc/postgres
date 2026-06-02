@@ -68,9 +68,18 @@
  * Use OTEL_MAKE_VERSION(maj, min) to construct version literals.
  * Use OTEL_API_MAJOR(v) and OTEL_API_MINOR(v) to extract halfwords.
  */
-#define OTEL_MAKE_VERSION(maj, min)	(((uint32) (maj) << 16) | (uint16) (min))
-#define OTEL_API_MAJOR(v)			((v) >> 16)
-#define OTEL_API_MINOR(v)			((v) & 0xFFFFu)
+/* Halfword split for the 32-bit version field.  These are object-
+ * like macros (plain integer constants) rather than embedded
+ * literals inside the function-like macros below so bindgen and
+ * other FFI-binding generators that don't expand function-like
+ * macros can still see the shift / mask values. */
+#define OTEL_API_MAJOR_SHIFT		16
+#define OTEL_API_MINOR_MASK			0xFFFFu
+
+#define OTEL_MAKE_VERSION(maj, min)	(((uint32) (maj) << OTEL_API_MAJOR_SHIFT) | \
+									 (uint16) (min))
+#define OTEL_API_MAJOR(v)			((v) >> OTEL_API_MAJOR_SHIFT)
+#define OTEL_API_MINOR(v)			((v) & OTEL_API_MINOR_MASK)
 
 #define OTEL_TRACING_API_MAJOR		2
 #define OTEL_TRACING_API_MINOR		0
