@@ -1,10 +1,18 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
 # Coverage for the libpq client-side per-message protocol headers API
-# (PQattachHeader / PQclearHeaders / PQheadersAvailable).  Runs the
-# small libpq_headers helper binary in several modes against a cluster
-# with contrib/otel loaded as the header consumer, then verifies the
-# stdout and the server log.
+# (PQattachHeader / PQclearHeaders / PQheadersAvailable).
+#
+# The libpq_headers helper binary attaches a header under the
+# "test_tx." prefix and runs a no-op SELECT to drive the protocol
+# forward.  Server-side verification uses the test_protocol_headers
+# loadable module, which registers a transaction-scoped handler for
+# that prefix and logs every set/clear event.  The TAP test reads
+# the log between known offsets to confirm:
+#
+#   * the handler was invoked exactly when the client attached;
+#   * was NOT invoked when the client did not attach, or cleared the
+#     queue, or used a stale (already-flushed) queue.
 
 use strict;
 use warnings FATAL => 'all';
@@ -14,9 +22,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $TRACE_ID	= 'aabbccddeeff00112233445566778899';
-my $SPAN_ID	 = '0011223344556677';
-my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-01";
+my $VALUE = 'hello-from-the-test';
 
 # ----------------------------------------------------------------------
 # Cluster setup --- feature ENABLED on the server side.
@@ -25,13 +31,10 @@ my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-01";
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel'
-log_statement = 'all'
+shared_preload_libraries = 'test_protocol_headers'
 log_min_messages = log
-log_line_prefix = 'TR[%T] SP[%S] '
 EOCONF
 $node->start;
-$node->safe_psql('postgres', 'CREATE EXTENSION otel');
 
 my $conn_str = $node->connstr('postgres');
 
@@ -47,6 +50,28 @@ sub run_client
 	return ($rc, $stdout, $stderr);
 }
 
+# Helper: count occurrences of /set scope=transaction key=test_tx\.alpha
+# value=VALUE/ in the log slice since $offset.  test_protocol_headers
+# logs one such line per set event.
+sub count_sets
+{
+	my ($offset, $value) = @_;
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $offset);
+	my $re = qr/test_protocol_headers: set scope=transaction key=test_tx\.alpha value=\Q$value\E/;
+	return scalar(() = $log =~ /$re/g);
+}
+
+# Helper: count occurrences of any test_protocol_headers set line under
+# the test_tx prefix, ignoring the value.  Used for absence checks
+# where the client never attached anything and so no value was at risk.
+sub count_any_sets
+{
+	my ($offset) = @_;
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $offset);
+	return scalar(() =
+		$log =~ /test_protocol_headers: set scope=transaction key=test_tx\./g);
+}
+
 # ----------------------------------------------------------------------
 # Group 1: PQheadersAvailable reports server support correctly.
 # ----------------------------------------------------------------------
@@ -59,51 +84,54 @@ sub run_client
 }
 
 # ----------------------------------------------------------------------
-# Group 2: attach + SELECT delivers traceparent end-to-end.
+# Group 2: PQattachHeader + PQexec delivers the value to the server.
 # ----------------------------------------------------------------------
 
-my $log_offset = -s $node->logfile;
-
 {
-	my ($rc, $out, $err) = run_client('attach', $TRACEPARENT);
+	my $offset = -s $node->logfile;
+	my ($rc, $out, $err) = run_client('attach', $VALUE);
 	is($rc, 0, 'attach mode exited 0');
-	is($out, "$TRACEPARENT\n",
-		'PQattachHeader + PQexec delivers traceparent to the server');
+	is($out, "ok\n", 'attach mode reported ok');
+
+	# wait_for_log polls until the regex matches, so we don't race the
+	# log writer.
+	$node->wait_for_log(
+		qr/test_protocol_headers: set scope=transaction key=test_tx\.alpha value=\Q$VALUE\E/,
+		$offset);
+	is(count_sets($offset, $VALUE), 1,
+		'handler fired exactly once for one PQattachHeader + PQexec');
 }
 
-# Server log carries the trace context via log_line_prefix.
-$node->wait_for_log(
-	qr/TR\[$TRACE_ID\] SP\[$SPAN_ID\] LOG:\s+statement: SELECT coalesce\(otel_current_traceparent/,
-	$log_offset);
-pass('server log carries trace_id/span_id for the libpq-driven SELECT');
-
 # ----------------------------------------------------------------------
-# Group 3: no attach -> no trace context.
+# Group 3: no attach -> handler never fires.
 # ----------------------------------------------------------------------
-
-$log_offset = -s $node->logfile;
 
 {
+	my $offset = -s $node->logfile;
 	my ($rc, $out, $err) = run_client('none');
 	is($rc, 0, 'none mode exited 0');
-	is($out, "\n", 'without PQattachHeader, no trace context reaches server');
+	is($out, "ok\n", 'none mode reported ok');
+
+	# Give the server a moment to flush any pending log lines before we
+	# check.  Issuing a marker query + waiting for it serves as a
+	# barrier without depending on wall-clock sleep.
+	$node->safe_psql('postgres', 'SELECT 1');
+	is(count_any_sets($offset), 0,
+		'no PQattachHeader => no handler invocation');
 }
 
-my $log_after =
-  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
-like(
-	$log_after,
-	qr/TR\[\] SP\[\] LOG:\s+statement: SELECT coalesce\(otel_current_traceparent/,
-	'server log shows empty trace_id/span_id when no header attached');
-
 # ----------------------------------------------------------------------
-# Group 4: PQclearHeaders cancels a queued attach.
+# Group 4: PQclearHeaders cancels the queued attach.
 # ----------------------------------------------------------------------
 
 {
-	my ($rc, $out, $err) = run_client('clear', $TRACEPARENT);
+	my $offset = -s $node->logfile;
+	my ($rc, $out, $err) = run_client('clear', $VALUE);
 	is($rc, 0, 'clear mode exited 0');
-	is($out, "\n",
+	is($out, "ok\n", 'clear mode reported ok');
+
+	$node->safe_psql('postgres', 'SELECT 1');
+	is(count_any_sets($offset), 0,
 		'PQclearHeaders prevents the queued attach from being sent');
 }
 
@@ -112,10 +140,16 @@ like(
 # ----------------------------------------------------------------------
 
 {
-	my ($rc, $out, $err) = run_client('reuse', $TRACEPARENT);
+	my $offset = -s $node->logfile;
+	my ($rc, $out, $err) = run_client('reuse', $VALUE);
 	is($rc, 0, 'reuse mode exited 0');
-	is($out, "$TRACEPARENT\n\n",
-		'first SELECT has trace context; second SELECT does NOT (queue reset)');
+	is($out, "ok\n", 'reuse mode reported ok');
+
+	$node->wait_for_log(
+		qr/test_protocol_headers: set scope=transaction key=test_tx\.alpha value=\Q$VALUE\E/,
+		$offset);
+	is(count_sets($offset, $VALUE), 1,
+		'first SELECT triggers the handler; second SELECT does not (queue reset)');
 }
 
 # ----------------------------------------------------------------------

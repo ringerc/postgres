@@ -4,9 +4,12 @@
  *	  Tiny libpq client driver for the libpq_headers TAP test.
  *
  * Run with one of several modes; each mode exercises a specific aspect
- * of the per-message protocol-headers API.  Output goes to stdout with
- * a single result line (or one line per sub-step for the multi-step
- * modes), so the TAP harness can assert via string equality.
+ * of the per-message protocol-headers API.  The driver always emits a
+ * single short status line on stdout; the TAP harness asserts on that
+ * line and additionally inspects the server log to confirm that
+ * headers actually reached (or did not reach) the server.  Server-side
+ * verification relies on the test_protocol_headers loadable module,
+ * which logs every set/clear event from its registered handlers.
  *
  * Most modes require the server to have affirmatively negotiated
  * _pq_.headers --- this is checked at the top.  The not_negotiated
@@ -29,8 +32,20 @@
 
 #include "libpq-fe.h"
 
-#define SELECT_TRACEPARENT \
-	"SELECT coalesce(otel_current_traceparent(), '')"
+/*
+ * Use the test_protocol_headers handler's "test_tx." prefix.  That
+ * module is loaded via shared_preload_libraries in the TAP test and
+ * registers transaction-scoped logging for any key under this prefix.
+ */
+#define TEST_KEY		"test_tx.alpha"
+
+/*
+ * No-op SELECT used purely to drive the protocol forward after the
+ * client has queued (or chosen not to queue) headers.  The 'M' message,
+ * if queued, gets flushed by pqsendQueryStart before this query's Q
+ * message goes out, so the handler fires before the SELECT executes.
+ */
+#define SELECT_NOOP		"SELECT 1"
 
 
 static void
@@ -44,16 +59,16 @@ die_connerr(PGconn *conn, const char *what)
 }
 
 /*
- * Run a single one-row, one-column SELECT and return the value (an
- * empty string for NULL).  Caller frees nothing; the buffer is static.
+ * Run a one-row SELECT, discard the result.  Used to drive the
+ * protocol so any queued 'M' gets sent; we don't care about the
+ * row, only the side effect on the server.
  */
-static const char *
-run_select(PGconn *conn, const char *sql)
+static void
+run_noop(PGconn *conn)
 {
-	static char buf[256];
 	PGresult   *res;
 
-	res = PQexec(conn, sql);
+	res = PQexec(conn, SELECT_NOOP);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		fprintf(stderr, "libpq_headers: SELECT failed: %s",
@@ -62,29 +77,20 @@ run_select(PGconn *conn, const char *sql)
 		PQfinish(conn);
 		exit(1);
 	}
-	if (PQntuples(res) != 1 || PQnfields(res) != 1)
-	{
-		fprintf(stderr, "libpq_headers: unexpected result shape\n");
-		PQclear(res);
-		PQfinish(conn);
-		exit(1);
-	}
-	snprintf(buf, sizeof(buf), "%s", PQgetvalue(res, 0, 0));
 	PQclear(res);
-	return buf;
 }
 
 static void
 usage(const char *argv0)
 {
 	fprintf(stderr,
-			"usage: %s <conninfo> <mode> [<traceparent> ...]\n"
+			"usage: %s <conninfo> <mode> [<value> ...]\n"
 			"Modes:\n"
 			"  available                  print '1' if PQheadersAvailable, '0' otherwise\n"
-			"  attach <tp>                attach traceparent, SELECT, print result\n"
-			"  none                       SELECT only, print result\n"
-			"  clear <tp>                 attach, PQclearHeaders, SELECT, print result\n"
-			"  reuse <tp>                 attach, SELECT, SELECT again (no re-attach), print both\n"
+			"  attach <value>             attach test_tx.alpha=<value>, run SELECT, print 'ok'\n"
+			"  none                       SELECT only (no attach), print 'ok'\n"
+			"  clear <value>              attach, PQclearHeaders, run SELECT, print 'ok'\n"
+			"  reuse <value>              attach, two SELECTs (queue resets between them), print 'ok'\n"
 			"  null_key                   PQattachHeader(NULL key); print '0' if rejected\n"
 			"  not_negotiated             expect PQheadersAvailable=0; verify PQattachHeader rejects\n",
 			argv0);
@@ -124,17 +130,12 @@ main(int argc, char **argv)
 			PQfinish(conn);
 			return 1;
 		}
-		if (PQattachHeader(conn, "otel.traceparent",
-						   "00-aabbccddeeff00112233445566778899-0011223344556677-01"))
+		if (PQattachHeader(conn, TEST_KEY, "ignored"))
 		{
 			fprintf(stderr, "libpq_headers: PQattachHeader unexpectedly succeeded\n");
 			PQfinish(conn);
 			return 1;
 		}
-		/*
-		 * PQerrorMessage should be set; print the first non-empty line so
-		 * the TAP test can assert on it.
-		 */
 		printf("rejected\n");
 	}
 	else
@@ -150,38 +151,39 @@ main(int argc, char **argv)
 		{
 			if (argc != 4)
 				usage(argv[0]);
-			if (!PQattachHeader(conn, "otel.traceparent", argv[3]))
+			if (!PQattachHeader(conn, TEST_KEY, argv[3]))
 				die_connerr(conn, "PQattachHeader");
-			printf("%s\n", run_select(conn, SELECT_TRACEPARENT));
+			run_noop(conn);
+			printf("ok\n");
 		}
 		else if (strcmp(mode, "none") == 0)
 		{
-			printf("%s\n", run_select(conn, SELECT_TRACEPARENT));
+			run_noop(conn);
+			printf("ok\n");
 		}
 		else if (strcmp(mode, "clear") == 0)
 		{
 			if (argc != 4)
 				usage(argv[0]);
-			if (!PQattachHeader(conn, "otel.traceparent", argv[3]))
+			if (!PQattachHeader(conn, TEST_KEY, argv[3]))
 				die_connerr(conn, "PQattachHeader");
 			PQclearHeaders(conn);
-			/* After PQclearHeaders no 'M' is sent, so the SELECT sees no
-			 * trace context.  Expected output: empty string. */
-			printf("%s\n", run_select(conn, SELECT_TRACEPARENT));
+			run_noop(conn);
+			printf("ok\n");
 		}
 		else if (strcmp(mode, "reuse") == 0)
 		{
 			if (argc != 4)
 				usage(argv[0]);
-			if (!PQattachHeader(conn, "otel.traceparent", argv[3]))
+			if (!PQattachHeader(conn, TEST_KEY, argv[3]))
 				die_connerr(conn, "PQattachHeader");
-			/* First SELECT: header attached -> traceparent visible. */
-			printf("%s\n", run_select(conn, SELECT_TRACEPARENT));
-			/* Second SELECT: no re-attach.  The queue was consumed by the
-			 * first PQexec, and the per-transaction effect on the server
-			 * was cleared at the end of the implicit transaction around
-			 * the first SELECT.  Expected output: empty string. */
-			printf("%s\n", run_select(conn, SELECT_TRACEPARENT));
+			/* First SELECT: header attached -> handler fires on server. */
+			run_noop(conn);
+			/* Second SELECT: the queue was consumed by the first
+			 * PQexec.  No M is sent and no second set log line should
+			 * appear. */
+			run_noop(conn);
+			printf("ok\n");
 		}
 		else if (strcmp(mode, "null_key") == 0)
 		{
