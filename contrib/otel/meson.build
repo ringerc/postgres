@@ -26,14 +26,18 @@ otel_cppflags = []
 if cc.has_header('libpq/protocol_headers.h', args: otel_include_args)
   otel_cppflags += '-DOTEL_HAVE_PROTOCOL_HEADERS'
 endif
-# Detect errtrace() with a compile probe (has_header_symbol can't
-# include postgres.h's prerequisites cleanly).
-if cc.compiles('''
-    #include "postgres.h"
-    #include "utils/elog.h"
-    int main(void) { return (int)(uintptr_t)&errtrace; }
-    ''', args: otel_include_args, name: 'errtrace declared in utils/elog.h')
-  otel_cppflags += '-DOTEL_HAVE_ERRTRACE'
+# Detect errtrace() in utils/elog.h.  A compile probe doesn't work
+# here: utils/elog.h includes utils/errcodes.h, which is generated
+# at build time and isn't present yet when meson setup runs against
+# a fresh build directory.  Text-grep the header instead --- robust
+# and identical in behaviour to what the matching Makefile probe does.
+otel_fs = import('fs')
+otel_elog_h = meson.project_source_root() / 'src/include/utils/elog.h'
+if otel_fs.exists(otel_elog_h)
+  otel_elog_text = otel_fs.read(otel_elog_h)
+  if otel_elog_text.contains('errtrace(')
+    otel_cppflags += '-DOTEL_HAVE_ERRTRACE'
+  endif
 endif
 
 otel = shared_module('otel',
