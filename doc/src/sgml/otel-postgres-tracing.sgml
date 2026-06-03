@@ -1,0 +1,214 @@
+<!-- doc/src/sgml/otel-postgres-tracing.sgml -->
+
+<sect1 id="otel-postgres-tracing" xreflabel="otel_postgres_tracing">
+ <title>otel_postgres_tracing &mdash; query-level OpenTelemetry spans</title>
+
+ <indexterm zone="otel-postgres-tracing">
+  <primary>otel_postgres_tracing</primary>
+ </indexterm>
+
+ <para>
+  The <filename>otel_postgres_tracing</filename> module is the
+  query-instrumentation half of
+  <productname>PostgreSQL</productname>'s built-in OpenTelemetry
+  trace-context support.  It installs executor and utility hooks
+  that produce one OtelSpan per top-level statement, captures
+  <function>ereport</function> events as span events on the active
+  span, and threads parallel-worker spans onto the leader's span.
+  It is a consumer of the <xref linkend="otel"/> module's
+  <structname>OtelTracingApi</structname> rendezvous interface;
+  all cross-module work goes through that function-pointer table.
+ </para>
+
+ <para>
+  Span emission is gated by a sampler decision: spans are produced
+  only when a client-supplied trace context is propagated (via the
+  <literal>'M'</literal> protocol header,
+  <varname>otel.traceparent</varname>, or sqlcommenter), or when
+  <varname>otel.trace_all_queries</varname> is on.  This module
+  does not itself ship a wire-format exporter; an exporter
+  loadable module &mdash; in-tree
+  <filename>otel_demo_exporter</filename> or out-of-tree &mdash;
+  registers an emit callback through the
+  <structname>OtelTracingApi</structname> and translates the
+  emitted spans into OTLP, log lines, or any other format it
+  wants.
+ </para>
+
+ <sect2 id="otel-postgres-tracing-loading">
+  <title>Loading the module</title>
+
+  <para>
+   <filename>otel_postgres_tracing</filename> must be loaded via
+   <xref linkend="guc-shared-preload-libraries"/>, immediately
+   after <filename>otel</filename>:
+  </para>
+
+<programlisting>
+# postgresql.conf
+shared_preload_libraries = 'otel,otel_postgres_tracing'
+</programlisting>
+
+  <para>
+   Order matters.  <filename>otel</filename> publishes the
+   <structname>OtelTracingApi</structname> rendezvous variable at
+   its <function>_PG_init</function>;
+   <filename>otel_postgres_tracing</filename> looks it up at its
+   own <function>_PG_init</function>.  If the order is reversed or
+   if <filename>otel</filename> is missing,
+   <filename>otel_postgres_tracing</filename>'s
+   <function>_PG_init</function> emits <literal>FATAL</literal>.
+  </para>
+ </sect2>
+
+ <sect2 id="otel-postgres-tracing-configuration-parameters">
+  <title>Configuration Parameters</title>
+
+  <variablelist>
+   <varlistentry>
+    <term>
+     <varname>otel.trace_all_queries</varname> (<type>boolean</type>)
+     <indexterm>
+      <primary><varname>otel.trace_all_queries</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      When on, every top-level statement produces a span, even if
+      no client-supplied trace context was propagated.  The
+      backend synthesises a fresh trace_id for the orphan span.
+      Off by default; the common case is to trace only what the
+      client explicitly opted into.
+     </para>
+     <para>
+      Useful for development, ad-hoc diagnostic sessions, or
+      always-on capture in environments where the application
+      doesn't yet propagate trace context.  Imposes a per-statement
+      span-construction cost on every backend.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect2>
+
+ <sect2 id="otel-postgres-tracing-span-shape">
+  <title>What spans are produced</title>
+
+  <para>
+   <filename>otel_postgres_tracing</filename> emits one span per
+   top-level statement:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     <literal>ExecutorStart</literal> &rarr;
+     <literal>ExecutorEnd</literal> for ordinary DML / SELECT
+     statements.  Span name <literal>pgsql.execute</literal>;
+     <literal>kind = SERVER</literal>.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     <literal>ProcessUtility_hook</literal> for utility commands
+     (BEGIN/COMMIT, DDL, COPY, EXPLAIN, etc.).  Span name is the
+     statement's command tag (e.g. <literal>BEGIN</literal>,
+     <literal>CREATE TABLE</literal>);
+     <literal>kind = SERVER</literal>.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Nested executor invocations (PL/pgSQL function bodies,
+     triggers, IMMUTABLE-function planner-time invocations) do
+     NOT each get their own span by default; the outermost
+     statement owns the span and nested invocations are subsumed
+     into it.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   Span attributes follow OpenTelemetry semantic conventions
+   where possible: <literal>db.system</literal>,
+   <literal>db.name</literal>, <literal>db.statement</literal>,
+   <literal>db.user</literal>, <literal>net.peer.addr</literal>,
+   <literal>application_name</literal>.
+  </para>
+
+  <para>
+   Statement spans opt in to
+   <literal>OTEL_UNWIND_ERROR</literal>: if the executor unwinds
+   via <function>ereport(ERROR)</function> before
+   <literal>ExecutorEnd</literal>, the span is finalized with
+   <literal>OTEL_STATUS_ERROR</literal> and a descriptive reason
+   rather than being dropped.  Aborted queries appear in traces.
+  </para>
+
+  <para>
+   <function>ereport</function> events at WARNING level or higher
+   that fire during an active span are captured as span events
+   (with <literal>sqlstate</literal>,
+   <literal>filename</literal>, <literal>lineno</literal>,
+   <literal>message</literal>, <literal>detail</literal>,
+   <literal>hint</literal>).  An ERROR-level ereport also sets
+   the span's status to <literal>OTEL_STATUS_ERROR</literal>.
+  </para>
+ </sect2>
+
+ <sect2 id="otel-postgres-tracing-parallel">
+  <title>Parallel-query workers</title>
+
+  <para>
+   Parallel workers each emit their own statement span, with
+   <literal>parent_span_id</literal> set to the leader's span_id
+   rather than the client-supplied root span_id.  The leader
+   publishes its span identity to a per-backend shared-memory
+   slot at span-start; workers read the slot at their own
+   span-start.  See <xref linkend="otel-parallel-workers"/>.
+  </para>
+ </sect2>
+
+ <sect2 id="otel-postgres-tracing-exporters">
+  <title>Span emission and exporters</title>
+
+  <para>
+   <filename>otel_postgres_tracing</filename> emits spans through
+   the <structname>OtelTracingApi</structname>'s
+   <literal>span_emit</literal> dispatch.  Registered exporter
+   hooks (set via
+   <literal>api-&gt;register_emit_hook</literal>) receive each
+   span as an in-memory <structname>OtelSpan</structname>.  Two
+   in-tree exporters demonstrate the pattern:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     The JSON-log fallback emitter that ships with
+     <filename>otel</filename>, controlled by
+     <varname>otel.emit_spans_to_log</varname>.  Emits each span
+     as a structured LOG line; useful for development and for
+     deployments where an out-of-tree exporter is not feasible.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     <filename>otel_demo_exporter</filename>, a minimal
+     file-based exporter that writes one JSON line per span to a
+     configurable path.  Demonstrates how an out-of-tree
+     exporter registers against the rendezvous API.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   Out-of-tree exporters &mdash; including SDK-backed exporters
+   such as <ulink url="https://github.com/ringerc/postgres_otel_tracing_demo">postgres_otel_tracing_demo</ulink>
+   (Rust, opentelemetry-rust SDK) &mdash; consume the same
+   rendezvous interface.  Adding an exporter does not require
+   modifying <filename>otel</filename> or
+   <filename>otel_postgres_tracing</filename>.
+  </para>
+ </sect2>
+</sect1>

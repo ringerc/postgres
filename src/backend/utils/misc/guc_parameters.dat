@@ -2106,6 +2106,24 @@
   max => 'MAX_BACKENDS',
 },
 
+{ name => 'max_protocol_header_entries', type => 'int', context => 'PGC_SIGHUP', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Maximum number of entries in a single RequestHeaders protocol message.',
+  long_desc => 'Caps the number of key/value entries the server will accept in one RequestHeaders message. A larger message is treated as a protocol violation.',
+  variable => 'max_protocol_header_entries',
+  boot_val => '64',
+  min => '0',
+  max => '1024',
+},
+
+{ name => 'max_protocol_header_size', type => 'int', context => 'PGC_SIGHUP', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Maximum size in bytes of a single RequestHeaders protocol message body.',
+  long_desc => 'Caps the total size of the body of one RequestHeaders message. A larger message is treated as a protocol violation. Capped by the v3 protocol\'s small-message limit (10000 bytes).',
+  variable => 'max_protocol_header_size',
+  boot_val => '4096',
+  min => '256',
+  max => '10000',
+},
+
 { name => 'max_repack_replication_slots', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SENDING',
   short_desc => 'Sets the maximum number of replication slots for use by REPACK.',
   variable => 'max_repack_replication_slots',
@@ -2402,6 +2420,13 @@
   variable => 'PrimarySlotName',
   boot_val => '""',
   check_hook => 'check_primary_slot_name',
+},
+
+{ name => 'protocol_headers', type => 'bool', context => 'PGC_SIGHUP', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Accept per-message RequestHeaders (\'M\') protocol messages.',
+  long_desc => 'When on, clients may opt in via the _pq_.headers startup option and send RequestHeaders messages. When off, the _pq_.headers option is reported as unrecognized and any incoming RequestHeaders message is a protocol violation.',
+  variable => 'protocol_headers_enabled',
+  boot_val => 'true',
 },
 
 { name => 'quote_all_identifiers', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',

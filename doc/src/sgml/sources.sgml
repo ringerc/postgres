@@ -392,6 +392,24 @@ ereport(ERROR,
      too much.
     </para>
    </listitem>
+   <listitem>
+    <para>
+     <function>errtrace(const char *trace_id, const char *span_id,
+     const char *trace_flags)</function> attaches a W3C Trace Context
+     (<literal>trace-id</literal>, <literal>span-id</literal>, and
+     <literal>trace-flags</literal>, each as a lowercase hexadecimal
+     string) to the current error or log message.  Any argument may be
+     <literal>NULL</literal> to leave that component unset.  The values
+     are not validated; callers are responsible for supplying values
+     conformant to <ulink url="https://www.w3.org/TR/trace-context/">
+     W3C Trace Context</ulink>.  Attached fields are emitted by the
+     CSV and JSON log writers and are available to
+     <varname>log_line_prefix</varname> via the <literal>%T</literal>
+     and <literal>%S</literal> escapes.  Trace context is intentionally
+     not sent to the client: trace propagation is one-way from client
+     to server, so the originating client already holds the context.
+    </para>
+   </listitem>
   </itemizedlist>
    </para>
 

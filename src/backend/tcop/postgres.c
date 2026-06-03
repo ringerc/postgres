@@ -45,6 +45,7 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
+#include "libpq/protocol_headers.h"
 #include "mb/pg_wchar.h"
 #include "mb/stringinfo_mb.h"
 #include "miscadmin.h"
@@ -443,6 +444,12 @@ SocketBackend(StringInfo inBuf)
 			ignore_till_sync = false;
 			/* mark not-extended, so that a new error doesn't begin skip */
 			doing_extended_query_message = false;
+			break;
+
+		case PqMsg_RequestHeaders:
+			maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
+			/* RequestHeaders precedes another operation and does not by
+			 * itself put us into extended-query mode. */
 			break;
 
 		case PqMsg_CopyData:
@@ -4400,6 +4407,15 @@ PostgresMain(const char *dbname, const char *username)
 	BeginReportingGUCOptions();
 
 	/*
+	 * Advertise the protocol-level features negotiated for this connection
+	 * (e.g. _pq_.headers).  This rides on the initial ParameterStatus burst
+	 * that proxies are accustomed to relaying, so a client can distinguish
+	 * "server agreed" from "an intermediary stripped my opt-in and the
+	 * absence of NegotiateProtocolVersion is meaningless".
+	 */
+	SendProtocolFeaturesParameterStatus();
+
+	/*
 	 * Also set up handler to log session end; we have to wait till now to be
 	 * sure Log_disconnections has its final value.
 	 */
@@ -4454,6 +4470,12 @@ PostgresMain(const char *dbname, const char *username)
 	MemoryContextSwitchTo(row_description_context);
 	initStringInfo(&row_description_buf);
 	MemoryContextSwitchTo(TopMemoryContext);
+
+	/*
+	 * Register transaction- and proc-exit callbacks used to clear the
+	 * effects of per-message protocol headers at scope boundaries.
+	 */
+	ProtocolHeadersInit();
 
 	/* Fire any defined login event triggers, if appropriate */
 	EventTriggerOnLogin();
@@ -4770,6 +4792,14 @@ PostgresMain(const char *dbname, const char *username)
 							   (double) auth_duration / NS_PER_US));
 			}
 
+			/*
+			 * Tear down per-statement protocol-header effects before the
+			 * next command-read.  Statement-scope handlers expect their
+			 * state to be valid through the end of the operation that
+			 * the headers preceded, but no further.
+			 */
+			ClearStatementScopeHeaders();
+
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;
 		}
@@ -5059,6 +5089,19 @@ PostgresMain(const char *dbname, const char *username)
 				finish_xact_command();
 				valgrind_report_error_query("SYNC message");
 				send_ready_for_query = true;
+				break;
+
+			case PqMsg_RequestHeaders:
+
+				/*
+				 * Per-message protocol headers.  Negotiated at startup via
+				 * the _pq_.headers option; ProcessRequestHeadersMessage()
+				 * enforces the negotiation and configured caps.  The
+				 * message produces no reply on its own --- the effect is
+				 * delivered via registered handlers and the next
+				 * operation's response carries any visible result.
+				 */
+				ProcessRequestHeadersMessage(&input_message);
 				break;
 
 				/*
