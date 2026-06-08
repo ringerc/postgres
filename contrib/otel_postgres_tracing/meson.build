@@ -13,7 +13,7 @@ if host_system == 'windows'
 endif
 
 # See contrib/otel/meson.build for the OTEL_HAVE_* feature gates.
-# otel_postgres_tracing only depends on OTEL_HAVE_ERRTRACE.  Text-grep
+# otel_postgres_tracing only depends on OTEL_HAVE_ERRANNOT.  Text-grep
 # the header (not a compile probe) because elog.h pulls in
 # errcodes.h, which is generated at build time and isn't present yet
 # when meson setup runs.
@@ -22,8 +22,8 @@ otel_pgt_fs = import('fs')
 otel_pgt_elog_h = meson.project_source_root() / 'src/include/utils/elog.h'
 if otel_pgt_fs.exists(otel_pgt_elog_h)
   otel_pgt_elog_text = otel_pgt_fs.read(otel_pgt_elog_h)
-  if otel_pgt_elog_text.contains('errtrace(')
-    otel_pgt_cppflags += '-DOTEL_HAVE_ERRTRACE'
+  if otel_pgt_elog_text.contains('errannot(')
+    otel_pgt_cppflags += '-DOTEL_HAVE_ERRANNOT'
   endif
 endif
 

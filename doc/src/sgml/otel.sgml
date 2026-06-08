@@ -260,14 +260,16 @@ shared_preload_libraries = 'otel,otel_postgres_tracing'
    or via the in-process active-span stack), core
    <productname>PostgreSQL</productname>'s JSON and CSV log writers
    include <literal>trace_id</literal>, <literal>span_id</literal>,
-   and <literal>trace_flags</literal> as top-level fields, and the
-   <literal>%T</literal> / <literal>%S</literal>
+   and <literal>trace_flags</literal> as annotations under those
+   well-known keys, and the <literal>%{trace_id}A</literal> /
+   <literal>%{span_id}A</literal> / <literal>%{trace_flags}A</literal>
    <xref linkend="guc-log-line-prefix"/> escapes substitute them into
-   plain-text log lines.  This is implemented in the core elog/ereport
-   machinery; <filename>otel</filename> populates the
-   <structname>ErrorData</structname> fields via an
-   <varname>emit_log_hook</varname>-style integration when a span is
-   active.
+   plain-text log lines.  This is implemented via the core
+   <function>errannot</function> annotation API on
+   <structname>ErrorData</structname>;
+   <filename>otel_postgres_tracing</filename> attaches the annotations
+   from an <varname>emit_log_hook</varname>-style integration when a
+   span is active.
   </para>
  </sect2>
 </sect1>

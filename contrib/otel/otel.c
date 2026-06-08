@@ -72,11 +72,12 @@
  *
  * Behaviour:
  *
- *	 * The header handler is registered at
- *	   PROTOCOL_HEADER_SCOPE_TRANSACTION; one 'M' before BEGIN (or
- *	   before a one-shot Parse/Bind/Execute) installs context for
- *	   every statement until COMMIT/ROLLBACK or the end of the
- *	   implicit transaction.  Last-write-wins.
+ *	 * The header handler is registered at the dispatcher's single
+ *	   on-set entry point; we install our own XactCallback to clear
+ *	   the in-memory derived state at top-level transaction end.
+ *	   One 'M' before BEGIN (or before a one-shot Parse/Bind/Execute)
+ *	   installs context for every statement until COMMIT/ROLLBACK or
+ *	   the end of the implicit transaction.  Last-write-wins.
  *	 * An emit_log_hook (in otel_log.c) fills ErrorData.trace_id /
  *	   span_id / trace_flags when not already set, so the built-in
  *	   JSON-log, CSV-log, and log_line_prefix %T / %S escapes pick
@@ -101,12 +102,15 @@
  *	 The PRIMARY entry point is the per-message 'M' RequestHeaders
  *	 protocol message: the client sends an otel.traceparent header
  *	 with the next Query, the handler attaches it for the duration
- *	 of that transaction, and it auto-clears at COMMIT / ROLLBACK
- *	 because the header handler is registered at scope
- *	 PROTOCOL_HEADER_SCOPE_TRANSACTION.  Drivers that implement the
- *	 'M' message (e.g. via libpq's PQattachHeader, see
- *	 src/test/modules/libpq_headers/) get the scoping and the
- *	 zero-extra-round-trip behaviour for free.
+ *	 of that transaction, and our XactCallback (otel_xact_callback)
+ *	 auto-clears it at top-level COMMIT / ROLLBACK / PREPARE.  Note
+ *	 that dispatch is deferred --- core's protocol-headers
+ *	 dispatcher invokes our set_cb at the start of the next
+ *	 Query/Parse/Bind/Execute, so a handler error fails the SQL
+ *	 operation rather than producing a standalone error.  Drivers
+ *	 that implement the 'M' message (e.g. via libpq's
+ *	 PQattachHeader, see src/test/modules/libpq_headers/) get the
+ *	 scoping and the zero-extra-round-trip behaviour for free.
  *
  *	 ALTERNATIVELY, clients may set the GUCs directly with SQL:
  *
@@ -151,7 +155,8 @@
  *		 single-statement-per-message protocol use (each Query
  *		 message can carry its own headers) and naturally
  *		 transaction-scoped under explicit BEGIN/COMMIT because
- *		 the handler is registered at TRANSACTION scope.
+ *		 our otel_xact_callback clears the in-memory derived
+ *		 state at top-level transaction end.
  *	   * Connection-pooler interaction.  SET state on a pooled
  *		 connection in TRANSACTION or STATEMENT mode pooling can
  *		 leak the trace context to whichever client happens to
@@ -181,6 +186,7 @@
 
 #include <string.h>
 
+#include "access/xact.h"
 #include "fmgr.h"
 #ifdef OTEL_HAVE_PROTOCOL_HEADERS
 #include "libpq/protocol_headers.h"
@@ -289,10 +295,27 @@ assign_traceparent(const char *newval, void *extra)
 
 #ifdef OTEL_HAVE_PROTOCOL_HEADERS
 /*
+ * Tracks whether the in-memory otel_ctx was last populated by an 'M'
+ * header (as opposed to a user-issued SET or a sqlcommenter parse).
+ * Read by otel_xact_callback to decide whether to clear at top-level
+ * transaction end --- only M-installed context is transaction-scoped
+ * by default; SET-installed context lives at whatever scope the user
+ * chose (SET = session; SET LOCAL = transaction, handled by the GUC
+ * machinery itself).
+ */
+static bool otel_ctx_from_M_header = false;
+
+/*
  * Header set callback: invoked once per matching entry in an incoming
  * RequestHeaders message.  Routes through SetConfigOption so the GUC
  * machinery propagates to parallel workers and triggers the assign
  * hook (which updates the in-memory derived state).
+ *
+ * Note: dispatch is deferred by the core dispatcher --- this callback
+ * fires at the start of the next Query / Parse / Bind / Execute, not
+ * on receipt of the 'M' message itself.  A handler ERROR thus
+ * propagates as that SQL operation's ERROR.  See
+ * src/backend/libpq/protocol_headers.c for the rationale.
  */
 static void
 otel_set_cb(const char *key, const char *value, void *cb_ctx)
@@ -318,15 +341,42 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
 							 value[0] == '\0' ? NULL : value,
 							 PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SET, true, LOG, false);
+
+	/*
+	 * Mark the in-memory state as M-installed so otel_xact_callback
+	 * will clear it at top-level transaction end.  We check
+	 * otel_ctx.is_set so that if the GUC machinery rejected the value
+	 * (malformed traceparent), we don't promise a clear that doesn't
+	 * correspond to anything.  Note that traceparent is the
+	 * load-bearing key; we don't flag tracestate-only sets because
+	 * tracestate without traceparent is not a meaningful trace
+	 * context.
+	 */
+	if (otel_ctx.is_set)
+		otel_ctx_from_M_header = true;
 }
 
 /*
- * Header clear callback: invoked at the handler's scope boundary
- * (transaction end).
+ * Transaction-end cleanup of M-installed trace context.
+ *
+ * The protocol-headers dispatcher in core is intentionally lifecycle-
+ * free: it only routes (key, value) entries to our set_cb and does
+ * nothing about scope.  We install this XactCallback to mirror the
+ * previous PROTOCOL_HEADER_SCOPE_TRANSACTION behaviour --- a header
+ * installed via 'M' applies until the top-level transaction ends, at
+ * which point the in-memory derived state is reset.
+ *
+ * Only context installed via 'M' is cleared here.  Context installed
+ * via SET / SET LOCAL is owned by the GUC machinery and lives at
+ * whatever scope the user chose.  Without this discrimination, a
+ * naive xact-end reset would clobber SET-installed values too, which
+ * would defeat the user's session-scope intent.  The
+ * otel_ctx_from_M_header flag is set by otel_set_cb (only on
+ * successful traceparent application) and cleared here.
  *
  * Resets the in-memory derived state directly --- DO NOT attempt to
  * reset the backing GUCs via set_config_option here.  This function
- * runs from inside a XactCallback during AbortTransaction (or
+ * runs from inside the XactCallback chain during AbortTransaction (or
  * CommitTransaction), and any set_config_option call from that
  * context is part of the same transaction that is now ending: on
  * the abort path the GUC change gets rolled back to whatever the
@@ -339,11 +389,37 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
  * the GUC cleanly.  SHOW otel.traceparent may briefly show a stale
  * value between an aborted transaction and the next assignment ---
  * a known cosmetic limitation.
+ *
+ * Subtransactions are deliberately NOT instrumented --- no
+ * RegisterSubXactCallback is installed.  Header context set inside a
+ * SAVEPOINT block survives a ROLLBACK TO that savepoint; it clears
+ * only at top-level COMMIT/ROLLBACK/PREPARE.  Matches the contract
+ * that test_protocol_headers documents for transaction-scope keys,
+ * and matches what the previous PROTOCOL_HEADER_SCOPE_TRANSACTION
+ * registration did.
  */
 static void
-otel_clear_cb(void *cb_ctx)
+otel_xact_callback(XactEvent event, void *arg)
 {
-	otel_ctx_reset();
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			if (otel_ctx_from_M_header)
+			{
+				otel_ctx_reset();
+				otel_ctx_from_M_header = false;
+			}
+			break;
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+		case XACT_EVENT_PRE_PREPARE:
+			/* nothing */
+			break;
+	}
 }
 #endif							/* OTEL_HAVE_PROTOCOL_HEADERS */
 
@@ -467,11 +543,15 @@ _PG_init(void)
 	MarkGUCPrefixReserved("otel");
 
 #ifdef OTEL_HAVE_PROTOCOL_HEADERS
-	RegisterProtocolHeaderHandler("otel.",
-								  PROTOCOL_HEADER_SCOPE_TRANSACTION,
-								  otel_set_cb,
-								  otel_clear_cb,
-								  NULL);
+	/*
+	 * Register the per-message header handler.  Core's dispatcher is
+	 * lifecycle-free: it routes our prefix to otel_set_cb and that's
+	 * all.  Our own XactCallback below provides the
+	 * "clear-at-transaction-end" behaviour that used to live in the
+	 * dispatcher under PROTOCOL_HEADER_SCOPE_TRANSACTION.
+	 */
+	RegisterProtocolHeaderHandler("otel.", otel_set_cb, NULL);
+	RegisterXactCallback(otel_xact_callback, NULL);
 #endif
 
 	/* otel_log_install_hooks() and otel_trace_install_hooks() moved

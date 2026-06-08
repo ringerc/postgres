@@ -29,7 +29,7 @@ OTEL_PROBE_INC := $(top_srcdir)/src/include
 endif
 
 # See contrib/otel/Makefile for the OTEL_HAVE_* feature gates.
-# otel_postgres_tracing only depends on OTEL_HAVE_ERRTRACE.
-ifneq (,$(shell grep -l '^extern int[[:space:]].*errtrace' $(OTEL_PROBE_INC)/utils/elog.h 2>/dev/null))
-PG_CPPFLAGS += -DOTEL_HAVE_ERRTRACE
+# otel_postgres_tracing only depends on OTEL_HAVE_ERRANNOT.
+ifneq (,$(shell grep -l '^extern int[[:space:]].*errannot' $(OTEL_PROBE_INC)/utils/elog.h 2>/dev/null))
+PG_CPPFLAGS += -DOTEL_HAVE_ERRANNOT
 endif

@@ -45,13 +45,15 @@ endif
 #       context can only enter via SET otel.traceparent or
 #       sqlcommenter.
 #
-#   OTEL_HAVE_ERRTRACE --- ErrorData.trace_id/span_id/trace_flags +
-#       errtrace() helper + %T/%S in log_line_prefix.  Without it,
-#       emit_log_hook injects trace context into edata->context
-#       instead so it still surfaces in textual log destinations.
+#   OTEL_HAVE_ERRANNOT --- generic errannot() / errannotf() helpers
+#       and ErrorAnnotation list on ErrorData; %A / %{key}A in
+#       log_line_prefix; trace context surfaces as named annotations
+#       in JSON/CSV log output.  Without it, emit_log_hook injects
+#       trace context into edata->context as a textual fallback so
+#       it still surfaces in textual log destinations.
 ifneq (,$(wildcard $(OTEL_PROBE_INC)/libpq/protocol_headers.h))
 PG_CPPFLAGS += -DOTEL_HAVE_PROTOCOL_HEADERS
 endif
-ifneq (,$(shell grep -l '^extern int[[:space:]].*errtrace' $(OTEL_PROBE_INC)/utils/elog.h 2>/dev/null))
-PG_CPPFLAGS += -DOTEL_HAVE_ERRTRACE
+ifneq (,$(shell grep -l '^extern int[[:space:]].*errannot' $(OTEL_PROBE_INC)/utils/elog.h 2>/dev/null))
+PG_CPPFLAGS += -DOTEL_HAVE_ERRANNOT
 endif

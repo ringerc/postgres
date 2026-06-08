@@ -6,17 +6,17 @@
  *	  operator can correlate a log line back to the trace it
  *	  belongs to.
  *
- *	  When core postgres has the native trace-context fields on
- *	  ErrorData (the OTEL_HAVE_ERRTRACE feature), we fill
- *	  edata->trace_id / span_id / trace_flags directly.  The built-
- *	  in log writers then surface them via JSON keys, CSV columns,
- *	  and the %T / %S log_line_prefix escapes --- structured,
- *	  machine-parseable.
+ *	  When core postgres has the structured-annotation API on
+ *	  ErrorData (the OTEL_HAVE_ERRANNOT feature), we attach
+ *	  trace_id / span_id / trace_flags as annotations.  The built-
+ *	  in log writers then surface them via JSON keys, the
+ *	  annotations object in CSV, and the %A / %{key}A
+ *	  log_line_prefix escapes --- structured, machine-parseable.
  *
- *	  When core postgres lacks those fields (an unpatched server),
- *	  we fall back to appending a "trace_id=... span_id=... " line
- *	  to edata->context so the trace context still appears in the
- *	  textual log output, just less structured.
+ *	  When core postgres lacks the annotation API (an unpatched
+ *	  server), we fall back to appending a "trace_id=... span_id=... "
+ *	  line to edata->context so the trace context still appears in
+ *	  the textual log output, just less structured.
  *
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -57,9 +57,10 @@ otel_log_install_hooks(void)
  * emit_log_hook entry point.
  *
  *	1. Surface trace context in the log line.  When core postgres
- *	   has the native ErrorData.trace_id/span_id/trace_flags
- *	   fields, fill those.  Otherwise append a trace_id=... line
- *	   to edata->context as a less-structured fallback.
+ *	   supports structured annotations on ErrorData, attach
+ *	   trace_id / span_id / trace_flags as annotations under their
+ *	   well-known keys.  Otherwise append a trace_id=... line to
+ *	   edata->context as a less-structured fallback.
  *	2. Hand the ereport to the span event-capture path in
  *	   otel_trace.c; it handles the active-span check, the elevel
  *	   gate, and the ERROR-status update internally.
@@ -76,20 +77,30 @@ otel_emit_log_hook(ErrorData *edata)
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(edata->assoc_context);
 
-#ifdef OTEL_HAVE_ERRTRACE
-		if (edata->trace_id == NULL)
-			edata->trace_id = pstrdup(rc.trace_id);
-		if (edata->span_id == NULL)
-			edata->span_id = pstrdup(rc.span_id);
-		if (edata->trace_flags == NULL)
-			edata->trace_flags = pstrdup(rc.trace_flags);
+#ifdef OTEL_HAVE_ERRANNOT
+		/*
+		 * errannot() operates on errordata[errordata_stack_depth]
+		 * which is what emit_log_hook receives as edata, so
+		 * attaching here updates the same ErrorData the log writers
+		 * are about to read.  set_annotation() in core uses
+		 * find-or-append semantics under each key, so a chained hook
+		 * that previously set the same key replaces rather than
+		 * stacking.  We deliberately do NOT pre-check whether a
+		 * previous hook set the annotation: the most-recent
+		 * hook-installed trace context is the most authoritative for
+		 * this log line.
+		 */
+		errannot(ERRANNOT_KEY_TRACE_ID, rc.trace_id);
+		errannot(ERRANNOT_KEY_SPAN_ID, rc.span_id);
+		errannot(ERRANNOT_KEY_TRACE_FLAGS, rc.trace_flags);
 #else
 		/*
-		 * Fallback for unpatched servers without ErrorData trace
-		 * fields: append a "trace_id=... span_id=... trace_flags=..."
-		 * line to edata->context.  Less structured than the native
-		 * path (no JSON keys / CSV columns / %T %S prefix), but it
-		 * preserves the correlation in the textual log output.
+		 * Fallback for unpatched servers without ErrorData
+		 * annotations: append a "trace_id=... span_id=...
+		 * trace_flags=..." line to edata->context.  Less
+		 * structured than the native path (no JSON keys / CSV
+		 * column / %A %{key}A prefix), but it preserves the
+		 * correlation in the textual log output.
 		 *
 		 * Skipped when the context already mentions our trace_id ---
 		 * the chained prev_emit_log_hook may have appended an

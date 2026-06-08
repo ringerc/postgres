@@ -26,7 +26,7 @@ otel_cppflags = []
 if cc.has_header('libpq/protocol_headers.h', args: otel_include_args)
   otel_cppflags += '-DOTEL_HAVE_PROTOCOL_HEADERS'
 endif
-# Detect errtrace() in utils/elog.h.  A compile probe doesn't work
+# Detect errannot() in utils/elog.h.  A compile probe doesn't work
 # here: utils/elog.h includes utils/errcodes.h, which is generated
 # at build time and isn't present yet when meson setup runs against
 # a fresh build directory.  Text-grep the header instead --- robust
@@ -35,8 +35,8 @@ otel_fs = import('fs')
 otel_elog_h = meson.project_source_root() / 'src/include/utils/elog.h'
 if otel_fs.exists(otel_elog_h)
   otel_elog_text = otel_fs.read(otel_elog_h)
-  if otel_elog_text.contains('errtrace(')
-    otel_cppflags += '-DOTEL_HAVE_ERRTRACE'
+  if otel_elog_text.contains('errannot(')
+    otel_cppflags += '-DOTEL_HAVE_ERRANNOT'
   endif
 endif
 

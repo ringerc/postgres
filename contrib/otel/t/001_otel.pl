@@ -3,7 +3,7 @@
 # End-to-end test for the contrib/otel module: register the otel.*
 # protocol-header handler, parse a W3C traceparent received from the
 # client, and propagate the trace context into log emission via the
-# emit_log_hook + log_line_prefix %T/%S integration.
+# emit_log_hook + log_line_prefix %{key}A annotation escapes.
 #
 # The test bashes the v3 wire protocol on a raw socket so it can send
 # RequestHeaders ('M') messages, which no libpq API yet exposes.
@@ -31,7 +31,7 @@ $node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel,otel_postgres_tracing'
 log_statement = 'all'
 log_min_messages = log
-log_line_prefix = 'TR[%T] SP[%S] '
+log_line_prefix = 'TR[%{trace_id}A] SP[%{span_id}A] '
 EOCONF
 $node->start;
 
