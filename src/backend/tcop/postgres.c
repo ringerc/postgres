@@ -110,6 +110,9 @@ int			client_connection_check_interval = 0;
 /* flags for non-system relation kinds to restrict use */
 int			restrict_nonsystem_relation_kind;
 
+/* Hook fired just before each ReadyForQuery; see tcopprot.h. */
+pre_ready_for_query_hook_type pre_ready_for_query_hook = NULL;
+
 /*
  * Include signal sender PID/UID in the server log when available
  * (SA_SIGINFO). The caller must supply the already-captured pid and uid
@@ -4769,6 +4772,16 @@ PostgresMain(const char *dbname, const char *username)
 							   (double) fork_duration / NS_PER_US,
 							   (double) auth_duration / NS_PER_US));
 			}
+
+			/*
+			 * Fire pre_ready_for_query_hook so extensions can run any
+			 * end-of-command-cycle teardown they need.  See the
+			 * declaration in tcop/tcopprot.h for the naming rationale
+			 * and a discussion of how this differs from a per-statement
+			 * hook.
+			 */
+			if (pre_ready_for_query_hook != NULL)
+				pre_ready_for_query_hook();
 
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;
