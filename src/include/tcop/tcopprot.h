@@ -46,6 +46,39 @@ extern PGDLLIMPORT int log_statement;
 
 extern PGDLLIMPORT int restrict_nonsystem_relation_kind;
 
+/*
+ * Hook fired by PostgresMain just before each ReadyForQuery message
+ * is sent.  This is the v3 protocol cycle boundary: the moment after
+ * which PostgresMain tells the client "I'm idle again."  Useful for
+ * extensions that need to run end-of-command-cycle teardown ---
+ * notably, a useful place to hook end-of-statement cleanup that
+ * cannot be expressed cleanly via the existing per-statement /
+ * per-utility hooks.
+ *
+ * Naming: this hook is named after its exact wire-protocol call
+ * site (mirroring the project's ExecutorStart_hook /
+ * post_parse_analyze_hook / emit_log_hook convention), and NOT
+ * end_of_statement_hook, because ReadyForQuery is NOT per-statement:
+ *
+ *	 - A simple-Query message carrying multiple SQL statements (e.g.
+ *	   "SELECT 1; SELECT 2;") produces a single ReadyForQuery after
+ *	   all of them complete.
+ *	 - In the extended-query protocol, every Bind/Execute cycle
+ *	   between two Syncs shares a single ReadyForQuery (one per
+ *	   Sync).
+ *	 - ReadyForQuery is also emitted after error-recovery skip-till-
+ *	   Sync, after CopyDone / CopyFail completion, and other
+ *	   non-statement protocol transitions.
+ *
+ * Hooks that genuinely require per-statement granularity should
+ * combine post_parse_analyze_hook, ExecutorEnd_hook, and
+ * ProcessUtility_hook.  This hook is the right place when the unit
+ * of work is "one network round-trip cycle" --- i.e. when the unit
+ * the extension cares about is bounded by ReadyForQuery messages.
+ */
+typedef void (*pre_ready_for_query_hook_type) (void);
+extern PGDLLIMPORT pre_ready_for_query_hook_type pre_ready_for_query_hook;
+
 extern List *pg_parse_query(const char *query_string);
 extern List *pg_rewrite_query(Query *query);
 extern List *pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,
