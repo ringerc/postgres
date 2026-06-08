@@ -93,6 +93,16 @@
                                         # disconnection while running queries;
                                         # 0 for never
 
+# - Per-message protocol headers -
+
+#protocol_headers = on                  # accept _pq_.headers opt-in and
+                                        # RequestHeaders ('M') messages
+#max_protocol_header_entries = 64       # max entries per RequestHeaders;
+                                        # 0 disables the feature at handshake
+#max_protocol_header_size = 4096        # max bytes per (key, value) entry,
+                                        # including NUL terminators;
+                                        # 0 disables the feature at handshake
+
 # - Authentication -
 
 #authentication_timeout = 1min          # 1s-600s
