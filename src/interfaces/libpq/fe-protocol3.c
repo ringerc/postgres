@@ -1526,6 +1526,18 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 			libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported unsupported parameter name without a \"%s\" prefix (\"%s\")", "_pq_.", conn->workBuffer.data);
 			goto failure;
 		}
+		if (strcmp(conn->workBuffer.data, "_pq_.headers") == 0)
+		{
+			/*
+			 * The server does not support per-message headers (either too
+			 * old, or has the feature disabled).  Nothing to track here;
+			 * conn->headersAvailable defaults to false and is flipped to
+			 * true only by an affirmative "protocol_features"
+			 * ParameterStatus, so a NegotiateProtocolVersion mention of
+			 * _pq_.headers leaves it false as desired.
+			 */
+			continue;
+		}
 		libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"%s\")",
 								conn->workBuffer.data);
 		goto failure;
@@ -2502,6 +2514,16 @@ build_startup_packet(const PGconn *conn, char *packet,
 
 	if (conn->client_encoding_initial && conn->client_encoding_initial[0])
 		ADD_STARTUP_OPTION("client_encoding", conn->client_encoding_initial);
+
+	/*
+	 * Advertise support for per-message protocol headers (RequestHeaders,
+	 * 'M').  Old servers, and servers with the feature disabled, will
+	 * report the option as unrecognized via NegotiateProtocolVersion;
+	 * acceptance is confirmed by a "protocol_features" ParameterStatus
+	 * later, not by the absence of NegotiateProtocolVersion (an
+	 * intermediary may have stripped the option).
+	 */
+	ADD_STARTUP_OPTION("_pq_.headers", "1");
 
 	/* Add any environment-driven GUC settings needed */
 	for (next_eo = options; next_eo->envName; next_eo++)
