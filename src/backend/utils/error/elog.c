@@ -1801,9 +1801,10 @@ static const char *const reserved_annotation_keys[] = {
 	"leader_pid",
 	"line_num",
 	"message",
+	ERRANNOT_KEY_REJECTED,		/* "pg_rejected_annotations" */
 	"pid",
-	ERRANNOT_KEY_REJECTED,
 	"ps",
+	"query_id",
 	"remote_host",
 	"remote_port",
 	"session_id",
@@ -1814,7 +1815,6 @@ static const char *const reserved_annotation_keys[] = {
 	"txid",
 	"user",
 	"vxid",
-	"query_id",
 };
 
 static int
@@ -4040,26 +4040,63 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 				{
 					/*
 					 * %{key}A --- emit the value of a single annotation
-					 * by name (or empty if not set / unknown letter).
+					 * by name, or empty if not set.
+					 *
+					 * The key must match the same syntax as is accepted
+					 * by errannot(): [A-Za-z_][A-Za-z0-9_.:-]*.  We scan
+					 * for valid key characters and then require '}A' to
+					 * follow; anything else is a format error.
+					 *
+					 * On format error we consume the entire malformed
+					 * escape so it does not bleed into the literal text:
+					 *   - if a '}' was found but the trailing letter is
+					 *     not 'A', consume through that wrong letter
+					 *     (move p to point at it; the outer loop's p++
+					 *     advances past it);
+					 *   - if no '}' was found before the first non-key
+					 *     character (including end-of-string), consume
+					 *     up to but not including that character (the
+					 *     outer loop will then emit it literally).
 					 */
-					const char *keystart = p + 1;
-					const char *keyend;
+					const char *q = p + 1;
 					char	   *key;
 					ErrorAnnotation *ann;
 
-					keyend = strchr(keystart, '}');
-					if (keyend == NULL)
-						break;		/* unterminated brace: ignore */
-					if (keyend[1] != 'A')
-						break;		/* only %{...}A is defined */
+					if (!((*q >= 'A' && *q <= 'Z') ||
+						  (*q >= 'a' && *q <= 'z') ||
+						  *q == '_'))
+					{
+						/*
+						 * No valid key start.  Leave p at '{' so the
+						 * outer p++ skips just the '{'; the next loop
+						 * iteration will emit any remaining content
+						 * literally.
+						 */
+						break;
+					}
+					q++;
+					while ((*q >= 'A' && *q <= 'Z') ||
+						   (*q >= 'a' && *q <= 'z') ||
+						   (*q >= '0' && *q <= '9') ||
+						   *q == '_' || *q == '.' ||
+						   *q == ':' || *q == '-')
+						q++;
 
-					/* point p at the trailing 'A' so the for-loop's p++
-					 * leaves us on the character after it */
-					p = keyend + 1;
+					if (*q != '}' || q[1] != 'A')
+					{
+						if (*q == '}')
+							p = q + 1;	/* consume %{key}X including X */
+						else
+							p = q - 1;	/* consume %{key, non-key char emits literally */
+						break;
+					}
 
-					key = pnstrdup(keystart, keyend - keystart);
+					/* Good case: q at '}', q[1] is 'A'. */
+					key = pnstrdup(p + 1, q - (p + 1));
 					ann = find_annotation(edata->annotations, key);
 					pfree(key);
+
+					p = q + 1;	/* point at 'A'; outer p++ moves past */
 
 					if (ann != NULL)
 					{
