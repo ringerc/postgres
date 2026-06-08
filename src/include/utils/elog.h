@@ -229,6 +229,29 @@ extern int	internalerrquery(const char *query);
 
 extern int	err_generic_string(int field, const char *str);
 
+extern int	errannot(const char *key, const char *value);
+extern int	errannotf(const char *key, const char *fmt, ...) pg_attribute_printf(2, 3);
+
+/*
+ * Well-known annotation keys.  Core call sites and extensions that emit
+ * standard observability attributes should use these constants rather than
+ * literal strings so that spellings stay consistent across the tree.
+ *
+ * Keys not listed here may also be used freely; the only constraint is the
+ * reserved-name list checked inside errannot() (see elog.c).
+ */
+#define ERRANNOT_KEY_TRACE_ID		"trace_id"
+#define ERRANNOT_KEY_SPAN_ID		"span_id"
+#define ERRANNOT_KEY_TRACE_FLAGS	"trace_flags"
+
+/*
+ * Reserved aggregator key used to surface annotation attempts that collided
+ * with a core-owned JSON log field name.  Its value is a comma-separated
+ * list of rejected key names (values are intentionally discarded; see
+ * elog.c).  Extensions may NOT call errannot() with this key.
+ */
+#define ERRANNOT_KEY_REJECTED		"pg_rejected_annotations"
+
 extern int	geterrcode(void);
 extern int	geterrposition(void);
 extern int	getinternalerrposition(void);
@@ -427,6 +450,19 @@ extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
 /* Stuff that error handlers might want to use */
 
 /*
+ * ErrorAnnotation is one key/value pair attached to an ErrorData via
+ * errannot().  Annotations are surfaced in JSON and CSV log output and via
+ * the %A / %{key}A log_line_prefix escapes, but are not propagated over the
+ * v3 error/notice wire protocol.
+ */
+typedef struct ErrorAnnotation
+{
+	char	   *key;
+	char	   *value;
+	struct ErrorAnnotation *next;
+} ErrorAnnotation;
+
+/*
  * ErrorData holds the data accumulated during any one ereport() cycle.
  * Any non-NULL pointers must point to palloc'd data.
  * (The const pointers are an exception; we assume they point at non-freeable
@@ -460,6 +496,8 @@ typedef struct ErrorData
 	int			cursorpos;		/* cursor index into query string */
 	int			internalpos;	/* cursor index into internalquery */
 	char	   *internalquery;	/* text of internally-generated query */
+	ErrorAnnotation *annotations;	/* k/v annotations attached via
+									 * errannot(), or NULL */
 	int			saved_errno;	/* errno at entry */
 
 	/* context containing associated non-constant strings */
