@@ -724,6 +724,15 @@ pqDropServerData(PGconn *conn)
 		}
 		conn->be_cancel_key_len = 0;
 	}
+
+	/*
+	 * Drop any queued protocol headers and clear the negotiation flag.  A
+	 * fresh handshake will re-confirm headersAvailable via protocol_features;
+	 * carrying headers or the flag across a reset would either send stale
+	 * metadata or misreport the new connection's capabilities.
+	 */
+	pqReleaseQueuedHeaders(conn);
+	conn->headersAvailable = false;
 }
 
 
@@ -5176,6 +5185,11 @@ freePGconn(PGconn *conn)
 	free(conn->inBuffer);
 	free(conn->outBuffer);
 	free(conn->rowBuf);
+
+	/* Drop any queued protocol headers and the array itself. */
+	pqReleaseQueuedHeaders(conn);
+	free(conn->queuedHeaders);
+
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 
