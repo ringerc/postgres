@@ -374,6 +374,13 @@ pgsa_read_from_disk(void)
 						 errmsg("syntax error in file \"%s\" line %u: expected end of line",
 								PGSA_DUMP_FILE, lineno)));
 
+			/* Reject overlong stash names. */
+			if (strlen(name) >= NAMEDATALEN)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("syntax error in file \"%s\" line %u: stash name too long",
+								PGSA_DUMP_FILE, lineno)));
+
 			/* Duplicate check. */
 			(void) pgsa_saved_stash_table_insert(saved_stashes, name, &found);
 			if (found)
@@ -432,7 +439,7 @@ pgsa_read_from_disk(void)
 
 			/* Parse the query ID. */
 			errno = 0;
-			queryId = strtoll(queryid_str, &endptr, 10);
+			queryId = strtoi64(queryid_str, &endptr, 10);
 			if (*endptr != '\0' || errno != 0 || queryid_str == endptr ||
 				queryId == 0)
 				ereport(ERROR,

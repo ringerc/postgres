@@ -40,6 +40,7 @@
 #include "access/toast_internals.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -897,12 +898,20 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 				replident;
 	Oid			ident_idx;
 
+	if (wal_level < WAL_LEVEL_REPLICA)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("cannot execute %s in this configuration",
+					   "REPACK (CONCURRENTLY)"),
+				errdetail("%s requires \"wal_level\" to be set to \"replica\" or higher.",
+						  "REPACK (CONCURRENTLY)"));
+
 	/* Data changes in system relations are not logically decoded. */
 	if (IsCatalogRelation(rel))
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is not supported for catalog relations.",
 						"REPACK (CONCURRENTLY)"));
 
@@ -913,8 +922,8 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	if (IsToastRelation(rel))
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is not supported for TOAST relations.",
 						"REPACK (CONCURRENTLY)"));
 
@@ -922,20 +931,26 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	if (relpersistence != RELPERSISTENCE_PERMANENT)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is only allowed for permanent relations.",
 						"REPACK (CONCURRENTLY)"));
 
-	/* With NOTHING, WAL does not contain the old tuple. */
+	/*
+	 * With NOTHING, WAL does not contain the old tuple; FULL is not yet
+	 * supported.
+	 */
 	replident = rel->rd_rel->relreplident;
-	if (replident == REPLICA_IDENTITY_NOTHING)
+	if (replident == REPLICA_IDENTITY_NOTHING ||
+		replident == REPLICA_IDENTITY_FULL)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
-				errhint("Relation \"%s\" has insufficient replication identity.",
-						RelationGetRelationName(rel)));
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errdetail("%s does not support tables with %s.",
+						  "REPACK (CONCURRENTLY)",
+						  replident == REPLICA_IDENTITY_NOTHING ?
+						  "REPLICA IDENTITY NOTHING" : "REPLICA IDENTITY FULL"));
 
 	/*
 	 * Obtain the replica identity index -- either one that has been set
@@ -946,12 +961,25 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	 */
 	ident_idx = GetRelationIdentityOrPK(rel);
 	if (!OidIsValid(ident_idx))
+	{
+		/* This special case warrants its own error message */
+		if (OidIsValid(rel->rd_pkindex) && rel->rd_ispkdeferrable)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot execute %s on relation \"%s\"",
+						   "REPACK (CONCURRENTLY)",
+						   RelationGetRelationName(rel)),
+					errdetail("%s does not support deferrable primary keys.",
+							  "REPACK (CONCURRENTLY)"),
+					errhint("Use ALTER TABLE ... REPLICA IDENTITY USING INDEX to designate another index as replica identity."));
+
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot process relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("Relation \"%s\" has no identity index.",
 						RelationGetRelationName(rel)));
+	}
 
 	*ident_idx_p = ident_idx;
 }
@@ -2572,7 +2600,7 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 			/* Find the tuple to be deleted */
 			found = find_target_tuple(rel, chgcxt, spilled_tuple, ondisk_tuple);
 			if (!found)
-				elog(ERROR, "failed to find target tuple");
+				elog(ERROR, "could not find target tuple");
 			apply_concurrent_delete(rel, ondisk_tuple);
 		}
 		else if (kind == CHANGE_UPDATE_NEW)
@@ -2588,7 +2616,7 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 			/* Find the tuple to be updated or deleted. */
 			found = find_target_tuple(rel, chgcxt, key, ondisk_tuple);
 			if (!found)
-				elog(ERROR, "failed to find target tuple");
+				elog(ERROR, "could not find target tuple");
 
 			/*
 			 * If 'tup' contains TOAST pointers, they point to the old
@@ -2665,7 +2693,9 @@ apply_concurrent_update(Relation rel, TupleTableSlot *spilled_tuple,
 							 &tmfd, &lockmode, &update_indexes);
 	if (res != TM_Ok)
 		ereport(ERROR,
-				errmsg("failed to apply concurrent UPDATE"));
+				errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("could not apply concurrent %s on relation \"%s\"",
+					   "UPDATE", RelationGetRelationName(rel)));
 
 	if (update_indexes != TU_None)
 	{
@@ -2701,7 +2731,9 @@ apply_concurrent_delete(Relation rel, TupleTableSlot *slot)
 
 	if (res != TM_Ok)
 		ereport(ERROR,
-				errmsg("failed to apply concurrent DELETE"));
+				errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("could not apply concurrent %s on relation \"%s\"",
+					   "DELETE", RelationGetRelationName(rel)));
 
 	pgstat_progress_incr_param(PROGRESS_REPACK_HEAP_TUPLES_DELETED, 1);
 }
@@ -2996,7 +3028,7 @@ initialize_change_context(ChangeContext *chgcxt,
 		}
 	}
 	if (chgcxt->cc_ident_index == NULL)
-		elog(ERROR, "failed to find identity index");
+		elog(ERROR, "could not find identity index");
 
 	/* Set up for scanning said identity index */
 	{
@@ -3408,21 +3440,22 @@ static void
 start_repack_decoding_worker(Oid relid)
 {
 	Size		size;
-	dsm_segment *seg;
 	DecodingWorkerShared *shared;
 	shm_mq	   *mq;
-	shm_mq_handle *mqh;
 	BackgroundWorker bgw;
+
+	decoding_worker = palloc0_object(DecodingWorker);
 
 	/* Setup shared memory. */
 	size = BUFFERALIGN(offsetof(DecodingWorkerShared, error_queue)) +
 		BUFFERALIGN(REPACK_ERROR_QUEUE_SIZE);
-	seg = dsm_create(size, 0);
-	shared = (DecodingWorkerShared *) dsm_segment_address(seg);
+	decoding_worker->seg = dsm_create(size, 0);
+
+	shared = (DecodingWorkerShared *) dsm_segment_address(decoding_worker->seg);
 	shared->initialized = false;
 	shared->lsn_upto = InvalidXLogRecPtr;
 	shared->done = false;
-	SharedFileSetInit(&shared->sfs, seg);
+	SharedFileSetInit(&shared->sfs, decoding_worker->seg);
 	shared->last_exported = -1;
 	SpinLockInit(&shared->mutex);
 	shared->dbid = MyDatabaseId;
@@ -3441,7 +3474,8 @@ start_repack_decoding_worker(Oid relid)
 	mq = shm_mq_create((char *) BUFFERALIGN(shared->error_queue),
 					   REPACK_ERROR_QUEUE_SIZE);
 	shm_mq_set_receiver(mq, MyProc);
-	mqh = shm_mq_attach(mq, seg, NULL);
+
+	decoding_worker->error_mqh = shm_mq_attach(mq, decoding_worker->seg, NULL);
 
 	memset(&bgw, 0, sizeof(bgw));
 	snprintf(bgw.bgw_name, BGW_MAXLEN,
@@ -3454,18 +3488,14 @@ start_repack_decoding_worker(Oid relid)
 	bgw.bgw_restart_time = BGW_NEVER_RESTART;
 	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "RepackWorkerMain");
-	bgw.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+	bgw.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(decoding_worker->seg));
 	bgw.bgw_notify_pid = MyProcPid;
 
-	decoding_worker = palloc0_object(DecodingWorker);
 	if (!RegisterDynamicBackgroundWorker(&bgw, &decoding_worker->handle))
 		ereport(ERROR,
 				errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				errmsg("out of background worker slots"),
 				errhint("You might need to increase \"%s\".", "max_worker_processes"));
-
-	decoding_worker->seg = seg;
-	decoding_worker->error_mqh = mqh;
 
 	/*
 	 * The decoding setup must be done before the caller can have XID assigned
@@ -3499,38 +3529,43 @@ start_repack_decoding_worker(Oid relid)
 static void
 stop_repack_decoding_worker(void)
 {
-	BgwHandleStatus status;
-
-	/* Haven't reached the worker startup? */
+	/* Nothing to do if no worker was set up. */
 	if (decoding_worker == NULL)
 		return;
 
-	/* Could not register the worker? */
-	if (decoding_worker->handle == NULL)
-		return;
+	/* Terminate the worker process, if one is running. */
+	if (decoding_worker->handle != NULL)
+	{
+		BgwHandleStatus status;
 
-	TerminateBackgroundWorker(decoding_worker->handle);
-	/* The worker should really exit before the REPACK command does. */
-	HOLD_INTERRUPTS();
-	status = WaitForBackgroundWorkerShutdown(decoding_worker->handle);
-	RESUME_INTERRUPTS();
+		TerminateBackgroundWorker(decoding_worker->handle);
+		/* The worker should really exit before the REPACK command does. */
+		HOLD_INTERRUPTS();
+		status = WaitForBackgroundWorkerShutdown(decoding_worker->handle);
+		RESUME_INTERRUPTS();
 
-	if (status == BGWH_POSTMASTER_DIED)
-		ereport(FATAL,
-				errcode(ERRCODE_ADMIN_SHUTDOWN),
-				errmsg("postmaster exited during REPACK command"));
-
-	shm_mq_detach(decoding_worker->error_mqh);
+		if (status == BGWH_POSTMASTER_DIED)
+			ereport(FATAL,
+					errcode(ERRCODE_ADMIN_SHUTDOWN),
+					errmsg("postmaster exited during REPACK command"));
+	}
 
 	/*
-	 * If we could not cancel the current sleep due to ERROR, do that before
-	 * we detach from the shared memory the condition variable is located in.
-	 * If we did not, the bgworker ERROR handling code would try and fail
-	 * badly.
+	 * Now detach from our shared memory segment.  In error cases there might
+	 * still be messages from the worker in the queue, which ProcessInterrupts
+	 * would try to read; this is pointless (and causes an assertion failure),
+	 * so set the global pointer to NULL to have ProcessRepackMessages ignore
+	 * them.
+	 *
+	 * We must also cancel the current sleep, if one is still set up.  This is
+	 * critical because the CV lives in the DSM that we're about to detach, so
+	 * if we omit it, later automatic cleanup tries to clear freed memory.
 	 */
+	if (decoding_worker->error_mqh != NULL)
+		shm_mq_detach(decoding_worker->error_mqh);
 	ConditionVariableCancelSleep();
-
-	dsm_detach(decoding_worker->seg);
+	if (decoding_worker->seg != NULL)
+		dsm_detach(decoding_worker->seg);
 	pfree(decoding_worker);
 	decoding_worker = NULL;
 }

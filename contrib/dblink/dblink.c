@@ -1995,6 +1995,9 @@ dblink_fdw_validator(PG_FUNCTION_ARGS)
 							 closest_match) : 0 :
 					 errhint("There are no valid options in this context.")));
 		}
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			(void) defGetBoolean(def);	/* accept only boolean values */
 	}
 
 	PG_RETURN_VOID();
@@ -3116,8 +3119,15 @@ static bool
 is_valid_dblink_fdw_option(const PQconninfoOption *options, const char *option,
 						   Oid context)
 {
-	if (strcmp(option, "use_scram_passthrough") == 0)
-		return true;
+	/*
+	 * These options are only valid for foreign server or user mapping
+	 * contexts
+	 */
+	if (context == ForeignServerRelationId || context == UserMappingRelationId)
+	{
+		if (strcmp(option, "use_scram_passthrough") == 0)
+			return true;
+	}
 
 	return is_valid_dblink_option(options, option, context);
 }
@@ -3231,12 +3241,18 @@ appendSCRAMKeysInfo(StringInfo buf)
 }
 
 
+/*
+ * Return whether SCRAM pass-through is enabled.
+ *
+ * If use_scram_passthrough is specified in both the foreign server
+ * and the user mapping, the user mapping setting takes precedence.
+ */
 static bool
 UseScramPassthrough(ForeignServer *foreign_server, UserMapping *user)
 {
 	ListCell   *cell;
 
-	foreach(cell, foreign_server->options)
+	foreach(cell, user->options)
 	{
 		DefElem    *def = lfirst(cell);
 
@@ -3244,7 +3260,7 @@ UseScramPassthrough(ForeignServer *foreign_server, UserMapping *user)
 			return defGetBoolean(def);
 	}
 
-	foreach(cell, user->options)
+	foreach(cell, foreign_server->options)
 	{
 		DefElem    *def = (DefElem *) lfirst(cell);
 

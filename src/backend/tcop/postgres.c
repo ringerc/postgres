@@ -45,6 +45,7 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
+#include "libpq/protocol_headers.h"
 #include "mb/pg_wchar.h"
 #include "mb/stringinfo_mb.h"
 #include "miscadmin.h"
@@ -109,6 +110,9 @@ int			client_connection_check_interval = 0;
 
 /* flags for non-system relation kinds to restrict use */
 int			restrict_nonsystem_relation_kind;
+
+/* Hook fired just before each ReadyForQuery; see tcopprot.h. */
+pre_ready_for_query_hook_type pre_ready_for_query_hook = NULL;
 
 /*
  * Include signal sender PID/UID in the server log when available
@@ -443,6 +447,12 @@ SocketBackend(StringInfo inBuf)
 			ignore_till_sync = false;
 			/* mark not-extended, so that a new error doesn't begin skip */
 			doing_extended_query_message = false;
+			break;
+
+		case PqMsg_RequestHeaders:
+			maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
+			/* RequestHeaders precedes another operation and does not by
+			 * itself put us into extended-query mode. */
 			break;
 
 		case PqMsg_CopyData:
@@ -4400,6 +4410,15 @@ PostgresMain(const char *dbname, const char *username)
 	BeginReportingGUCOptions();
 
 	/*
+	 * Advertise the protocol-level features negotiated for this connection
+	 * (e.g. _pq_.headers).  This rides on the initial ParameterStatus burst
+	 * that proxies are accustomed to relaying, so a client can distinguish
+	 * "server agreed" from "an intermediary stripped my opt-in and the
+	 * absence of NegotiateProtocolVersion is meaningless".
+	 */
+	SendProtocolFeaturesParameterStatus();
+
+	/*
 	 * Also set up handler to log session end; we have to wait till now to be
 	 * sure Log_disconnections has its final value.
 	 */
@@ -4557,6 +4576,17 @@ PostgresMain(const char *dbname, const char *username)
 		ReplicationSlotCleanup(false);
 
 		jit_reset_after_error();
+
+		/*
+		 * Drop any RequestHeaders entries stashed from a prior 'M'
+		 * message but not yet dispatched.  The ERROR we're recovering
+		 * from may itself have been raised by ApplyPendingRequestHeaders
+		 * mid-iteration, leaving the tail of the list undispatched; or
+		 * it may have come from anywhere else, in which case we still
+		 * want any 'M' that arrived in this command cycle dropped so
+		 * it does not silently apply to the next operation.
+		 */
+		ResetPendingRequestHeaders();
 
 		/*
 		 * Now return to normal top-level context and clear ErrorContext for
@@ -4770,6 +4800,16 @@ PostgresMain(const char *dbname, const char *username)
 							   (double) auth_duration / NS_PER_US));
 			}
 
+			/*
+			 * Fire pre_ready_for_query_hook so extensions can run any
+			 * end-of-command-cycle teardown they need.  See the
+			 * declaration in tcop/tcopprot.h for the naming rationale
+			 * and a discussion of how this differs from a per-statement
+			 * hook.
+			 */
+			if (pre_ready_for_query_hook != NULL)
+				pre_ready_for_query_hook();
+
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;
 		}
@@ -4844,6 +4884,15 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
+					/*
+					 * Apply any RequestHeaders pending from an earlier 'M'
+					 * message.  A handler ERROR here becomes this Query's
+					 * ERROR, which is exactly the binding we want: the
+					 * client sees the failure scoped to the operation the
+					 * headers were intended to prefix.
+					 */
+					ApplyPendingRequestHeaders();
+
 					query_string = pq_getmsgstring(&input_message);
 					pq_getmsgend(&input_message);
 
@@ -4873,6 +4922,9 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
+					/* See ApplyPendingRequestHeaders comment in Query case. */
+					ApplyPendingRequestHeaders();
+
 					stmt_name = pq_getmsgstring(&input_message);
 					query_string = pq_getmsgstring(&input_message);
 					numParams = pq_getmsgint(&input_message, 2);
@@ -4897,6 +4949,9 @@ PostgresMain(const char *dbname, const char *username)
 				/* Set statement_timestamp() */
 				SetCurrentStatementStartTimestamp();
 
+				/* See ApplyPendingRequestHeaders comment in Query case. */
+				ApplyPendingRequestHeaders();
+
 				/*
 				 * this message is complex enough that it seems best to put
 				 * the field extraction out-of-line
@@ -4915,6 +4970,9 @@ PostgresMain(const char *dbname, const char *username)
 
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
+
+					/* See ApplyPendingRequestHeaders comment in Query case. */
+					ApplyPendingRequestHeaders();
 
 					portal_name = pq_getmsgstring(&input_message);
 					max_rows = pq_getmsgint(&input_message, 4);
@@ -5059,6 +5117,19 @@ PostgresMain(const char *dbname, const char *username)
 				finish_xact_command();
 				valgrind_report_error_query("SYNC message");
 				send_ready_for_query = true;
+				break;
+
+			case PqMsg_RequestHeaders:
+
+				/*
+				 * Per-message protocol headers.  Negotiated at startup via
+				 * the _pq_.headers option; ProcessRequestHeadersMessage()
+				 * enforces the negotiation and configured caps.  The
+				 * message produces no reply on its own --- the effect is
+				 * delivered via registered handlers and the next
+				 * operation's response carries any visible result.
+				 */
+				ProcessRequestHeadersMessage(&input_message);
 				break;
 
 				/*

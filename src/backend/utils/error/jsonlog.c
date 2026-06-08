@@ -287,6 +287,19 @@ write_jsonlog(ErrorData *edata)
 	appendJSONKeyValueFmt(&buf, "query_id", false, "%" PRId64,
 						  pgstat_get_my_query_id());
 
+	/*
+	 * Annotations attached via errannot().  Emitted as top-level keys; the
+	 * reserved-key check in errannot() prevents collisions with the fixed
+	 * keys above.  Insertion order in the linked list is the reverse of
+	 * call order (set_annotation prepends), which is fine: JSON object
+	 * member ordering is not semantically meaningful, and consumers that
+	 * want a specific key fetch it by name.
+	 */
+	for (ErrorAnnotation *ann = edata->annotations;
+		 ann != NULL;
+		 ann = ann->next)
+		appendJSONKeyValue(&buf, ann->key, ann->value, true);
+
 	/* Finish string */
 	appendStringInfoChar(&buf, '}');
 	appendStringInfoChar(&buf, '\n');

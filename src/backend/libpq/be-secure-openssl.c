@@ -48,9 +48,7 @@
 #include <openssl/bn.h>
 #include <openssl/conf.h>
 #include <openssl/dh.h>
-#ifndef OPENSSL_NO_ECDH
 #include <openssl/ec.h>
-#endif
 #include <openssl/x509v3.h>
 
 /*
@@ -106,7 +104,7 @@ static void host_context_cleanup_cb(void *arg);
 static int	sni_clienthello_cb(SSL *ssl, int *al, void *arg);
 #endif
 
-static char *X509_NAME_to_cstring(X509_NAME *name);
+static char *X509_NAME_to_cstring(const X509_NAME *name);
 
 static SSL_CTX *SSL_context = NULL;
 static MemoryContext SSL_hosts_memcxt = NULL;
@@ -1071,18 +1069,18 @@ aloop:
 	if (port->peer != NULL)
 	{
 		int			len;
-		X509_NAME  *x509name = X509_get_subject_name(port->peer);
+		const X509_NAME *x509name = X509_get_subject_name(port->peer);
 		char	   *peer_dn;
 		BIO		   *bio = NULL;
 		BUF_MEM    *bio_buf = NULL;
 
-		len = X509_NAME_get_text_by_NID(x509name, NID_commonName, NULL, 0);
+		len = X509_NAME_get_text_by_NID(unconstify(X509_NAME *, x509name), NID_commonName, NULL, 0);
 		if (len != -1)
 		{
 			char	   *peer_cn;
 
 			peer_cn = MemoryContextAlloc(TopMemoryContext, len + 1);
-			r = X509_NAME_get_text_by_NID(x509name, NID_commonName, peer_cn,
+			r = X509_NAME_get_text_by_NID(unconstify(X509_NAME *, x509name), NID_commonName, peer_cn,
 										  len + 1);
 			peer_cn[len] = '\0';
 			if (r != len)
@@ -2115,7 +2113,6 @@ initialize_dh(SSL_CTX *context, bool isServerStart)
 static bool
 initialize_ecdh(SSL_CTX *context, bool isServerStart)
 {
-#ifndef OPENSSL_NO_ECDH
 	if (SSL_CTX_set1_groups_list(context, SSLECDHCurve) != 1)
 	{
 		/*
@@ -2133,7 +2130,6 @@ initialize_ecdh(SSL_CTX *context, bool isServerStart)
 				errhint("Ensure that each group name is spelled correctly and supported by the installed version of OpenSSL."));
 		return false;
 	}
-#endif
 
 	return true;
 }
@@ -2333,14 +2329,14 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
  *
  */
 static char *
-X509_NAME_to_cstring(X509_NAME *name)
+X509_NAME_to_cstring(const X509_NAME *name)
 {
 	BIO		   *membuf = BIO_new(BIO_s_mem());
 	int			i,
 				nid,
 				count = X509_NAME_entry_count(name);
-	X509_NAME_ENTRY *e;
-	ASN1_STRING *v;
+	const X509_NAME_ENTRY *e;
+	const ASN1_STRING *v;
 	const char *field_name;
 	size_t		size;
 	char		nullterm;
