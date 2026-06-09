@@ -34,6 +34,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "utils/auth_lock.h"
@@ -323,19 +324,99 @@ pg_set_session_authorization_irrevocable(PG_FUNCTION_ARGS)
 /*
  * SQL-callable: pg_auth_lock_status()
  *
- * Returns a 4-column row per scope describing whether a lock is in
- * effect and what its ceiling is.  Does NOT expose any cookie value.
- * Phase 0 implements only the IRREVOCABLE kind, but the result shape
- * is forward-compatible with the cookie variant.
+ * Returns one row per scope describing whether a lock is in effect and
+ * what its ceiling is.  Does NOT expose any cookie value (cookies will
+ * land in Phase 2; only their presence/absence is reported via the
+ * cookie_outstanding column).
  */
 Datum
 pg_auth_lock_status(PG_FUNCTION_ARGS)
 {
-	/* TODO: implement as a SRF.  Stubbed for Phase 0 — the C surface is
-	 * sufficient for testing; the SQL inspector can land with the cookie
-	 * patch. */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_auth_lock_status() not yet implemented")));
-	PG_RETURN_NULL();
+	FuncCallContext *funcctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		TupleDesc	tupdesc;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_auth_lock_status() must be called with a row-typed result")));
+
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		funcctx->max_calls = AUTH_LOCK_NSCOPES;
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+
+	if (funcctx->call_cntr < funcctx->max_calls)
+	{
+		AuthLockScope scope = (AuthLockScope) funcctx->call_cntr;
+		AuthLockKind kind = AuthLockGetKind(scope);
+		Oid			ceiling = AuthLockGetCeiling(scope);
+		Datum		values[5];
+		bool		nulls[5];
+		HeapTuple	tuple;
+		const char *kind_str;
+
+		switch (kind)
+		{
+			case AUTH_LOCK_NONE:
+				kind_str = "none";
+				break;
+			case AUTH_LOCK_IRREVOCABLE:
+				kind_str = "irrevocable";
+				break;
+			case AUTH_LOCK_COOKIE:
+				kind_str = "cookie";
+				break;
+			default:
+				kind_str = "unknown";
+				break;
+		}
+
+		values[0] = CStringGetTextDatum(scope_name(scope));
+		nulls[0] = false;
+
+		values[1] = CStringGetTextDatum(kind_str);
+		nulls[1] = false;
+
+		if (kind == AUTH_LOCK_NONE)
+		{
+			nulls[2] = true;
+			nulls[3] = true;
+		}
+		else
+		{
+			char	   *role_name;
+
+			values[2] = ObjectIdGetDatum(ceiling);
+			nulls[2] = false;
+
+			role_name = GetUserNameFromId(ceiling, true);
+			if (role_name != NULL)
+			{
+				values[3] = DirectFunctionCall1(namein,
+											  CStringGetDatum(role_name));
+				nulls[3] = false;
+			}
+			else
+				nulls[3] = true;
+		}
+
+		/* Phase 1: cookie variant not implemented — always false. */
+		values[4] = BoolGetDatum(false);
+		nulls[4] = false;
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
 }
