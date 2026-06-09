@@ -20,6 +20,7 @@
 #include "commands/prepare.h"
 #include "commands/sequence.h"
 #include "storage/lock.h"
+#include "utils/auth_lock.h"
 #include "utils/guc.h"
 #include "utils/portal.h"
 
@@ -65,6 +66,23 @@ DiscardAll(bool isTopLevel)
 	 * still uncommitted.
 	 */
 	PreventInTransactionBlock(isTopLevel, "DISCARD ALL");
+
+	/*
+	 * Refuse DISCARD ALL when an authorization lock is in effect.  The
+	 * downstream SetPGVariable("session_authorization", NIL, false) below
+	 * would also be refused by the Layer-2 set_config_option_ext hook,
+	 * but checking here lets us fail early without performing any of the
+	 * other DISCARD sub-operations (portals, prepared statements, etc.)
+	 * — partial DISCARD would leave the session in an awkward state.
+	 *
+	 * If a session truly needs to recycle (e.g. behind a connection
+	 * pooler), use the cookie-protected reset variant instead.
+	 */
+	if (AuthLockIsAnyActive())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("session is locked; cannot DISCARD ALL"),
+				 errhint("Reconnect to release the lock, or use the cookie-protected reset variant.")));
 
 	/* Closing portals might run user-defined code, so do that first. */
 	PortalHashTableDeleteAll();

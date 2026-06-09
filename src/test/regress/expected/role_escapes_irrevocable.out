@@ -51,6 +51,7 @@ SELECT pg_set_role_irrevocable('regress_irr_low');
 (1 row)
 
 RESET ROLE;
+ERROR:  session role is locked; cannot reset
 SELECT current_user AS a1_after_reset_role;
  a1_after_reset_role 
 ---------------------
@@ -157,7 +158,7 @@ BEGIN
     RAISE NOTICE 'inside DO block, current_user = %', current_user;
 END;
 $$;
-NOTICE:  inside DO block, current_user = regress_irr_low
+ERROR:  session role is locked; cannot reset
 SELECT current_user AS a6_after_do_block;
  a6_after_do_block 
 -------------------
@@ -226,6 +227,7 @@ SELECT pg_set_role_irrevocable('regress_irr_low');
 (1 row)
 
 DISCARD ALL;
+ERROR:  session is locked; cannot DISCARD ALL
 SELECT current_user AS f1_after_discard_all;
  f1_after_discard_all 
 ----------------------
@@ -246,6 +248,7 @@ SELECT pg_set_role_irrevocable('regress_irr_low');
 (1 row)
 
 RESET role;
+ERROR:  session role is locked; cannot reset
 SELECT current_user AS f2_after_reset_role_lc;
  f2_after_reset_role_lc 
 ------------------------
@@ -267,11 +270,7 @@ SELECT pg_set_role_irrevocable('regress_irr_low');
 (1 row)
 
 SELECT set_config('role', NULL, false);
- set_config 
-------------
- none
-(1 row)
-
+ERROR:  session role is locked; cannot reset
 SELECT current_user AS f3_after_set_config_null;
  f3_after_set_config_null 
 --------------------------

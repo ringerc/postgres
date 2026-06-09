@@ -46,6 +46,7 @@
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/auth_lock.h"
 #include "utils/builtins.h"
 #include "utils/conffiles.h"
 #include "utils/guc_tables.h"
@@ -3560,6 +3561,33 @@ set_config_with_handle(const char *name, config_handle *handle,
 							record->name)));
 			return 0;
 		}
+	}
+
+	/*
+	 * Refuse RESET of "role" / "session_authorization" while an
+	 * authorization lock is in effect (Phase 1 Layer-2 user-visible
+	 * refusal).  Without this hook, RESET would silently reach the assign
+	 * hook and get clipped at the SetCurrentRoleId / SetSessionAuthorization
+	 * chokepoint, but the GUC string would still be updated to "none" —
+	 * SHOW role would then disagree with current_user.  Layer 2 converts
+	 * the silent clip into a loud refusal for the user-initiated path.
+	 *
+	 * Covers RESET ROLE, RESET SESSION AUTHORIZATION, RESET role/
+	 * session_authorization (lowercase), set_config('role', NULL, ...),
+	 * and any other path that calls set_config_option(name, NULL, ...).
+	 * The string-RESET branch of ResetAllOptions (DISCARD ALL / RESET
+	 * ALL) for these specific GUCs is skipped via GUC_NO_RESET_ALL —
+	 * but DISCARD ALL also issues an explicit SetPGVariable for
+	 * session_authorization, which routes through here.
+	 */
+	if (value == NULL && AuthLockBlocksReset(record->name))
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("session %s is locked; cannot reset",
+						record->name),
+				 errhint("Reconnect to release the lock, or use the cookie-protected reset variant.")));
+		return 0;
 	}
 
 	/* Disallow resetting and saving GUC_NO_RESET values */

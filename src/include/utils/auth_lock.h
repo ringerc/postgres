@@ -80,6 +80,23 @@ extern void AuthLockClipRole(AuthLockScope scope,
 							 Oid *roleid, bool *is_superuser);
 
 /*
+ * Layer-2 helper used by set_config_option_ext: returns true iff `name`
+ * is "role" or "session_authorization" AND the corresponding scope is
+ * locked, indicating that RESET (value == NULL) of that GUC must be
+ * refused with an ERROR rather than silently allowed to reach the
+ * assign hook (which would clip via the Layer-1 chokepoint, leaving
+ * the GUC string out of sync with the effective identity).
+ */
+extern bool AuthLockBlocksReset(const char *name);
+
+/*
+ * Layer-2 helper used by DiscardCommand: returns true iff any lock is
+ * currently in effect on any scope.  Used to refuse DISCARD ALL when
+ * locked.
+ */
+extern bool AuthLockIsAnyActive(void);
+
+/*
  * SQL-callable: pg_set_role_irrevocable(text), pg_set_session_authorization_irrevocable(text).
  * Declared here so they can be referenced from pg_proc.dat / fmgrtab.
  */

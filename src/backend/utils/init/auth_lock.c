@@ -129,6 +129,28 @@ AuthLockWouldViolate(AuthLockScope scope, Oid roleid)
 	return !member_can_set_role(auth_locks[scope].ceiling_role, roleid);
 }
 
+bool
+AuthLockBlocksReset(const char *name)
+{
+	if (name == NULL)
+		return false;
+
+	if (strcmp(name, "role") == 0)
+		return auth_locks[AUTH_LOCK_SCOPE_ROLE].kind != AUTH_LOCK_NONE;
+	if (strcmp(name, "session_authorization") == 0)
+		return auth_locks[AUTH_LOCK_SCOPE_SESSION_AUTH].kind != AUTH_LOCK_NONE;
+	return false;
+}
+
+bool
+AuthLockIsAnyActive(void)
+{
+	for (int i = 0; i < AUTH_LOCK_NSCOPES; i++)
+		if (auth_locks[i].kind != AUTH_LOCK_NONE)
+			return true;
+	return false;
+}
+
 void
 AuthLockClipRole(AuthLockScope scope, Oid *roleid, bool *is_superuser)
 {
