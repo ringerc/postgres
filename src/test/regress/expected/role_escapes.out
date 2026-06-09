@@ -8,7 +8,8 @@
 -- that attacker-controlled code is executed under the privileged
 -- identity.
 --
--- THE EXPECTED OUTPUT OF THIS FILE DOCUMENTS BUGS, NOT CORRECTNESS.
+-- THE EXPECTED OUTPUT OF THIS FILE DOCUMENTS WEAKNESSES IN ROLE
+-- MANAGEMENT, NOT CORRECTNESS.
 --
 -- Two flavours of evidence appear in the expected output:
 --   1. "current_user = regress_role_high" after a "SET ROLE
