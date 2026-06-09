@@ -636,7 +636,12 @@ static char *timezone_string;
 static char *log_timezone_string;
 static char *timezone_abbreviations_string;
 static char *data_directory;
-static char *session_authorization_string;
+/*
+ * No longer static: show_session_authorization in variable.c reads it
+ * directly to provide truthful reporting when an authorization lock is
+ * in effect.  Other backend code should still go through the GUC API.
+ */
+char	   *session_authorization_string;
 static int	max_function_args;
 static int	max_index_keys;
 static int	max_identifier_length;

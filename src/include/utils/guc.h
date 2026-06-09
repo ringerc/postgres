@@ -323,6 +323,7 @@ extern PGDLLIMPORT int tcp_keepalives_count;
 extern PGDLLIMPORT int tcp_user_timeout;
 
 extern PGDLLIMPORT char *role_string;
+extern PGDLLIMPORT char *session_authorization_string;
 extern PGDLLIMPORT bool in_hot_standby_guc;
 extern PGDLLIMPORT bool trace_sort;
 

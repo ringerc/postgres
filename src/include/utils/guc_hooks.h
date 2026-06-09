@@ -122,6 +122,7 @@ extern void assign_recovery_target_xid(const char *newval, void *extra);
 extern bool check_role(char **newval, void **extra, GucSource source);
 extern void assign_role(const char *newval, void *extra);
 extern const char *show_role(void);
+extern const char *show_session_authorization(void);
 extern bool check_restrict_nonsystem_relation_kind(char **newval, void **extra,
 												   GucSource source);
 extern void assign_restrict_nonsystem_relation_kind(const char *newval, void *extra);

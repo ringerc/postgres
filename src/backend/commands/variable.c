@@ -1094,6 +1094,8 @@ assign_role(const char *newval, void *extra)
 const char *
 show_role(void)
 {
+	Oid			roleid = GetCurrentRoleId();
+
 	/*
 	 * Check whether SET ROLE is active; if not return "none".  This is a
 	 * kluge to deal with the fact that SET SESSION AUTHORIZATION logically
@@ -1101,11 +1103,54 @@ show_role(void)
 	 * assign_session_authorization (because we haven't got enough info to
 	 * call set_config_option).
 	 */
-	if (!OidIsValid(GetCurrentRoleId()))
+	if (!OidIsValid(roleid))
 		return "none";
+
+	/*
+	 * When an authorization lock is in effect, report the actual effective
+	 * role rather than trusting the GUC string.  The string can lag behind
+	 * the effective identity in the narrow window where transaction-abort
+	 * GUC unwind has restored an above-ceiling stack value into role_string
+	 * but the Layer-1 chokepoint clipped the OID-level assignment back to
+	 * the ceiling.  Returning the looked-up name closes that observability
+	 * gap for SHOW role and current_setting('role').
+	 */
+	if (AuthLockGetKind(AUTH_LOCK_SCOPE_ROLE) != AUTH_LOCK_NONE)
+	{
+		const char *name = GetUserNameFromId(roleid, true);
+
+		if (name != NULL)
+			return name;
+		/* fall through if lookup failed somehow */
+	}
 
 	/* Otherwise we can just use the GUC string */
 	return role_string ? role_string : "none";
+}
+
+const char *
+show_session_authorization(void)
+{
+	/*
+	 * Symmetric to show_role: when the session_authorization scope is
+	 * locked, the GUC string `session_authorization_string` can lag behind
+	 * the effective SessionUserId after a transaction-abort GUC unwind.
+	 * Report the actual name in that case.
+	 */
+	if (AuthLockGetKind(AUTH_LOCK_SCOPE_SESSION_AUTH) != AUTH_LOCK_NONE)
+	{
+		Oid			session_uid = GetSessionUserId();
+
+		if (OidIsValid(session_uid))
+		{
+			const char *name = GetUserNameFromId(session_uid, true);
+
+			if (name != NULL)
+				return name;
+		}
+	}
+
+	return session_authorization_string ? session_authorization_string : "";
 }
 
 

@@ -32,6 +32,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
@@ -124,6 +125,23 @@ AuthLockWouldViolate(AuthLockScope scope, Oid roleid)
 
 	if (roleid == auth_locks[scope].ceiling_role)
 		return false;
+
+	/*
+	 * If we are not currently in a transaction state, catalog lookups are
+	 * unsafe.  This happens when AuthLockClipRole is invoked from
+	 * SetCurrentRoleId / SetSessionAuthorization during transaction abort
+	 * (via the GUC unwind path that calls the assign hooks).  In that
+	 * narrow window we cannot evaluate the full ceiling rule, so be
+	 * conservative: treat any non-equal target as a violation and let the
+	 * caller clip to the ceiling.  This may over-clip a legitimate
+	 * sibling-of-ceiling restore during abort, but the resulting identity
+	 * is always at or below the ceiling — the security invariant holds.
+	 *
+	 * Normal (non-abort) paths reach this function inside a transaction
+	 * state and get the full ceiling rule via member_can_set_role.
+	 */
+	if (!IsTransactionState())
+		return true;
 
 	/* Ceiling must be permitted to become target role under SET ROLE rules. */
 	return !member_can_set_role(auth_locks[scope].ceiling_role, roleid);

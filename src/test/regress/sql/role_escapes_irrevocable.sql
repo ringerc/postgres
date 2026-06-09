@@ -184,6 +184,27 @@ SELECT current_user AS f3_after_set_config_null;
 
 
 -- ============================================================
+-- L3.  Layer 3 observability under abort-driven GUC unwind.
+--      A SET LOCAL ROLE inside a transaction stacks the prior GUC
+--      value (the session default, e.g. "none" or the test
+--      runner's role).  When the transaction aborts, GUC unwind
+--      restores that stacked value into role_string while the
+--      Layer 1 chokepoint clips the OID-level identity back to
+--      the ceiling.  show_role / show_session_authorization must
+--      report the actual identity, not the (possibly above-
+--      ceiling) GUC string.
+-- ============================================================
+\c -
+BEGIN;
+SET LOCAL ROLE regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+DO $$ BEGIN RAISE EXCEPTION 'force abort'; END $$;
+ROLLBACK;
+SELECT current_user AS l3_current_user,
+       current_setting('role') AS l3_show_role;
+
+
+-- ============================================================
 -- Cleanup (fresh connection, superuser).
 -- ============================================================
 \c -

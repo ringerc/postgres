@@ -2682,6 +2682,7 @@
   boot_val => 'NULL',
   check_hook => 'check_session_authorization',
   assign_hook => 'assign_session_authorization',
+  show_hook => 'show_session_authorization',
 },
 
 { name => 'session_preload_libraries', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_PRELOAD',
