@@ -1,0 +1,240 @@
+--
+-- role_escapes_cookie
+--
+-- Cookie-protected variant of the authorization lock.  Covers:
+--   - cookie set returns a 32-byte bytea and installs lock on both
+--     scopes with kind=cookie
+--   - locked-state behaviour is identical to IRREVOCABLE: every
+--     escape path errors or stays at ceiling
+--   - wrong cookie / bad length / NULL cookie are all refused
+--     with a uniform "invalid auth_lock cookie" error
+--   - correct cookie clears the lock and restores normal SET ROLE
+--     behaviour
+--
+-- Note: the cookie value is non-deterministic (random per call),
+-- so the test must use \gset to capture and replay it; the test
+-- assertions are length-only / structural rather than value-based.
+--
+-- Structured like role_escapes_irrevocable: one connection per
+-- scenario via \c, so future hardening that further constrains
+-- in-session behaviour won't break test isolation.
+\set VERBOSITY terse
+\c -
+CREATE ROLE regress_cookie_high SUPERUSER;
+CREATE ROLE regress_cookie_low NOSUPERUSER NOINHERIT;
+GRANT regress_cookie_low TO regress_cookie_high;
+-- ============================================================
+-- C1.  Cookie set returns 32 bytes; both scopes show cookie lock.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c1_cookie_len;
+ c1_cookie_len 
+---------------
+            32
+(1 row)
+
+SELECT scope, lock_kind, ceiling_role_name, cookie_outstanding
+    FROM pg_auth_lock_status() ORDER BY scope;
+         scope         | lock_kind | ceiling_role_name  | cookie_outstanding 
+-----------------------+-----------+--------------------+--------------------
+ role                  | cookie    | regress_cookie_low | t
+ session_authorization | cookie    | regress_cookie_low | t
+(2 rows)
+
+SELECT current_user AS c1_current_user;
+  c1_current_user   
+--------------------
+ regress_cookie_low
+(1 row)
+
+-- ============================================================
+-- C2.  Lock blocks the same escape paths as IRREVOCABLE.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c2_cookie_len;
+ c2_cookie_len 
+---------------
+            32
+(1 row)
+
+RESET ROLE;
+ERROR:  session role is locked; cannot reset
+SELECT current_user AS c2_after_reset_role;
+ c2_after_reset_role 
+---------------------
+ regress_cookie_low
+(1 row)
+
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c2b_cookie_len;
+ c2b_cookie_len 
+----------------
+             32
+(1 row)
+
+DISCARD ALL;
+ERROR:  session is locked; cannot DISCARD ALL
+SELECT current_user AS c2b_after_discard_all;
+ c2b_after_discard_all 
+-----------------------
+ regress_cookie_low
+(1 row)
+
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c2c_cookie_len;
+ c2c_cookie_len 
+----------------
+             32
+(1 row)
+
+SET ROLE regress_cookie_high;
+ERROR:  session role is locked; cannot change to "regress_cookie_high"
+SELECT current_user AS c2c_after_set_high;
+ c2c_after_set_high 
+--------------------
+ regress_cookie_low
+(1 row)
+
+-- ============================================================
+-- C3.  Wrong cookie -> error, lock preserved.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c3_cookie_len;
+ c3_cookie_len 
+---------------
+            32
+(1 row)
+
+SELECT pg_reset_role_with_cookie(
+    '\x00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'::bytea);
+ERROR:  invalid auth_lock cookie
+SELECT current_user AS c3_after_bad_cookie;
+ c3_after_bad_cookie 
+---------------------
+ regress_cookie_low
+(1 row)
+
+SELECT lock_kind FROM pg_auth_lock_status() WHERE scope='role';
+ lock_kind 
+-----------
+ cookie
+(1 row)
+
+-- ============================================================
+-- C4.  Cookie of wrong length -> error.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c4_cookie_len;
+ c4_cookie_len 
+---------------
+            32
+(1 row)
+
+SELECT pg_reset_role_with_cookie('\xdeadbeef'::bytea);
+ERROR:  invalid auth_lock cookie
+SELECT pg_reset_role_with_cookie(''::bytea);
+ERROR:  invalid auth_lock cookie
+-- ============================================================
+-- C5.  NULL cookie -> error.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c5_cookie_len;
+ c5_cookie_len 
+---------------
+            32
+(1 row)
+
+SELECT pg_reset_role_with_cookie(NULL);
+ pg_reset_role_with_cookie 
+---------------------------
+ 
+(1 row)
+
+-- ============================================================
+-- C6.  Correct cookie clears the lock; subsequent SET ROLE works.
+--      \gset captures the cookie literal for replay in the same
+--      connection.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT pg_set_role_with_cookie('regress_cookie_low') AS c6_cookie \gset
+SELECT current_user AS c6_locked;
+     c6_locked      
+--------------------
+ regress_cookie_low
+(1 row)
+
+SELECT pg_reset_role_with_cookie(:'c6_cookie'::bytea);
+ pg_reset_role_with_cookie 
+---------------------------
+ 
+(1 row)
+
+SELECT lock_kind FROM pg_auth_lock_status() ORDER BY scope;
+ lock_kind 
+-----------
+ none
+ none
+(2 rows)
+
+-- After unlock, normal role manipulation works again.
+RESET ROLE;
+SELECT current_user AS c6_after_reset;
+   c6_after_reset    
+---------------------
+ regress_cookie_high
+(1 row)
+
+SET ROLE regress_cookie_low;
+SELECT current_user AS c6_after_set_low;
+  c6_after_set_low  
+--------------------
+ regress_cookie_low
+(1 row)
+
+-- ============================================================
+-- C7.  Cookie is one-shot: re-presenting after a successful
+--      reset fails (because the lock is no longer COOKIE-kind).
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT pg_set_role_with_cookie('regress_cookie_low') AS c7_cookie \gset
+SELECT pg_reset_role_with_cookie(:'c7_cookie'::bytea);
+ pg_reset_role_with_cookie 
+---------------------------
+ 
+(1 row)
+
+-- First reset succeeded.  Second presentation must fail.
+SELECT pg_reset_role_with_cookie(:'c7_cookie'::bytea);
+ERROR:  invalid auth_lock cookie
+-- ============================================================
+-- C8.  Cannot install a second lock on top of an existing one.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_cookie_high;
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c8_first_len;
+ c8_first_len 
+--------------
+           32
+(1 row)
+
+-- Second attempt errors (lock already in effect on role scope).
+SELECT octet_length(pg_set_role_with_cookie('regress_cookie_low')) AS c8_second_len;
+ERROR:  authorization lock already in effect on role scope
+-- Same applies to IRREVOCABLE alongside an existing cookie lock.
+SELECT pg_set_role_irrevocable('regress_cookie_low');
+ERROR:  authorization lock already in effect on role scope
+-- ============================================================
+-- Cleanup
+-- ============================================================
+\c -
+DROP ROLE regress_cookie_low;
+DROP ROLE regress_cookie_high;

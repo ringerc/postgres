@@ -31,8 +31,11 @@ typedef enum AuthLockKind
 {
 	AUTH_LOCK_NONE = 0,
 	AUTH_LOCK_IRREVOCABLE = 1,
-	AUTH_LOCK_COOKIE = 2			/* not implemented in Phase 0 */
+	AUTH_LOCK_COOKIE = 2
 } AuthLockKind;
+
+#define AUTH_LOCK_COOKIE_HASH_LEN	32	/* SHA-256 output size */
+#define AUTH_LOCK_COOKIE_RAW_LEN	32	/* random bytes returned to caller */
 
 /*
  * Install an IRREVOCABLE lock on the given scope.  This is one-way for
@@ -45,6 +48,43 @@ typedef enum AuthLockKind
 extern void AuthLockSetIrrevocable(AuthLockScope scope,
 								   Oid ceiling_role,
 								   bool ceiling_is_superuser);
+
+/*
+ * Install a cookie-protected lock on the given scope.  The caller has
+ * already generated the cookie via pg_strong_random and hashed it via
+ * SHA-256; only the hash is stored.  The raw cookie should be returned
+ * to the legitimate holder exactly once and then scrubbed from
+ * server-side memory.
+ *
+ * The same caller restriction applies as for AuthLockSetIrrevocable:
+ * membership of ceiling_role must already have been verified.
+ */
+extern void AuthLockSetCookie(AuthLockScope scope,
+							  Oid ceiling_role,
+							  bool ceiling_is_superuser,
+							  const uint8 hash[AUTH_LOCK_COOKIE_HASH_LEN]);
+
+/*
+ * Attempt to clear a cookie-protected lock by presenting the cookie's
+ * hash.  Comparison is constant-time.  Returns true iff the lock was
+ * actively COOKIE and the hash matched (in which case the scope's lock
+ * is now NONE).  Returns false if the scope had no cookie lock OR the
+ * hash did not match (in which case state is unchanged).
+ *
+ * Audit-log emission is the caller's responsibility — this routine
+ * doesn't log because it doesn't know whether the caller is dispatching
+ * a SQL function, protocol-level message, or batched multi-scope clear.
+ */
+extern bool AuthLockClearWithCookie(AuthLockScope scope,
+									const uint8 hash[AUTH_LOCK_COOKIE_HASH_LEN]);
+
+/*
+ * Helper: hash the raw cookie bytes (caller-supplied buffer of arbitrary
+ * length) into the 32-byte output.  Centralised so both set-time and
+ * clear-time use identical hashing.
+ */
+extern void AuthLockHashCookie(const uint8 *raw, size_t raw_len,
+							   uint8 out_hash[AUTH_LOCK_COOKIE_HASH_LEN]);
 
 /*
  * Inspectors.
@@ -97,11 +137,15 @@ extern bool AuthLockBlocksReset(const char *name);
 extern bool AuthLockIsAnyActive(void);
 
 /*
- * SQL-callable: pg_set_role_irrevocable(text), pg_set_session_authorization_irrevocable(text).
- * Declared here so they can be referenced from pg_proc.dat / fmgrtab.
+ * SQL-callable entry points.  Declared here so they can be referenced
+ * from pg_proc.dat / fmgrtab.
  */
 extern Datum pg_set_role_irrevocable(PG_FUNCTION_ARGS);
 extern Datum pg_set_session_authorization_irrevocable(PG_FUNCTION_ARGS);
+extern Datum pg_set_role_with_cookie(PG_FUNCTION_ARGS);
+extern Datum pg_set_session_authorization_with_cookie(PG_FUNCTION_ARGS);
+extern Datum pg_reset_role_with_cookie(PG_FUNCTION_ARGS);
+extern Datum pg_reset_session_authorization_with_cookie(PG_FUNCTION_ARGS);
 extern Datum pg_auth_lock_status(PG_FUNCTION_ARGS);
 
 #endif							/* AUTH_LOCK_H */
