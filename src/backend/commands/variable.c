@@ -1114,8 +1114,16 @@ show_role(void)
 	 * but the Layer-1 chokepoint clipped the OID-level assignment back to
 	 * the ceiling.  Returning the looked-up name closes that observability
 	 * gap for SHOW role and current_setting('role').
+	 *
+	 * GetUserNameFromId does a syscache lookup and requires an active
+	 * transaction.  show_role is also invoked from ReportChangedGUCOptions
+	 * after end-of-statement, when the transaction may have already closed
+	 * (and during transaction abort, where the syscache may be in an
+	 * unsafe state).  Gate the override on IsTransactionState(); fall
+	 * through to the GUC string otherwise.
 	 */
-	if (AuthLockGetKind(AUTH_LOCK_SCOPE_ROLE) != AUTH_LOCK_NONE)
+	if (AuthLockGetKind(AUTH_LOCK_SCOPE_ROLE) != AUTH_LOCK_NONE &&
+		IsTransactionState())
 	{
 		const char *name = GetUserNameFromId(roleid, true);
 
@@ -1136,8 +1144,15 @@ show_session_authorization(void)
 	 * locked, the GUC string `session_authorization_string` can lag behind
 	 * the effective SessionUserId after a transaction-abort GUC unwind.
 	 * Report the actual name in that case.
+	 *
+	 * IsTransactionState() gate as in show_role: this hook is also called
+	 * from ReportChangedGUCOptions (session_authorization has GUC_REPORT)
+	 * at end-of-statement, sometimes outside a transaction.  Catalog
+	 * lookups via GetUserNameFromId require an active transaction; fall
+	 * back to the GUC string otherwise.
 	 */
-	if (AuthLockGetKind(AUTH_LOCK_SCOPE_SESSION_AUTH) != AUTH_LOCK_NONE)
+	if (AuthLockGetKind(AUTH_LOCK_SCOPE_SESSION_AUTH) != AUTH_LOCK_NONE &&
+		IsTransactionState())
 	{
 		Oid			session_uid = GetSessionUserId();
 
