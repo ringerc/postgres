@@ -39,6 +39,7 @@
 #include "storage/proc.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
+#include "utils/auth_lock.h"
 #include "utils/combocid.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -94,6 +95,22 @@ typedef struct FixedParallelState
 	int			sec_context;
 	bool		session_user_is_superuser;
 	bool		role_is_superuser;
+
+	/*
+	 * Authorization-lock state, serialised so the worker's Layer-1
+	 * chokepoint clip in SetCurrentRoleId / SetSessionAuthorization
+	 * enforces the leader's lock.  Cookie hashes are NOT propagated —
+	 * workers cannot legitimately clear a cookie-protected lock, and
+	 * keeping the hash out of the DSM avoids any risk of off-process
+	 * exposure.
+	 */
+	uint8		auth_lock_role_kind;	/* AuthLockKind enum value */
+	Oid			auth_lock_role_ceiling;
+	bool		auth_lock_role_super;
+	uint8		auth_lock_sessionauth_kind;
+	Oid			auth_lock_sessionauth_ceiling;
+	bool		auth_lock_sessionauth_super;
+
 	PGPROC	   *parallel_leader_pgproc;
 	pid_t		parallel_leader_pid;
 	ProcNumber	parallel_leader_proc_number;
@@ -350,6 +367,19 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	GetUserIdAndSecContext(&fps->current_user_id, &fps->sec_context);
 	fps->session_user_is_superuser = GetSessionUserIsSuperuser();
 	fps->role_is_superuser = current_role_is_superuser;
+
+	/*
+	 * Capture authorization-lock state for the worker.  The kind enum is
+	 * widened to uint8 in the FixedParallelState struct so that the field
+	 * has stable size across compilers; cast in/out at the boundary.
+	 */
+	fps->auth_lock_role_kind = (uint8) AuthLockGetKind(AUTH_LOCK_SCOPE_ROLE);
+	fps->auth_lock_role_ceiling = AuthLockGetCeiling(AUTH_LOCK_SCOPE_ROLE);
+	fps->auth_lock_role_super = AuthLockGetCeilingIsSuperuser(AUTH_LOCK_SCOPE_ROLE);
+	fps->auth_lock_sessionauth_kind = (uint8) AuthLockGetKind(AUTH_LOCK_SCOPE_SESSION_AUTH);
+	fps->auth_lock_sessionauth_ceiling = AuthLockGetCeiling(AUTH_LOCK_SCOPE_SESSION_AUTH);
+	fps->auth_lock_sessionauth_super = AuthLockGetCeilingIsSuperuser(AUTH_LOCK_SCOPE_SESSION_AUTH);
+
 	GetTempNamespaceState(&fps->temp_namespace_id,
 						  &fps->temp_toast_namespace_id);
 	fps->parallel_leader_pgproc = MyProc;
@@ -1425,7 +1455,24 @@ ParallelWorkerMain(Datum main_arg)
 	 * happens here, we just blindly adopt the leader's state.  Note that this
 	 * has to happen before InitPostgres, since InitializeSessionUserId will
 	 * not set these variables.
+	 *
+	 * Restore the authorization lock state FIRST so that the chokepoint
+	 * clip in SetCurrentRoleId / SetSessionAuthorization below enforces
+	 * the leader's lock in the worker.  In practice the leader's state
+	 * being passed is already at-or-below the ceiling (because the leader
+	 * was locked when it serialised), so the clip is a no-op — but
+	 * installing the lock here means any future role mutation inside the
+	 * worker is also clipped.
 	 */
+	if (fps->auth_lock_role_kind != AUTH_LOCK_NONE)
+		AuthLockSetIrrevocable(AUTH_LOCK_SCOPE_ROLE,
+							   fps->auth_lock_role_ceiling,
+							   fps->auth_lock_role_super);
+	if (fps->auth_lock_sessionauth_kind != AUTH_LOCK_NONE)
+		AuthLockSetIrrevocable(AUTH_LOCK_SCOPE_SESSION_AUTH,
+							   fps->auth_lock_sessionauth_ceiling,
+							   fps->auth_lock_sessionauth_super);
+
 	SetAuthenticatedUserId(fps->authenticated_user_id);
 	SetSessionAuthorization(fps->session_user_id,
 							fps->session_user_is_superuser);
