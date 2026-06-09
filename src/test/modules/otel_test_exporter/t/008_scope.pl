@@ -29,14 +29,14 @@ $node->safe_psql('postgres',
 # ----------------------------------------------------------------------
 # Test 1: spans emitted by contrib/otel_postgres_tracing for executor
 # work carry scope = "contrib/otel_postgres_tracing".  We force a span
-# via SET otel.traceparent with the sampled wire bit set; the
+# via SET otel_api.traceparent with the sampled wire bit set; the
 # default sampler-hook policy passes that through without consulting
 # test_otel_exporter's sampler hook.
 # ----------------------------------------------------------------------
 
 my $exec_span = $node->safe_psql('postgres', qq{
 	SELECT test_otel_clear();
-	SET otel.traceparent = '$TRACEPARENT';
+	SET otel_api.traceparent = '$TRACEPARENT';
 	SELECT 1;
 	SELECT test_otel_pop_span();
 });
