@@ -31,6 +31,7 @@
 #include "postmaster/syslogger.h"
 #include "storage/bufmgr.h"
 #include "utils/acl.h"
+#include "utils/auth_lock.h"
 #include "utils/backend_status.h"
 #include "utils/datetime.h"
 #include "utils/fmgrprotos.h"
@@ -895,6 +896,23 @@ check_session_authorization(char **newval, void **extra, GucSource source)
 							 *newval);
 			return false;
 		}
+
+		/* Authorization lock check; see counterpart in check_role. */
+		if (AuthLockWouldViolate(AUTH_LOCK_SCOPE_SESSION_AUTH, roleid))
+		{
+			if (source == PGC_S_TEST)
+			{
+				ereport(NOTICE,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("session authorization is locked; cannot change to \"%s\"",
+								*newval)));
+				return true;
+			}
+			GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+			GUC_check_errmsg("session authorization is locked; cannot change to \"%s\"",
+							 *newval);
+			return false;
+		}
 	}
 
 	/* Set up "extra" struct for assign_session_authorization to use */
@@ -912,12 +930,20 @@ void
 assign_session_authorization(const char *newval, void *extra)
 {
 	role_auth_extra *myextra = (role_auth_extra *) extra;
+	Oid			roleid;
+	bool		is_superuser;
 
 	/* Do nothing for the boot_val default of NULL */
 	if (!myextra)
 		return;
 
-	SetSessionAuthorization(myextra->roleid, myextra->is_superuser);
+	roleid = myextra->roleid;
+	is_superuser = myextra->is_superuser;
+
+	/* Clip-to-ceiling for transaction-abort / GUC-unwind paths. */
+	AuthLockClipRole(AUTH_LOCK_SCOPE_SESSION_AUTH, &roleid, &is_superuser);
+
+	SetSessionAuthorization(roleid, is_superuser);
 }
 
 
@@ -1009,6 +1035,39 @@ check_role(char **newval, void **extra, GucSource source)
 							 *newval);
 			return false;
 		}
+
+	}
+
+	/*
+	 * If a session-level authorization lock is in effect, refuse any change
+	 * that would cross the ceiling.  This catches direct user-initiated
+	 * escalation paths: RESET ROLE, SET ROLE NONE (collapses to session
+	 * user), SET ROLE <other-reachable-via-session-user>,
+	 * set_config('role',...), DISCARD ALL, etc.  GUC unwind from
+	 * transaction abort is handled separately in assign_role: that path must
+	 * not error (errors during abort PANIC), so it clips silently.
+	 *
+	 * Placed after the if/else chain so the check applies uniformly to the
+	 * "none" hardwired translation, the parallel-worker init path, and the
+	 * normal user-initiated path.  Parallel worker init is exempt because
+	 * the leader has already validated the value and the worker must accept
+	 * it verbatim.
+	 */
+	if (!InitializingParallelWorker &&
+		AuthLockWouldViolate(AUTH_LOCK_SCOPE_ROLE, roleid))
+	{
+		if (source == PGC_S_TEST)
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("session role is locked; cannot change to \"%s\"",
+							*newval)));
+			return true;
+		}
+		GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
+		GUC_check_errmsg("session role is locked; cannot change to \"%s\"",
+						 *newval);
+		return false;
 	}
 
 	/* Set up "extra" struct for assign_role to use */
@@ -1026,8 +1085,19 @@ void
 assign_role(const char *newval, void *extra)
 {
 	role_auth_extra *myextra = (role_auth_extra *) extra;
+	Oid			roleid = myextra->roleid;
+	bool		is_superuser = myextra->is_superuser;
 
-	SetCurrentRoleId(myextra->roleid, myextra->is_superuser);
+	/*
+	 * Clip-to-ceiling for transaction-abort / GUC-unwind paths.  check_role
+	 * already rejected user-initiated above-ceiling SETs; if a value above
+	 * the ceiling reaches assign_role it means we are restoring a stacked
+	 * value during unwind, and we must not raise here (would PANIC).  See
+	 * AuthLockClipRole().
+	 */
+	AuthLockClipRole(AUTH_LOCK_SCOPE_ROLE, &roleid, &is_superuser);
+
+	SetCurrentRoleId(roleid, is_superuser);
 }
 
 const char *
