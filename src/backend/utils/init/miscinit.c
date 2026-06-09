@@ -48,6 +48,7 @@
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "utils/auth_lock.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -921,6 +922,17 @@ system_user(PG_FUNCTION_ARGS)
 void
 SetSessionAuthorization(Oid userid, bool is_superuser)
 {
+	/*
+	 * Layer 1 chokepoint clip for the authorization lock.  Every durable
+	 * mutation of session_authorization passes through this function (GUC
+	 * assign, backend init, parallel worker startup, future protocol-level
+	 * handlers, third-party extensions calling the public miscadmin.h API).
+	 * Placing the clip here ensures the lock cannot be bypassed by any
+	 * code path that targets this function.  Cannot raise: this function
+	 * runs during transaction abort, where errors PANIC the session.
+	 */
+	AuthLockClipRole(AUTH_LOCK_SCOPE_SESSION_AUTH, &userid, &is_superuser);
+
 	SetSessionUserId(userid, is_superuser);
 
 	if (!SetRoleIsActive)
@@ -957,6 +969,8 @@ GetCurrentRoleId(void)
 void
 SetCurrentRoleId(Oid roleid, bool is_superuser)
 {
+	bool		was_invalid = !OidIsValid(roleid);
+
 	/*
 	 * Get correct info if it's SET ROLE NONE
 	 *
@@ -965,16 +979,36 @@ SetCurrentRoleId(Oid roleid, bool is_superuser)
 	 * update the derived state.  This is needed since we will get called
 	 * during GUC initialization.
 	 */
-	if (!OidIsValid(roleid))
+	if (was_invalid)
 	{
-		SetRoleIsActive = false;
-
 		if (!OidIsValid(SessionUserId))
+		{
+			SetRoleIsActive = false;
 			return;
+		}
 
 		roleid = SessionUserId;
 		is_superuser = SessionUserIsSuperuser;
 	}
+
+	/*
+	 * Layer 1 chokepoint clip for the authorization lock.  See comment in
+	 * SetSessionAuthorization above.  After the SET ROLE NONE translation
+	 * above, the effective target is either the caller-supplied role or
+	 * the session user.  Clip may force it to the ceiling if a lock is in
+	 * effect and the target is above it.
+	 */
+	AuthLockClipRole(AUTH_LOCK_SCOPE_ROLE, &roleid, &is_superuser);
+
+	/*
+	 * Update SetRoleIsActive based on the *actual* outcome.  If the caller
+	 * requested SET ROLE NONE and the clip did not move us off
+	 * SessionUserId, SET ROLE is not active.  Otherwise (explicit role, or
+	 * clip forced us to the ceiling away from SessionUserId), SET ROLE is
+	 * active.
+	 */
+	if (was_invalid && roleid == SessionUserId)
+		SetRoleIsActive = false;
 	else
 		SetRoleIsActive = true;
 

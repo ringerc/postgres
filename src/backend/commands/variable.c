@@ -930,20 +930,17 @@ void
 assign_session_authorization(const char *newval, void *extra)
 {
 	role_auth_extra *myextra = (role_auth_extra *) extra;
-	Oid			roleid;
-	bool		is_superuser;
 
 	/* Do nothing for the boot_val default of NULL */
 	if (!myextra)
 		return;
 
-	roleid = myextra->roleid;
-	is_superuser = myextra->is_superuser;
-
-	/* Clip-to-ceiling for transaction-abort / GUC-unwind paths. */
-	AuthLockClipRole(AUTH_LOCK_SCOPE_SESSION_AUTH, &roleid, &is_superuser);
-
-	SetSessionAuthorization(roleid, is_superuser);
+	/*
+	 * The authorization-lock clip is applied inside SetSessionAuthorization
+	 * itself (Layer 1 chokepoint); see comments there.  Nothing to do here
+	 * beyond the upstream behaviour.
+	 */
+	SetSessionAuthorization(myextra->roleid, myextra->is_superuser);
 }
 
 
@@ -1085,19 +1082,13 @@ void
 assign_role(const char *newval, void *extra)
 {
 	role_auth_extra *myextra = (role_auth_extra *) extra;
-	Oid			roleid = myextra->roleid;
-	bool		is_superuser = myextra->is_superuser;
 
 	/*
-	 * Clip-to-ceiling for transaction-abort / GUC-unwind paths.  check_role
-	 * already rejected user-initiated above-ceiling SETs; if a value above
-	 * the ceiling reaches assign_role it means we are restoring a stacked
-	 * value during unwind, and we must not raise here (would PANIC).  See
-	 * AuthLockClipRole().
+	 * The authorization-lock clip is applied inside SetCurrentRoleId itself
+	 * (Layer 1 chokepoint); see comments there.  Nothing to do here beyond
+	 * the upstream behaviour.
 	 */
-	AuthLockClipRole(AUTH_LOCK_SCOPE_ROLE, &roleid, &is_superuser);
-
-	SetCurrentRoleId(roleid, is_superuser);
+	SetCurrentRoleId(myextra->roleid, myextra->is_superuser);
 }
 
 const char *
