@@ -22,17 +22,21 @@
 -- ----------------------------------------------------------------
 -- Classification by the irrevocable-privilege-drop patch
 -- ----------------------------------------------------------------
--- IRR  = will be blocked by SET ROLE x IRREVOCABLE (the v1 patch)
--- COOK = will be blocked by SET ROLE x WITH COOKIE (v1 patch, if
---        cookie not exposed)
--- OTHER = requires hardening orthogonal to the v1 patch (search_path
+-- LOCK  = will be blocked by an authorization lock installed via
+--         SET ROLE x IRREVOCABLE or SET ROLE x WITH COOKIE.  The
+--         two lock kinds offer the same in-session protection
+--         against escape — they differ only in whether a single
+--         legitimate unlock is possible (COOKIE) or impossible
+--         (IRREVOCABLE).  See design §5.1.  All escape vectors
+--         categorised here treat the two kinds identically.
+-- OTHER = requires hardening orthogonal to the lock (search_path
 --         discipline, SECDEF audit, etc.); listed here because the
 --         shared problem is "SET ROLE is not a sound isolation
 --         boundary"
 --
---   A.  Direct restoration class       — IRR, COOK
---   B.  GUC rollback class             — IRR, COOK
---   C.  search_path hijack             — IRR helps reduce damage
+--   A.  Direct restoration class       — LOCK
+--   B.  GUC rollback class             — LOCK
+--   C.  search_path hijack             — LOCK helps reduce damage
 --                                         (attacker can no longer
 --                                         RESET ROLE inside hijacked
 --                                         function), but the function
@@ -40,7 +44,7 @@
 --                                         needs schema/search_path
 --                                         discipline
 --   D.  Object-definition triggers     — OTHER (function runs as
---                                         writer; IRREVOCABLE doesn't
+--                                         writer; the lock doesn't
 --                                         prevent this — the writer
 --                                         hasn't dropped privilege.
 --                                         The lesson is that
@@ -49,11 +53,32 @@
 --                                         whose definitions contain
 --                                         attacker-controlled
 --                                         functions.)
---   E.  SECURITY DEFINER lent back     — IRR if the SECDEF body does
+--   E.  SECURITY DEFINER lent back     — LOCK if the SECDEF body does
 --                                         a SET ROLE the caller's
 --                                         lock should clip
---   F.  Connection-state escape        — IRR
+--   F.  Connection-state escape        — LOCK
 --   G.  Catalog-driven invocation      — OTHER (similar to D)
+--
+-- No "PROTO" classification (protocol-level role management, design
+-- §16) appears here.  PROTO is not a different *enforcement* tier —
+-- it routes the SAME AuthLock primitives through a wire-protocol
+-- channel that bypasses the SQL parser/executor/logging.  Every
+-- escape vector in this file is reached via SQL execution *inside*
+-- an already-established session; the lock's in-session enforcement
+-- (Layer 1 chokepoint clip + Layer 2 user-visible refusal) blocks
+-- them all regardless of whether the lock was installed via SQL or
+-- via a protocol message.
+--
+-- The benefits PROTO adds are about the *channel between pooler
+-- and backend*, not about in-session escape:
+--   * Pooler's privilege-management bytes cannot be smuggled into
+--     by tenant-controlled SQL (different wire-protocol layer).
+--   * Role name is never visible to log_statement / pg_stat_statements
+--     / auto_explain.
+--   * Privilege ops have no Parse/Bind/Describe lifecycle and so
+--     cannot be re-bound via extended-query.
+-- These belong in a pooler-channel-hardening test suite (not yet
+-- written), not in this in-session escape catalogue.
 -- ----------------------------------------------------------------
 \set VERBOSITY terse
 -- ============================================================
@@ -77,7 +102,7 @@ SELECT current_user;
 (1 row)
 
 -- ============================================================
--- A.  Direct privilege restoration  [IRR]
+-- A.  Direct privilege restoration  [LOCK]
 -- ============================================================
 -- A1.  Function body calls RESET ROLE.
 CREATE FUNCTION regress_low_schema.escape_via_reset() RETURNS name
@@ -156,7 +181,7 @@ RESET ROLE;
 RESET SESSION AUTHORIZATION;
 SET SESSION AUTHORIZATION regress_role_high;
 -- ============================================================
--- B.  GUC rollback class  [IRR]
+-- B.  GUC rollback class  [LOCK]
 -- ============================================================
 -- B1.  SET LOCAL ROLE undone by transaction abort.
 BEGIN;
@@ -241,7 +266,7 @@ SELECT current_user;                                -- regress_role_high (SET LO
 (1 row)
 
 -- ============================================================
--- C.  search_path hijack  [IRR partially / OTHER]
+-- C.  search_path hijack  [LOCK partially / OTHER]
 -- ============================================================
 -- C1.  Function-name shadowing.
 CREATE FUNCTION regress_low_schema.length(text) RETURNS int
@@ -541,7 +566,7 @@ $$;
 NOTICE:  D8: domain CHECK ran as regress_role_high
 NOTICE:  D8: domain CHECK ran as regress_role_high
 -- ============================================================
--- E.  SECURITY DEFINER lent back to lowered context  [IRR + OTHER]
+-- E.  SECURITY DEFINER lent back to lowered context  [LOCK + OTHER]
 -- ============================================================
 -- E1.  SECDEF wrapper that EXECUTEs untrusted SQL passed by the
 --      lowered caller.  The EXECUTE runs as the SECDEF owner (high =
@@ -589,7 +614,7 @@ SELECT rolname, rolsuper, rolcanlogin FROM pg_roles
 
 DROP ROLE regress_role_evil;
 -- ============================================================
--- F.  Connection-state escape  [IRR]
+-- F.  Connection-state escape  [LOCK]
 -- ============================================================
 -- F1.  DISCARD ALL.
 SET ROLE regress_role_low;
