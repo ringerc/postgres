@@ -120,7 +120,7 @@ api_reset_root_context(void)
 static bool
 api_try_apply_sqlcommenter_context(const char *sql)
 {
-	/* Gated by the otel.parse_sqlcommenter GUC.  Returning false
+	/* Gated by the otel_api.parse_sqlcommenter GUC.  Returning false
 	 * without parsing matches the behaviour of "no comment
 	 * contained a traceparent" --- the caller can safely treat both
 	 * cases identically. */

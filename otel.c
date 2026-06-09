@@ -14,7 +14,7 @@
  * The active trace context is stored in two custom GUCs, mirroring the
  * two HTTP headers the W3C Trace Context spec defines:
  *
- *	 otel.traceparent  Required, fixed format:
+ *	 otel_api.traceparent  Required, fixed format:
  *					   "{version}-{trace-id}-{parent-id}-{flags}".
  *					   Every component has spec-defined semantics;
  *					   every conformant tracing participant MUST
@@ -24,7 +24,7 @@
  *					   This is the load-bearing piece for log
  *					   correlation.
  *
- *	 otel.tracestate   Optional, vendor-extensible: a comma-separated
+ *	 otel_api.tracestate   Optional, vendor-extensible: a comma-separated
  *					   list of "vendor=value" pairs, where the
  *					   semantics of each value are defined by that
  *					   vendor's tracing system (Datadog, Honeycomb,
@@ -46,7 +46,7 @@
  *						  storage in place now avoids a wire/API
  *						  change later.
  *					   3. Diagnostic visibility via SHOW
- *						  otel.tracestate when operators are
+ *						  otel_api.tracestate when operators are
  *						  debugging trace propagation through proxy
  *						  chains.
  *
@@ -60,7 +60,7 @@
  *					   PostgreSQL, that belongs in a separate
  *					   `baggage.*` prefix handler (likely a sibling
  *					   `contrib/baggage` module), not in
- *					   `otel.tracestate`.
+ *					   `otel_api.tracestate`.
  *
  * Using GUCs as the canonical storage has a deliberate side effect:
  * GUC values automatically propagate to parallel workers via
@@ -100,7 +100,7 @@
  * Client-side propagation:
  *
  *	 The PRIMARY entry point is the per-message 'M' RequestHeaders
- *	 protocol message: the client sends an otel.traceparent header
+ *	 protocol message: the client sends an otel_api.traceparent header
  *	 with the next Query, the handler attaches it for the duration
  *	 of that transaction, and our XactCallback (otel_xact_callback)
  *	 auto-clears it at top-level COMMIT / ROLLBACK / PREPARE.  Note
@@ -114,17 +114,17 @@
  *
  *	 ALTERNATIVELY, clients may set the GUCs directly with SQL:
  *
- *		 SET otel.traceparent = '00-{trace-id}-{span-id}-{flags}';
- *		 SET otel.tracestate  = 'vendor1=...,vendor2=...';
+ *		 SET otel_api.traceparent = '00-{trace-id}-{span-id}-{flags}';
+ *		 SET otel_api.tracestate  = 'vendor1=...,vendor2=...';
  *
  *	 or, scoped to one transaction:
  *
  *		 BEGIN;
- *		 SET LOCAL otel.traceparent = '...';
+ *		 SET LOCAL otel_api.traceparent = '...';
  *		 SELECT ...;
  *		 COMMIT;
  *
- *	 This works because otel.traceparent / otel.tracestate are
+ *	 This works because otel_api.traceparent / otel_api.tracestate are
  *	 ordinary PGC_USERSET GUCs.  Use it when:
  *
  *	   * the driver doesn't support the 'M' message yet;
@@ -142,8 +142,8 @@
  *	   * Cannot achieve statement scope.  GUC scoping options are:
  *		   - plain SET: session-scoped (persists across statements
  *			 AND transactions; survives auto-commit; the operator
- *			 must explicitly clear with `SET otel.traceparent = ''`
- *			 or `RESET otel.traceparent`).  Real risk of stale
+ *			 must explicitly clear with `SET otel_api.traceparent = ''`
+ *			 or `RESET otel_api.traceparent`).  Real risk of stale
  *			 context leaking from one logical operation to the
  *			 next, especially in long-lived connections.
  *		   - SET LOCAL: transaction-scoped (cleared at COMMIT or
@@ -202,7 +202,7 @@
 
 PG_MODULE_MAGIC;
 
-/* In-memory derived state populated by the otel.traceparent assign-hook
+/* In-memory derived state populated by the otel_api.traceparent assign-hook
  * (called by the GUC machinery on M-header arrival, SET, or
  * parallel-worker RestoreGUCState).  Read by the emit_log_hook in
  * otel_log.c. */
@@ -222,9 +222,9 @@ bool		otel_parse_sqlcommenter = false;
 /*
  * Flag set by the executor/utility hooks when otel_ctx was
  * populated from a sqlcommenter comment in the SQL text (as opposed
- * to from the otel.traceparent GUC).  Comment-derived context is
+ * to from the otel_api.traceparent GUC).  Comment-derived context is
  * STATEMENT-scoped: cleared in finalize_span.  We bypass the GUC
- * path so SHOW otel.traceparent doesn't lie about session state
+ * path so SHOW otel_api.traceparent doesn't lie about session state
  * and so a comment on one statement doesn't bleed into the next.
  */
 bool		otel_ctx_from_comment = false;
@@ -247,7 +247,7 @@ static bool extract_traceparent_from_comment(const char *body, size_t bodylen,
 
 
 /*
- * GUC check-hook for otel.traceparent --- validates the W3C format.
+ * GUC check-hook for otel_api.traceparent --- validates the W3C format.
  * An empty string or NULL is accepted as "clear".
  */
 static bool
@@ -268,7 +268,7 @@ check_traceparent(char **newval, void **extra, GucSource source)
 }
 
 /*
- * GUC assign-hook for otel.traceparent --- populates the in-memory
+ * GUC assign-hook for otel_api.traceparent --- populates the in-memory
  * derived state.  Called on every value change, including by
  * RestoreGUCState in a parallel worker.
  */
@@ -322,12 +322,20 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
 {
 	const char *guc;
 
+	/*
+	 * Wire-key -> GUC-name mapping.  The wire keys (clients send them
+	 * in the 'M' frame) stay in the legacy "otel.*" namespace --- they
+	 * are a protocol-level contract and changing them would be a wire
+	 * breaking change.  The GUCs they map into were renamed to the
+	 * "otel_api.*" namespace when extension naming was aligned to the
+	 * package directory.  See DefineCustom* calls in _PG_init.
+	 */
 	if (strcmp(key, "otel.traceparent") == 0)
-		guc = "otel.traceparent";
+		guc = "otel_api.traceparent";
 	else if (strcmp(key, "otel.tracestate") == 0)
-		guc = "otel.tracestate";
+		guc = "otel_api.tracestate";
 	else
-		return;					/* unknown otel.* key */
+		return;					/* unknown otel.* wire key */
 
 	/*
 	 * An empty value is the documented "clear this key" convention; map
@@ -386,7 +394,7 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
  * Leaving the GUC variable stale relative to in-memory state is
  * acceptable because otel_ctx.is_set is the authoritative flag that
  * start_span reads.  The next M (or explicit SET) will overwrite
- * the GUC cleanly.  SHOW otel.traceparent may briefly show a stale
+ * the GUC cleanly.  SHOW otel_api.traceparent may briefly show a stale
  * value between an aborted transaction and the next assignment ---
  * a known cosmetic limitation.
  *
@@ -464,7 +472,7 @@ _PG_init(void)
 	 * to the empty string (= "no context set"); the assign-hook
 	 * collapses empty -> no context.
 	 */
-	DefineCustomStringVariable("otel.traceparent",
+	DefineCustomStringVariable("otel_api.traceparent",
 							   "W3C Trace Context traceparent for the current operation.",
 							   "Format: \"00-{32 hex}-{16 hex}-{2 hex}\". Empty means no trace context.",
 							   &otel_traceparent_guc,
@@ -475,7 +483,7 @@ _PG_init(void)
 							   assign_traceparent,
 							   NULL);
 
-	DefineCustomStringVariable("otel.tracestate",
+	DefineCustomStringVariable("otel_api.tracestate",
 							   "W3C Trace Context tracestate companion value.",
 							   "Stored opaquely; not interpreted by this module.",
 							   &otel_tracestate_guc,
@@ -490,7 +498,7 @@ _PG_init(void)
 	 * superseded by the per-backend shared-memory slot mechanism in
 	 * otel_parallel.c.  See OtelParallelContext in otel.h. */
 
-	DefineCustomBoolVariable("otel.emit_spans_to_log",
+	DefineCustomBoolVariable("otel_api.emit_spans_to_log",
 							 "Emit completed spans as structured log lines.",
 							 NULL,
 							 &otel_emit_spans_to_log,
@@ -499,10 +507,10 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	/* otel.trace_all_queries moved to contrib/otel_postgres_tracing
-	 * in Phase 4; it's a query-tracing-specific behaviour GUC. */
+	/* trace_all_queries is owned by otel_postgres_tracing; see its
+	 * _PG_init for that GUC. */
 
-	DefineCustomStringVariable("otel.service_name",
+	DefineCustomStringVariable("otel_api.service_name",
 							   "OTel Resource service.name attribute for this postmaster.",
 							   "Identifies the service emitting traces / metrics.  Default "
 							   "\"postgres\".  Operators typically set this to a deployment-"
@@ -514,7 +522,7 @@ _PG_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomStringVariable("otel.service_instance_id",
+	DefineCustomStringVariable("otel_api.service_instance_id",
 							   "OTel Resource service.instance.id attribute for this postmaster.",
 							   "Uniquely identifies this postmaster instance among instances "
 							   "of the same service.  Empty string (the default) selects the "
@@ -526,14 +534,14 @@ _PG_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("otel.parse_sqlcommenter",
+	DefineCustomBoolVariable("otel_api.parse_sqlcommenter",
 							 "Extract trace context from sqlcommenter SQL comments when no other context is set.",
 							 "Default off.  WARNING: structurally broken under driver-side or "
 							 "server-side prepared statements --- the SQL text (and its comment) "
 							 "is captured at Parse time and frozen in the cached plan, so every "
 							 "subsequent Execute reuses the original traceparent.  Prefer the "
-							 "'M' protocol header, or SET LOCAL otel.traceparent with pipelining, "
-							 "for any workload that uses prepared statements.",
+							 "'M' protocol header, or SET LOCAL otel_api.traceparent with "
+							 "pipelining, for any workload that uses prepared statements.",
 							 &otel_parse_sqlcommenter,
 							 false,
 							 PGC_USERSET,
@@ -541,17 +549,20 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
-	 * Note: we deliberately do NOT call MarkGUCPrefixReserved("otel")
-	 * here.  The "otel." GUC namespace is shared with
-	 * otel_postgres_tracing, which defines otel.trace_all_queries in
-	 * its _PG_init --- that runs AFTER ours because of
-	 * shared_preload_libraries load order, and reserving the prefix
-	 * before its DefineCustom* call would drop any
-	 * otel.trace_all_queries = ... placeholder that was loaded from
-	 * postgresql.conf at server start.  The reservation is performed
-	 * by otel_postgres_tracing's _PG_init instead (which is what runs
-	 * last among the modules that contribute otel.* GUCs).
+	 * Reserve the otel_api.* GUC namespace this module owns
+	 * exclusively.  Other modules in the stack use different
+	 * namespaces:
+	 *   otel_postgres_tracing.*  --- the query-tracing consumer
+	 *   oteltracingdemo.*        --- the Rust demo exporter
+	 *   otel.trace_all_queries   --- legacy single-GUC carve-out
+	 *                                (lives in otel_postgres_tracing
+	 *                                 for back-compat)
+	 *
+	 * No cross-module shared namespace, so this reservation is safe
+	 * to do at _PG_init time and gives operators a typo-protection
+	 * warning on any unknown otel_api.* settings.
 	 */
+	MarkGUCPrefixReserved("otel_api");
 
 #ifdef OTEL_HAVE_PROTOCOL_HEADERS
 	/*
@@ -908,7 +919,7 @@ extract_traceparent_from_comment(const char *body, size_t bodylen,
 }
 
 /*
- * Orchestrator: if otel.parse_sqlcommenter is on AND otel_ctx is
+ * Orchestrator: if otel_api.parse_sqlcommenter is on AND otel_ctx is
  * not already populated by a higher-priority source ('M' header or
  * SET / SET LOCAL), try to extract a traceparent from a comment in
  * `sql` and apply it to otel_ctx directly (NOT via the GUC path

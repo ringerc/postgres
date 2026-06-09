@@ -18,7 +18,7 @@
  * -----------
  *	  * Root context: per-backend (trace_id, root_span_id, trace_flags,
  *	    tracestate), set when the client supplies trace context via the
- *	    'M' protocol header or via the otel.traceparent GUC.  The legacy
+ *	    'M' protocol header or via the otel_api.traceparent GUC.  The legacy
  *	    `OtelContext otel_ctx` in otel.c is the canonical storage; this
  *	    file reads it via the existing assign-hook-populated state.
  *
@@ -206,7 +206,7 @@ typedef struct OtelSpanUnwindNode
  */
 /*
  * Zero-config JSON-log fallback emitter.  Gated by
- * otel.emit_spans_to_log.  Used by dispatch_span below.  Moved
+ * otel_api.emit_spans_to_log.  Used by dispatch_span below.  Moved
  * here from otel_trace.c when the query-tracing module split out
  * in Phase 4 --- the log-line emitter is producer-side
  * infrastructure, not query-tracing-specific.

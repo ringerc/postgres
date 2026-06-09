@@ -24,9 +24,9 @@
 								 OTEL_SPAN_ID_LEN + 1 + OTEL_TRACE_FLAGS_LEN)
 
 /*
- * In-memory derived trace context populated by the otel.traceparent
+ * In-memory derived trace context populated by the otel_api.traceparent
  * assign-hook in otel.c; read by the emit_log_hook in otel_log.c.
- * tracestate, when present, lives in the otel.tracestate GUC's own
+ * tracestate, when present, lives in the otel_api.tracestate GUC's own
  * string storage and is not duplicated here.
  */
 typedef struct OtelContext

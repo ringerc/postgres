@@ -99,7 +99,7 @@ typedef struct OtelParallelContext
 
 /*
  * Snapshot of the backend's root context as supplied by the client
- * via the 'M' protocol header, SET otel.traceparent, or sqlcommenter
+ * via the 'M' protocol header, SET otel_api.traceparent, or sqlcommenter
  * SQL-comment parsing.  Exposed via the OtelTracingApi rendezvous
  * struct so the query-instrumentation module (and other consumers)
  * can inspect the root context without taking a direct symbol
