@@ -118,23 +118,18 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
-	 * Reserve both prefixes here, not in otel_api's _PG_init.  The
-	 * "otel." namespace is shared between otel_api and this module
-	 * (otel_api defines otel.traceparent / .tracestate / etc., we
-	 * define otel.trace_all_queries).  shared_preload_libraries loads
-	 * otel_api first; if otel_api called MarkGUCPrefixReserved("otel")
-	 * during its _PG_init it would drop the otel.trace_all_queries
-	 * placeholder loaded from postgresql.conf before this module had
-	 * a chance to claim it.  Doing it here, after this module has
-	 * defined its share of the namespace, lets the placeholder land
-	 * on the real GUC and preserves the typo-protection warning for
-	 * unknown otel.* settings.
+	 * "otel.trace_all_queries" is the lone surviving GUC in the
+	 * legacy "otel." namespace --- it predates the otel -> otel_api
+	 * extension rename and is kept here for continuity with existing
+	 * user configurations (a "SET otel.trace_all_queries = on" line
+	 * in postgresql.conf shouldn't break on upgrade).  Other otel_api
+	 * GUCs all moved to "otel_api.*" when extension naming was
+	 * aligned to the package directory, so this module is now the
+	 * sole owner of the "otel." prefix and the reservation is
+	 * conflict-free.
 	 *
-	 * Edge case: if otel_api is loaded WITHOUT otel_postgres_tracing,
-	 * the "otel." prefix never gets reserved and typos in otel.* GUCs
-	 * silently persist as placeholders.  That configuration produces
-	 * no spans anyway (no consumer), so the lost typo warning is
-	 * tolerable.
+	 * Also reserve "otel_postgres_tracing.*" for any future module-
+	 * specific GUCs (none today).
 	 */
 	MarkGUCPrefixReserved("otel");
 	MarkGUCPrefixReserved("otel_postgres_tracing");
