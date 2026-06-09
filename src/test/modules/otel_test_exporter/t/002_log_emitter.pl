@@ -27,12 +27,13 @@ log_min_messages = warning
 log_statement = 'none'
 EOCONF
 $node->start;
-$node->safe_psql('postgres', 'CREATE EXTENSION otel');
 
 if (!$node->raw_connect_works())
 {
 	plan skip_all => "this test requires working raw_connect()";
 }
+
+$node->safe_psql('postgres', 'CREATE EXTENSION otel');
 
 # ----- raw-protocol helpers (same shape as 001_basic.pl) -----
 

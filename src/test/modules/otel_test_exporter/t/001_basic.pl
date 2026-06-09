@@ -28,13 +28,17 @@ log_min_messages = warning
 log_statement = 'all'
 EOCONF
 $node->start;
-$node->safe_psql('postgres',
-	'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
 
+# raw_connect_works() requires a running postmaster (it tests by actually
+# connecting), so this check must come after $node->start.  Run it before
+# the CREATE EXTENSION below to avoid wasted setup work on the skip path.
 if (!$node->raw_connect_works())
 {
 	plan skip_all => "this test requires working raw_connect()";
 }
+
+$node->safe_psql('postgres',
+	'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
 
 # ----------------------------------------------------------------------
 # Raw-protocol helpers (same shape as the existing otel TAP test).
