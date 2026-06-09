@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
 # Coverage for contrib/otel's optional sqlcommenter trace context
-# extraction (GUC otel.parse_sqlcommenter).
+# extraction (GUC otel_api.parse_sqlcommenter).
 #
 # What this test verifies:
 #   * Default off: a sqlcommenter comment is ignored.
@@ -201,7 +201,7 @@ my $HEADER_SPAN         = 'dddddddddddddddd';
 # context; sqlcommenter parsing disabled).
 # ----------------------------------------------------------------------
 
-run_query($sock, 'RESET otel.parse_sqlcommenter');
+run_query($sock, 'RESET otel_api.parse_sqlcommenter');
 is( query_and_span_count(
 		$sock,
 		"/* traceparent='00-${COMMENT_TRACE_LEAD}-${COMMENT_SPAN_LEAD}-01' */ SELECT 1"
@@ -214,7 +214,7 @@ is( query_and_span_count(
 # client-supplied trace_id and parent_span_id.
 # ----------------------------------------------------------------------
 
-run_query($sock, "SET otel.parse_sqlcommenter = on");
+run_query($sock, "SET otel_api.parse_sqlcommenter = on");
 my $span = query_and_pop_span(
 	$sock,
 	"/* traceparent='00-${COMMENT_TRACE_LEAD}-${COMMENT_SPAN_LEAD}-01' */ SELECT 'lead'"
