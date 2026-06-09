@@ -540,7 +540,18 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("otel");
+	/*
+	 * Note: we deliberately do NOT call MarkGUCPrefixReserved("otel")
+	 * here.  The "otel." GUC namespace is shared with
+	 * otel_postgres_tracing, which defines otel.trace_all_queries in
+	 * its _PG_init --- that runs AFTER ours because of
+	 * shared_preload_libraries load order, and reserving the prefix
+	 * before its DefineCustom* call would drop any
+	 * otel.trace_all_queries = ... placeholder that was loaded from
+	 * postgresql.conf at server start.  The reservation is performed
+	 * by otel_postgres_tracing's _PG_init instead (which is what runs
+	 * last among the modules that contribute otel.* GUCs).
+	 */
 
 #ifdef OTEL_HAVE_PROTOCOL_HEADERS
 	/*
