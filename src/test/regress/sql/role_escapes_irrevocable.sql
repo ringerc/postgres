@@ -1,94 +1,191 @@
 --
 -- role_escapes_irrevocable
 --
--- Phase 0 verification of pg_set_role_irrevocable: re-runs the
--- direct-restoration (class A) and GUC-rollback (class B) escapes from
--- role_escapes.sql with the irrevocable lock installed.  Each escape
--- that previously succeeded must now either error or be silently
--- clipped, with current_user remaining at the locked role.
+-- Verification of pg_set_role_irrevocable: re-runs class-A
+-- (direct restoration) and class-B (GUC rollback) escapes from
+-- role_escapes.sql against a session locked by the IRREVOCABLE
+-- variant.  Each escape that previously succeeded must now either
+-- error or be silently clipped, with current_user remaining at the
+-- locked role.
 --
--- Classes C–G are deliberately out of scope here: they require the
--- caller to be high-privilege at the moment of attack, which the
--- IRREVOCABLE lock has by construction prevented.  Those classes need
--- orthogonal hardening and are covered by other tests / documentation.
+-- ----------------------------------------------------------------
+-- Structural rule for this file: ONE TEST CASE PER CONNECTION.
 --
+-- Each test reconnects via \c so it sets up its locked state from a
+-- clean session, runs ONE escape attempt, observes the result, and
+-- ends.  This is important because the irrevocable lock is by
+-- design single-use within a connection — RESET ROLE / DISCARD ALL
+-- currently clip silently (Phase 0) and will be hardened to ERROR
+-- in Phase 1.  Test cases must not depend on being able to recover
+-- the session state between scenarios.  When the harder defenses
+-- land, the only update needed will be to the expected-output file:
+-- the test SQL structure already assumes single-use sessions.
+--
+-- Classes C–G of role_escapes.sql are deliberately out of scope
+-- here — they require attacker-controlled code to run as the
+-- caller, which the IRREVOCABLE lock prevents by construction.
+-- Those classes need orthogonal hardening.
+-- ----------------------------------------------------------------
 
 \set VERBOSITY terse
 
+
+-- ============================================================
+-- Shared setup (one connection).  Roles persist across reconnects.
+-- ============================================================
+\c -
 CREATE ROLE regress_irr_high SUPERUSER;
 CREATE ROLE regress_irr_low NOSUPERUSER NOINHERIT;
 CREATE ROLE regress_irr_other NOSUPERUSER NOINHERIT;
 GRANT regress_irr_low   TO regress_irr_high;
 GRANT regress_irr_other TO regress_irr_high;
 
+
+-- ============================================================
+-- A1.  RESET ROLE from a locked session.
+--      Phase 0: silently clipped — current_user stays at ceiling.
+--      Phase 1 (planned): ERROR via set_config_option chokepoint.
+--      Either way, current_user must remain at the locked role.
+-- ============================================================
+\c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
-SELECT current_user AS locked;
-
-
--- A1.  RESET ROLE: silently clipped (assign_role) — GUC string may
---      revert to "none" but the effective role stays locked.
 RESET ROLE;
-SELECT current_user AS after_reset_role;             -- regress_irr_low
-
--- A2.  SET ROLE NONE: errored (check_role lock check fires).
-SET ROLE NONE;                                       -- ERROR
-SELECT current_user AS after_set_role_none;          -- regress_irr_low
-
--- A3.  SET ROLE to a sibling reachable via session_user but NOT via
---      the lock's ceiling.
-SET ROLE regress_irr_other;                          -- ERROR
-SELECT current_user AS after_set_role_sibling;       -- regress_irr_low
-
--- A4.  SET ROLE to a strictly higher role.
-SET ROLE regress_irr_high;                           -- ERROR
-SELECT current_user AS after_set_role_high;          -- regress_irr_low
-
--- A5.  SET SESSION AUTHORIZATION (the other scope is also locked).
-SET SESSION AUTHORIZATION regress_irr_high;          -- ERROR
-SELECT current_user AS after_set_sess_auth;          -- regress_irr_low
+SELECT current_user AS a1_after_reset_role;
 
 
--- B1.  Transaction abort attempting to rewind a SET LOCAL to a higher role.
---      Since SET LOCAL above ceiling would already fail at check time,
---      this exercise verifies the assign_role clip path on the unwind
---      side via a SET LOCAL to the same role (no-op above ceiling but
---      a value gets stacked).
-BEGIN;
-SET LOCAL ROLE regress_irr_low;                      -- ok (at ceiling)
-DO $$ BEGIN RAISE EXCEPTION 'rollback triggers unwind'; END $$;
-ROLLBACK;
-SELECT current_user AS after_rollback;               -- regress_irr_low
-
--- B2.  set_config() function variant.
-SELECT set_config('role', 'regress_irr_high', false);   -- ERROR
-SELECT current_user AS after_set_config;             -- regress_irr_low
+-- ============================================================
+-- A2.  SET ROLE NONE from a locked session — ERROR.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+SET ROLE NONE;
+SELECT current_user AS a2_after_set_role_none;
 
 
--- F1.  DISCARD ALL: silently clipped (does not error, but role stays).
-DISCARD ALL;
-SELECT current_user AS after_discard_all;            -- regress_irr_low
+-- ============================================================
+-- A3.  SET ROLE to a sibling (reachable via session_user but not
+--      from the ceiling) — ERROR.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+SET ROLE regress_irr_other;
+SELECT current_user AS a3_after_set_sibling;
 
--- F2.  RESET role (lowercase): also clipped.
-RESET role;
-SELECT current_user AS after_reset_role_guc;         -- regress_irr_low
+
+-- ============================================================
+-- A4.  SET ROLE to a strictly higher role — ERROR.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+SET ROLE regress_irr_high;
+SELECT current_user AS a4_after_set_high;
 
 
--- A1 via inline DO block (the original A1 from role_escapes.sql).
--- The RESET ROLE inside the body is silently clipped on assign, so
--- current_user inside the block stays at the locked role.
+-- ============================================================
+-- A5.  SET SESSION AUTHORIZATION (the other scope is also
+--      locked) — ERROR.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT current_user AS a5_after_set_sess_auth;
+
+
+-- ============================================================
+-- A6.  RESET ROLE invoked from inside a function called within
+--      the locked context (the canonical class-A attack from
+--      role_escapes.sql).
+--      Phase 0: clipped on assign — function's RESET is a no-op.
+--      Phase 1 (planned): set_config_option hook errors before
+--                          the function returns.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
 DO $$
 BEGIN
     RESET ROLE;
     RAISE NOTICE 'inside DO block, current_user = %', current_user;
 END;
 $$;
-SELECT current_user AS after_do_block;               -- regress_irr_low
+SELECT current_user AS a6_after_do_block;
 
 
--- Cleanup.  The current session is locked, so we cannot RESET back
--- to a superuser identity in-band.  Reconnect to drop the locked
--- session, then clean up roles as the superuser.
+-- ============================================================
+-- B1.  Transaction abort rewinding SET LOCAL ROLE.
+--      The SET LOCAL is at the ceiling (no-op above ceiling
+--      would have errored at check time); abort still goes
+--      through assign_role to restore the pre-LOCAL value, and
+--      the clip path keeps current_user at the ceiling.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+BEGIN;
+SET LOCAL ROLE regress_irr_low;
+DO $$ BEGIN RAISE EXCEPTION 'rollback triggers unwind'; END $$;
+ROLLBACK;
+SELECT current_user AS b1_after_rollback;
+
+
+-- ============================================================
+-- B2.  set_config('role', ...) — ERROR.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+SELECT set_config('role', 'regress_irr_high', false);
+SELECT current_user AS b2_after_set_config;
+
+
+-- ============================================================
+-- F1.  DISCARD ALL from a locked session.
+--      Phase 0: silently clipped — DISCARD ALL succeeds, but
+--               current_user stays at ceiling.
+--      Phase 1 (planned): ERROR from DISCARD ALL.  Tests that
+--               relied on DISCARD ALL working in a locked session
+--               will need to migrate to cookie-protected reset.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+DISCARD ALL;
+SELECT current_user AS f1_after_discard_all;
+
+
+-- ============================================================
+-- F2.  RESET role (lowercase, just the GUC).
+--      Same status as RESET ROLE — clipped today, will error
+--      under set_config_option chokepoint hook.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+RESET role;
+SELECT current_user AS f2_after_reset_role_lc;
+
+
+-- ============================================================
+-- F3.  set_config('role', NULL, false).
+--      This is the deepest non-statement RESET surface.  Phase
+--      0: clipped silently.  Phase 1 (planned): ERROR from the
+--      set_config_option hook.
+-- ============================================================
+\c -
+SET SESSION AUTHORIZATION regress_irr_high;
+SELECT pg_set_role_irrevocable('regress_irr_low');
+SELECT set_config('role', NULL, false);
+SELECT current_user AS f3_after_set_config_null;
+
+
+-- ============================================================
+-- Cleanup (fresh connection, superuser).
+-- ============================================================
 \c -
 DROP ROLE regress_irr_low;
 DROP ROLE regress_irr_other;
