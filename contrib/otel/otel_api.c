@@ -231,6 +231,7 @@ otel_api_publish_rendezvous(void)
 	void	  **slot;
 
 	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
+	Assert(slot != NULL);		/* HASH_ENTER ereports on OOM, never returns NULL */
 	*slot = (void *) &otel_tracing_api;
 }
 
