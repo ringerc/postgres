@@ -79,6 +79,59 @@
 --     cannot be re-bound via extended-query.
 -- These belong in a pooler-channel-hardening test suite (not yet
 -- written), not in this in-session escape catalogue.
+--
+-- ----------------------------------------------------------------
+-- Existing PostgreSQL safeguards confirmed by this test
+-- ----------------------------------------------------------------
+-- Several escape vectors documented here are *already* mitigated
+-- by long-standing PostgreSQL hardening, independently of any of
+-- this branch's work.  This test catalogues those mitigations
+-- empirically so that any regression in them would surface as a
+-- test failure:
+--
+--   * SECURITY_RESTRICTED_OPERATION blocks SET / RESET of role,
+--     session_authorization, and search_path inside expression
+--     contexts evaluated by writers/readers:
+--       - functional indexes (D1)
+--       - CHECK constraints (D2)
+--       - generated column expressions (D7)
+--       - domain CHECK constraints (D8)
+--       - RLS policy USING/WITH CHECK expressions (D6)
+--     The body of any IMMUTABLE / STABLE function reached via
+--     these surfaces cannot mutate session state.  Attacker code
+--     in those positions can still SIDE-CHANNEL (e.g. via NOTICE
+--     or by reading otherwise-restricted catalogs while running
+--     as the writer), which is why the test still treats these
+--     as escapes — but the simplest payload (RESET ROLE) is
+--     blocked at runtime.
+--
+--   * "cannot set parameter \"role\" within security-definer
+--     function" — SET / RESET of role / session_authorization /
+--     search_path is rejected inside any SECURITY DEFINER body.
+--     Confirmed by E1's first probe (which expects this error).
+--
+--   * GUC_NO_RESET_ALL flag on the role and session_authorization
+--     GUCs — RESET ALL silently skips these.  Confirmed by F2:
+--     RESET ALL leaves the (lowered) role intact; only an
+--     explicit RESET role / RESET ROLE clears it.
+--
+--   * ANALYZE / VACUUM with expression-index functions run the
+--     expression under the *table owner*'s identity, not the
+--     analyzing user's (CVE-2023-5869 and related changes).
+--     Confirmed by G2: INSERT-time evaluations show the WRITER
+--     in NOTICE output, but ANALYZE-time evaluations show the
+--     TABLE OWNER.
+--
+--   * Implicit cast from boolean to text is built-in and the
+--     attempted CREATE CAST (boolean AS text) is rejected.
+--     (Originally part of an early draft of C3; the test was
+--     reworked to use a domain check instead.)
+--
+-- A regression in any of these would be visible as a diff against
+-- the expected output.  Operators reading the .out file should
+-- treat NOTICEs that *don't* fire, or "permission denied"
+-- responses that *do* fire when the test expects success, as
+-- alarm signals about the corresponding safeguard.
 -- ----------------------------------------------------------------
 
 \set VERBOSITY terse
@@ -482,16 +535,40 @@ $$;
 --      lowered caller.  The EXECUTE runs as the SECDEF owner (high =
 --      superuser).
 --
---      Existing PG hardening: SET / RESET of "role",
---      "session_authorization", and "search_path" is rejected inside
---      a SECURITY DEFINER function body with errcode "cannot set
---      parameter \"role\" within security-definer function".
+--      IMPORTANT: this is not a PostgreSQL weakness.  The escape
+--      requires an exploitable SECDEF function to already exist —
+--      one whose body executes caller-supplied SQL (or builds SQL
+--      from caller-supplied identifiers without escaping).  A
+--      well-written SECDEF function — bodies that use only static
+--      SQL, parameterise all values, and never EXECUTE dynamic
+--      strings constructed from inputs — does not have this
+--      problem.  The test catalogues the class because it is a
+--      common application-level mistake, and because the lock
+--      work and the SECDEF-hardening follow-ups
+--      (role-isolation-hardening-followups.md, concepts 1 and 2)
+--      together would shrink the surface where such a mistake
+--      becomes catastrophic:
 --
---      But the SECDEF can still execute *other* privileged SQL on the
---      attacker's behalf.  Here we use CREATE ROLE: the attacker
---      causes the SECDEF to create a new superuser they control.
---      This is a lasting privilege escalation that survives the
---      session.
+--        * Lock: any role-mutation attempted via the dynamic SQL is
+--          still subject to the lock's enforcement.
+--        * Concept 1 (secure-by-default SECDEF search_path) and
+--          Concept 2 (require_qualified) would defang the
+--          search_path-hijack subclass of this attack, where the
+--          dynamic SQL is benign-looking but the resolution is
+--          attacker-influenced.
+--
+--      Existing PG hardening confirmed by this test case: SET /
+--      RESET of "role", "session_authorization", and "search_path"
+--      is rejected inside a SECURITY DEFINER function body with
+--      errcode "cannot set parameter \"role\" within
+--      security-definer function" (the SET ROLE pathway below
+--      demonstrates this).
+--
+--      But the SECDEF can still execute *other* privileged SQL on
+--      the attacker's behalf.  Here we use CREATE ROLE: the
+--      attacker causes the SECDEF to create a new superuser they
+--      control.  Persistent privilege escalation, but entirely a
+--      consequence of the SECDEF body design — not a PG flaw.
 
 SET SESSION AUTHORIZATION regress_role_high;
 CREATE FUNCTION regress_high_schema.secdef_runner(cmd text) RETURNS void
