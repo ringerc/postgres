@@ -278,8 +278,8 @@ run_query($sock, 'ROLLBACK');
 # ----------------------------------------------------------------------
 # Test 6: parallel-worker propagation.
 #
-# The trace context is stored in custom GUCs (otel.traceparent,
-# otel.tracestate); custom GUCs propagate to parallel workers as part
+# The trace context is stored in custom GUCs (otel_api.traceparent,
+# otel_api.tracestate); custom GUCs propagate to parallel workers as part
 # of the standard parallel-state machinery (RestoreGUCState during
 # worker startup).  The worker's assign_hook fires during that
 # restore, populating the worker's in-memory OtelContext.

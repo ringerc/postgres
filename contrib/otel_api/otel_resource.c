@@ -22,12 +22,12 @@
  * OtelTracingApi.get_resource_attributes().  Pointers in the array
  * remain valid for the lifetime of the backend, so exporters may
  * cache them.  Operators override the defaults via the
- * otel.service_name and otel.service_instance_id GUCs (which match
+ * otel_api.service_name and otel_api.service_instance_id GUCs (which match
  * OTel's environment-variable conventions OTEL_SERVICE_NAME etc.).
  *
  * Three resource attributes are populated:
- *	 - service.name --- the otel.service_name GUC, default "postgres".
- *	 - service.instance.id --- the otel.service_instance_id GUC if
+ *	 - service.name --- the otel_api.service_name GUC, default "postgres".
+ *	 - service.instance.id --- the otel_api.service_instance_id GUC if
  *	   set, else the cluster's pg_control system identifier as a
  *	   decimal string.
  *	 - host.name --- gethostname(3) at _PG_init; falls back to

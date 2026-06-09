@@ -9,7 +9,7 @@
  * read their leader's slot (indexed by ParallelLeaderProcNumber)
  * and use the leader's span_id as parent_span_id.
  *
- * Why a dedicated shared-memory array rather than the otel.traceparent
+ * Why a dedicated shared-memory array rather than the otel_api.traceparent
  * GUC system?  The GUCs are intentionally scoped as the client->server
  * entry point ONLY --- they hold what the client supplied via
  * SET / SET LOCAL or the 'M' protocol header, and must not be

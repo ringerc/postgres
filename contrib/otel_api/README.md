@@ -1,12 +1,12 @@
-# contrib/otel
+# otel_api
 
 OpenTelemetry trace-context glue for PostgreSQL.
 
 This module wires PostgreSQL into OpenTelemetry tracing by:
 
 * Accepting a propagated W3C `traceparent` / `tracestate` from the client
-  (via query-headers, using GUCs `otel.traceparent` / `otel.tracestate`, or opt-in
-  `sqlcommenter`-style query comments).
+  (via query-headers, using GUCs `otel_api.traceparent` /
+  `otel_api.tracestate`, or opt-in `sqlcommenter`-style query comments).
 * Generating a span per top-level query and per utility statement using
   `ExecutorStart_hook` / `ExecutorEnd_hook` / `ProcessUtility_hook`.
 * Capturing `ereport()`s on the active span as OTel span events.
