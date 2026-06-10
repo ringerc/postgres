@@ -69,17 +69,18 @@ auth_channel_recv(PGconn *conn, PGresult **err_out, char **payload_out,
 				return 0;
 		}
 
+		/*
+		 * Assume more input is needed unless we successfully consume a
+		 * complete message this iteration (mirrors pqFunctionCall3's
+		 * pattern in fe-protocol3.c).
+		 */
+		needInput = true;
+
 		conn->inCursor = conn->inStart;
 		if (pqGetc(&id, (PGconn *) conn))
-		{
-			needInput = true;
 			continue;
-		}
 		if (pqGetInt(&msgLength, 4, (PGconn *) conn))
-		{
-			needInput = true;
 			continue;
-		}
 
 		if (msgLength < 4)
 			return 0;
@@ -115,9 +116,13 @@ auth_channel_recv(PGconn *conn, PGresult **err_out, char **payload_out,
 		 * don't dispatch to pqParseInput3 here because it has its own state
 		 * machine expectations; for the auth-channel send/recv path we only
 		 * care about Y/E/Z and quietly consume anything else.
+		 *
+		 * Reset needInput so the next iteration tries to parse whatever
+		 * remains in the buffer before waiting for more network input.
 		 */
 		conn->inCursor += msgLength;
 		conn->inStart = conn->inCursor;
+		needInput = false;
 	}
 }
 
@@ -192,48 +197,28 @@ auth_channel_make_result(PGconn *conn, char id, const char *payload, int payload
 
 		if (res && status == 1 && cookie_len > 0)
 		{
-			/* Make a one-field binary tuple holding the cookie bytes. */
-			static const char *colname = "cookie";
-			res->numAttributes = 1;
-			res->binary = 1;
-			res->attDescs = (PGresAttDesc *)
-				pqResultAlloc(res, sizeof(PGresAttDesc), true);
-			if (!res->attDescs)
-			{
-				PQclear(res);
-				return NULL;
-			}
-			res->attDescs[0].name = pqResultStrdup(res, colname);
-			res->attDescs[0].tableid = 0;
-			res->attDescs[0].columnid = 0;
-			res->attDescs[0].format = 1;	/* binary */
-			res->attDescs[0].typid = 17;	/* BYTEAOID */
-			res->attDescs[0].typlen = -1;
-			res->attDescs[0].atttypmod = -1;
+			/*
+			 * Make a one-field binary tuple holding the cookie bytes via
+			 * the public PQsetResultAttrs / PQsetvalue path, which handles
+			 * all the bookkeeping (tupArrSize, attDescs allocation, etc.)
+			 * that lets PQclear free everything correctly.
+			 */
+			PGresAttDesc attDesc;
 
-			res->tuples = (PGresAttValue **)
-				pqResultAlloc(res, sizeof(PGresAttValue *), true);
-			if (!res->tuples)
+			attDesc.name = "cookie";
+			attDesc.tableid = 0;
+			attDesc.columnid = 0;
+			attDesc.format = 1;	/* binary */
+			attDesc.typid = 17;	/* BYTEAOID */
+			attDesc.typlen = -1;
+			attDesc.atttypmod = -1;
+			if (!PQsetResultAttrs(res, 1, &attDesc) ||
+				!PQsetvalue(res, 0, 0, (char *) cookie_ptr, cookie_len))
 			{
 				PQclear(res);
 				return NULL;
 			}
-			res->tuples[0] = (PGresAttValue *)
-				pqResultAlloc(res, sizeof(PGresAttValue), true);
-			if (!res->tuples[0])
-			{
-				PQclear(res);
-				return NULL;
-			}
-			res->tuples[0][0].len = cookie_len;
-			res->tuples[0][0].value = pqResultAlloc(res, cookie_len, true);
-			if (!res->tuples[0][0].value)
-			{
-				PQclear(res);
-				return NULL;
-			}
-			memcpy(res->tuples[0][0].value, cookie_ptr, cookie_len);
-			res->ntups = 1;
+			res->binary = 1;
 		}
 		return res;
 	}
