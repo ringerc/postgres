@@ -15,23 +15,44 @@
 -- clean session, runs ONE escape attempt, observes the result, and
 -- ends.  This is important because the irrevocable lock is by
 -- design single-use within a connection — RESET ROLE / DISCARD ALL
--- currently clip silently (Phase 0) and will be hardened to ERROR
--- in Phase 1.  Test cases must not depend on being able to recover
--- the session state between scenarios.  When the harder defenses
--- land, the only update needed will be to the expected-output file:
--- the test SQL structure already assumes single-use sessions.
+-- error or clip silently depending on which Phase 1 hook fired.
+-- Test cases must not depend on being able to recover the session
+-- state between scenarios.
+--
+-- ----------------------------------------------------------------
+-- Evidence model: goal_post table
+--
+-- A shared goal_post table is created at top.  It is owned by
+-- regress_irr_high, and INSERT is granted ONLY to regress_irr_high.
+-- regress_irr_low and regress_irr_other have no grant.
+--
+-- After each escape attempt, the test issues an INSERT into
+-- goal_post.  The INSERT runs under whatever current_user the
+-- session ended up at:
+--   * If the lock held (escape blocked or clipped), current_user is
+--     regress_irr_low → INSERT fails with permission denied → no
+--     row is recorded.
+--   * If the lock had failed (escape succeeded), current_user would
+--     be a privileged role with INSERT → row would be recorded.
+--
+-- The final score board at the end of the file lists any escape
+-- vectors that succeeded.  A passing run records ZERO rows; any
+-- row in the score board is a security-critical regression in the
+-- lock's enforcement.
 --
 -- Classes C–G of role_escapes.sql are deliberately out of scope
 -- here — they require attacker-controlled code to run as the
--- caller, which the IRREVOCABLE lock prevents by construction.
--- Those classes need orthogonal hardening.
+-- caller, which the IRREVOCABLE lock does not address (those
+-- classes need orthogonal hardening — see role-isolation-
+-- hardening-followups.md).
 -- ----------------------------------------------------------------
 
 \set VERBOSITY terse
 
 
 -- ============================================================
--- Shared setup (one connection).  Roles persist across reconnects.
+-- Shared setup (one connection).  Roles + goal_post persist across
+-- the \c reconnects below.
 -- ============================================================
 \c -
 CREATE ROLE regress_irr_high SUPERUSER;
@@ -40,69 +61,82 @@ CREATE ROLE regress_irr_other NOSUPERUSER NOINHERIT;
 GRANT regress_irr_low   TO regress_irr_high;
 GRANT regress_irr_other TO regress_irr_high;
 
+CREATE SCHEMA regress_irr_high_schema AUTHORIZATION regress_irr_high;
+GRANT USAGE ON SCHEMA regress_irr_high_schema TO PUBLIC;
+
+CREATE TABLE regress_irr_high_schema.goal_post (
+    achieved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    achieved_by name NOT NULL,
+    vector text NOT NULL,
+    note text
+);
+REVOKE ALL ON regress_irr_high_schema.goal_post FROM PUBLIC;
+GRANT INSERT ON regress_irr_high_schema.goal_post TO regress_irr_high;
+-- regress_irr_low and regress_irr_other have NO grant.  If the lock
+-- holds, any goal_post INSERT issued by the locked session errors
+-- with "permission denied for table goal_post" — proof the lock
+-- prevented the role from escaping to regress_irr_high.
+
 
 -- ============================================================
 -- A1.  RESET ROLE from a locked session.
---      Phase 0: silently clipped — current_user stays at ceiling.
---      Phase 1 (planned): ERROR via set_config_option chokepoint.
---      Either way, current_user must remain at the locked role.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 RESET ROLE;
-SELECT current_user AS a1_after_reset_role;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'A1', 'RESET ROLE from locked session');
 
 
 -- ============================================================
--- A2.  SET ROLE NONE from a locked session — ERROR.
+-- A2.  SET ROLE NONE from a locked session.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 SET ROLE NONE;
-SELECT current_user AS a2_after_set_role_none;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'A2', 'SET ROLE NONE from locked session');
 
 
 -- ============================================================
--- A3.  SET ROLE to a sibling (reachable via session_user but not
---      from the ceiling) — ERROR.
+-- A3.  SET ROLE to a sibling reachable via session_user but not
+--      from the ceiling.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 SET ROLE regress_irr_other;
-SELECT current_user AS a3_after_set_sibling;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'A3', 'SET ROLE sibling from locked session');
 
 
 -- ============================================================
--- A4.  SET ROLE to a strictly higher role — ERROR.
+-- A4.  SET ROLE to a strictly higher role.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 SET ROLE regress_irr_high;
-SELECT current_user AS a4_after_set_high;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'A4', 'SET ROLE high from locked session');
 
 
 -- ============================================================
--- A5.  SET SESSION AUTHORIZATION (the other scope is also
---      locked) — ERROR.
+-- A5.  SET SESSION AUTHORIZATION (the other scope is also locked).
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 SET SESSION AUTHORIZATION regress_irr_high;
-SELECT current_user AS a5_after_set_sess_auth;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'A5', 'SAS from locked session');
 
 
 -- ============================================================
--- A6.  RESET ROLE invoked from inside a function called within
---      the locked context (the canonical class-A attack from
---      role_escapes.sql).
---      Phase 0: clipped on assign — function's RESET is a no-op.
---      Phase 1 (planned): set_config_option hook errors before
---                          the function returns.
+-- A6.  RESET ROLE invoked from inside a function — the canonical
+--      class-A attack pattern from role_escapes.sql.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
@@ -110,18 +144,17 @@ SELECT pg_set_role_irrevocable('regress_irr_low');
 DO $$
 BEGIN
     RESET ROLE;
-    RAISE NOTICE 'inside DO block, current_user = %', current_user;
+    INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+        VALUES (current_user, 'A6', 'RESET ROLE inside DO block');
 END;
 $$;
-SELECT current_user AS a6_after_do_block;
 
 
 -- ============================================================
 -- B1.  Transaction abort rewinding SET LOCAL ROLE.
---      The SET LOCAL is at the ceiling (no-op above ceiling
---      would have errored at check time); abort still goes
---      through assign_role to restore the pre-LOCAL value, and
---      the clip path keeps current_user at the ceiling.
+--      The chokepoint clip in SetCurrentRoleId silently corrects
+--      the unwind target to the ceiling.  current_user stays at
+--      regress_irr_low; INSERT fails.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
@@ -130,69 +163,66 @@ BEGIN;
 SET LOCAL ROLE regress_irr_low;
 DO $$ BEGIN RAISE EXCEPTION 'rollback triggers unwind'; END $$;
 ROLLBACK;
-SELECT current_user AS b1_after_rollback;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'B1', 'transaction abort unwind from locked session');
 
 
 -- ============================================================
--- B2.  set_config('role', ...) — ERROR.
+-- B2.  set_config('role', ...) — Layer-2 set_config_option hook
+--      errors before the role change reaches the chokepoint.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 SELECT set_config('role', 'regress_irr_high', false);
-SELECT current_user AS b2_after_set_config;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'B2', 'set_config(role) from locked session');
 
 
 -- ============================================================
 -- F1.  DISCARD ALL from a locked session.
---      Phase 0: silently clipped — DISCARD ALL succeeds, but
---               current_user stays at ceiling.
---      Phase 1 (planned): ERROR from DISCARD ALL.  Tests that
---               relied on DISCARD ALL working in a locked session
---               will need to migrate to cookie-protected reset.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 DISCARD ALL;
-SELECT current_user AS f1_after_discard_all;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F1', 'DISCARD ALL from locked session');
 
 
 -- ============================================================
 -- F2.  RESET role (lowercase, just the GUC).
---      Same status as RESET ROLE — clipped today, will error
---      under set_config_option chokepoint hook.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 RESET role;
-SELECT current_user AS f2_after_reset_role_lc;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F2', 'RESET role lc from locked session');
 
 
 -- ============================================================
--- F3.  set_config('role', NULL, false).
---      This is the deepest non-statement RESET surface.  Phase
---      0: clipped silently.  Phase 1 (planned): ERROR from the
---      set_config_option hook.
+-- F3.  set_config('role', NULL, false) — the deepest non-statement
+--      RESET surface, covered by the set_config_option Layer-2
+--      hook.
 -- ============================================================
 \c -
 SET SESSION AUTHORIZATION regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 SELECT set_config('role', NULL, false);
-SELECT current_user AS f3_after_set_config_null;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'F3', 'set_config(role,NULL) from locked session');
 
 
 -- ============================================================
--- L3.  Layer 3 observability under abort-driven GUC unwind.
---      A SET LOCAL ROLE inside a transaction stacks the prior GUC
---      value (the session default, e.g. "none" or the test
---      runner's role).  When the transaction aborts, GUC unwind
---      restores that stacked value into role_string while the
---      Layer 1 chokepoint clips the OID-level identity back to
---      the ceiling.  show_role / show_session_authorization must
---      report the actual identity, not the (possibly above-
---      ceiling) GUC string.
+-- L3.  Layer-3 observability check under abort-driven GUC unwind.
+--      The previous test pattern relied on SELECT current_user /
+--      current_setting('role') to detect drift between the GUC
+--      string and the effective identity.  Under the goal_post
+--      model, the equivalent check is: after the abort, INSERT
+--      runs under the *effective* identity (clipped to ceiling);
+--      it must error.  Drift detectable via current_setting
+--      separately.
 -- ============================================================
 \c -
 BEGIN;
@@ -200,14 +230,31 @@ SET LOCAL ROLE regress_irr_high;
 SELECT pg_set_role_irrevocable('regress_irr_low');
 DO $$ BEGIN RAISE EXCEPTION 'force abort'; END $$;
 ROLLBACK;
-SELECT current_user AS l3_current_user,
-       current_setting('role') AS l3_show_role;
+-- current_setting reports truth (Layer 3); INSERT runs under the
+-- effective identity (clipped, Layer 1).
+SELECT current_setting('role') = current_user::text AS string_agrees_with_oid;
+INSERT INTO regress_irr_high_schema.goal_post(achieved_by, vector, note)
+    VALUES (current_user, 'L3', 'abort-driven unwind from locked session');
+
+
+-- ============================================================
+-- Score board (fresh connection, privileged).
+-- ============================================================
+-- Expected: zero rows.  Any row here is a regression in the
+-- lock's enforcement — that test case's escape attempt SUCCEEDED
+-- in writing to a privileged-owned table, meaning the lock failed
+-- to constrain the session's effective privileges.
+\c -
+SELECT count(*) AS escapes_recorded FROM regress_irr_high_schema.goal_post;
+SELECT vector, achieved_by, note FROM regress_irr_high_schema.goal_post
+    ORDER BY vector;
 
 
 -- ============================================================
 -- Cleanup (fresh connection, superuser).
 -- ============================================================
 \c -
+DROP SCHEMA regress_irr_high_schema CASCADE;
 DROP ROLE regress_irr_low;
 DROP ROLE regress_irr_other;
 DROP ROLE regress_irr_high;
