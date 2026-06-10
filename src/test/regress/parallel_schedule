@@ -53,7 +53,7 @@ test: create_aggregate create_function_sql create_cast constraints triggers sele
 # Authorization-lock tests (irrevocable-privilege-drop branch).  Grouped
 # on their own parallel line because they install per-backend
 # AuthLock state and each scenario reconnects (\c) to start clean.
-test: role_escapes role_escapes_irrevocable role_escapes_cookie
+test: role_escapes role_escapes_irrevocable role_escapes_cookie role_escapes_grammar
 
 # ----------
 # sanity_check does a vacuum, affecting the sort order of SELECT *

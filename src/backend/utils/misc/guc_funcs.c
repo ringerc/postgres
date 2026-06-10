@@ -28,6 +28,7 @@
 #include "miscadmin.h"
 #include "parser/parse_type.h"
 #include "utils/acl.h"
+#include "utils/auth_lock.h"
 #include "utils/builtins.h"
 #include "utils/guc_tables.h"
 #include "utils/snapmgr.h"
@@ -39,12 +40,122 @@ static void ShowAllGUCConfig(DestReceiver *dest);
 
 
 /*
+ * Dispatch a VariableSetStmt that carries an authorization-lock
+ * modifier (IRREVOCABLE or WITH COOKIE) to the AuthLock SQL functions.
+ *
+ * For SET ROLE / SET SESSION AUTHORIZATION with IRREVOCABLE or WITH
+ * COOKIE, we route through the existing pg_set_*_irrevocable /
+ * pg_set_*_with_cookie functions to share their validation +
+ * lock-installation logic.  For RESET ROLE / RESET SESSION
+ * AUTHORIZATION WITH COOKIE, we route through pg_reset_*_with_cookie.
+ *
+ * The cookie produced by SET ... WITH COOKIE in SQL grammar form is
+ * emitted as a NOTICE message; the bytea-returning function form
+ * pg_set_role_with_cookie() should be preferred by drivers and
+ * poolers that need to capture the cookie programmatically.
+ */
+static void
+exec_auth_lock_stmt(VariableSetStmt *stmt)
+{
+	bool		is_session_auth = (strcmp(stmt->name, "session_authorization") == 0);
+
+	if (!is_session_auth && strcmp(stmt->name, "role") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("IRREVOCABLE / WITH COOKIE modifier not supported for parameter \"%s\"",
+						stmt->name)));
+
+	if (stmt->is_local)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("SET LOCAL cannot be combined with IRREVOCABLE or WITH COOKIE")));
+
+	if (stmt->kind == VAR_SET_VALUE && stmt->auth_lock_kind == 1)
+	{
+		/* SET ROLE x IRREVOCABLE / SET SESSION AUTHORIZATION x IRREVOCABLE */
+		const char *rolename = ExtractSetVariableArgs(stmt);
+
+		if (is_session_auth)
+			DirectFunctionCall1(pg_set_session_authorization_irrevocable,
+								CStringGetTextDatum(rolename));
+		else
+			DirectFunctionCall1(pg_set_role_irrevocable,
+								CStringGetTextDatum(rolename));
+	}
+	else if (stmt->kind == VAR_SET_VALUE && stmt->auth_lock_kind == 2)
+	{
+		/* SET ROLE x WITH COOKIE / SET SESSION AUTHORIZATION x WITH COOKIE */
+		const char *rolename = ExtractSetVariableArgs(stmt);
+		Datum		cookie_datum;
+		bytea	   *cookie;
+		char	   *cookie_text;
+
+		if (is_session_auth)
+			cookie_datum = DirectFunctionCall1(pg_set_session_authorization_with_cookie,
+											   CStringGetTextDatum(rolename));
+		else
+			cookie_datum = DirectFunctionCall1(pg_set_role_with_cookie,
+											   CStringGetTextDatum(rolename));
+
+		cookie = DatumGetByteaPP(cookie_datum);
+
+		/*
+		 * Emit the cookie via NOTICE in bytea-hex format so that drivers
+		 * which capture NoticeResponse messages can extract it.  The
+		 * function-style API is the recommended path for programmatic
+		 * capture; this is a convenience for grammar-form callers.
+		 */
+		cookie_text = DatumGetCString(DirectFunctionCall1(byteaout,
+														  PointerGetDatum(cookie)));
+		ereport(NOTICE,
+				(errmsg("auth_lock_cookie: %s", cookie_text)));
+	}
+	else if (stmt->kind == VAR_RESET && stmt->auth_lock_kind == 2)
+	{
+		/* RESET ROLE WITH COOKIE 'lit' / RESET SESSION AUTHORIZATION WITH COOKIE 'lit' */
+		A_Const    *con = linitial_node(A_Const, stmt->args);
+		const char *cookie_lit = strVal(&con->val);
+		Datum		cookie_datum;
+
+		/*
+		 * The cookie literal is a string in PG bytea-input format
+		 * (e.g. '\x0123abcd...').  byteain accepts either the hex or the
+		 * escape form.
+		 */
+		cookie_datum = DirectFunctionCall1(byteain,
+										   CStringGetDatum(cookie_lit));
+
+		if (is_session_auth)
+			DirectFunctionCall1(pg_reset_session_authorization_with_cookie,
+								cookie_datum);
+		else
+			DirectFunctionCall1(pg_reset_role_with_cookie,
+								cookie_datum);
+	}
+	else
+	{
+		/* Should be impossible given the grammar; defensive check. */
+		elog(ERROR, "invalid combination of VariableSetStmt kind=%d auth_lock_kind=%d",
+			 stmt->kind, stmt->auth_lock_kind);
+	}
+}
+
+/*
  * SET command
  */
 void
 ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 {
 	GucAction	action = stmt->is_local ? GUC_ACTION_LOCAL : GUC_ACTION_SET;
+
+	/* Grammar-level IRREVOCABLE / WITH COOKIE modifiers dispatch out-of-band. */
+	if (stmt->auth_lock_kind != 0)
+	{
+		exec_auth_lock_stmt(stmt);
+		InvokeObjectPostAlterHookArgStr(ParameterAclRelationId, stmt->name,
+										ACL_SET, stmt->kind, false);
+		return;
+	}
 
 	/*
 	 * Workers synchronize these parameters at the start of the parallel

@@ -754,7 +754,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 	COMMITTED COMPRESSION CONCURRENTLY CONDITIONAL CONFIGURATION CONFLICT
-	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTINUE_P CONVERSION_P COPY
+	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTINUE_P CONVERSION_P COOKIE COPY
 	COST CREATE CROSS CSV CUBE CURRENT_P
 	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
@@ -778,7 +778,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	IDENTITY_P IF_P IGNORE_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
 	INCLUDING INCREMENT INDENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
-	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
+	INTERSECT INTERVAL INTO INVOKER IRREVOCABLE IS ISNULL ISOLATION
 
 	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_EXISTS JSON_OBJECT JSON_OBJECTAGG
 	JSON_QUERY JSON_SCALAR JSON_SERIALIZE JSON_TABLE JSON_VALUE
@@ -1876,6 +1876,28 @@ set_rest_more:	/* Generic SET syntaxes: */
 					n->location = @2;
 					$$ = n;
 				}
+			| ROLE NonReservedWord_or_Sconst IRREVOCABLE
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_SET_VALUE;
+					n->name = "role";
+					n->args = list_make1(makeStringConst($2, @2));
+					n->auth_lock_kind = 1;	/* AUTH_LOCK_IRREVOCABLE */
+					n->location = @2;
+					$$ = n;
+				}
+			| ROLE NonReservedWord_or_Sconst WITH COOKIE
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_SET_VALUE;
+					n->name = "role";
+					n->args = list_make1(makeStringConst($2, @2));
+					n->auth_lock_kind = 2;	/* AUTH_LOCK_COOKIE */
+					n->location = @2;
+					$$ = n;
+				}
 			| SESSION AUTHORIZATION NonReservedWord_or_Sconst
 				{
 					VariableSetStmt *n = makeNode(VariableSetStmt);
@@ -1883,6 +1905,28 @@ set_rest_more:	/* Generic SET syntaxes: */
 					n->kind = VAR_SET_VALUE;
 					n->name = "session_authorization";
 					n->args = list_make1(makeStringConst($3, @3));
+					n->location = @3;
+					$$ = n;
+				}
+			| SESSION AUTHORIZATION NonReservedWord_or_Sconst IRREVOCABLE
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_SET_VALUE;
+					n->name = "session_authorization";
+					n->args = list_make1(makeStringConst($3, @3));
+					n->auth_lock_kind = 1;	/* AUTH_LOCK_IRREVOCABLE */
+					n->location = @3;
+					$$ = n;
+				}
+			| SESSION AUTHORIZATION NonReservedWord_or_Sconst WITH COOKIE
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_SET_VALUE;
+					n->name = "session_authorization";
+					n->args = list_make1(makeStringConst($3, @3));
+					n->auth_lock_kind = 2;	/* AUTH_LOCK_COOKIE */
 					n->location = @3;
 					$$ = n;
 				}
@@ -2041,6 +2085,28 @@ reset_rest:
 					n->kind = VAR_RESET;
 					n->name = "session_authorization";
 					n->location = -1;
+					$$ = n;
+				}
+			| SESSION AUTHORIZATION WITH COOKIE Sconst
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_RESET;
+					n->name = "session_authorization";
+					n->args = list_make1(makeStringConst($5, @5));
+					n->auth_lock_kind = 2;	/* AUTH_LOCK_COOKIE */
+					n->location = @5;
+					$$ = n;
+				}
+			| ROLE WITH COOKIE Sconst
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_RESET;
+					n->name = "role";
+					n->args = list_make1(makeStringConst($4, @4));
+					n->auth_lock_kind = 2;	/* AUTH_LOCK_COOKIE */
+					n->location = @4;
 					$$ = n;
 				}
 		;
@@ -18871,6 +18937,7 @@ unreserved_keyword:
 			| CONTENT_P
 			| CONTINUE_P
 			| CONVERSION_P
+			| COOKIE
 			| COPY
 			| COST
 			| CSV
@@ -18959,6 +19026,7 @@ unreserved_keyword:
 			| INSERT
 			| INSTEAD
 			| INVOKER
+			| IRREVOCABLE
 			| ISOLATION
 			| KEEP
 			| KEY
@@ -19452,6 +19520,7 @@ bare_label_keyword:
 			| CONTENT_P
 			| CONTINUE_P
 			| CONVERSION_P
+			| COOKIE
 			| COPY
 			| COST
 			| CROSS

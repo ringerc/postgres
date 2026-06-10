@@ -2828,6 +2828,16 @@ typedef struct VariableSetStmt
 	bool		jumble_args;
 	/* SET LOCAL? */
 	bool		is_local;
+	/*
+	 * Irrevocable-privilege-drop modifier.  Non-zero only for SET ROLE /
+	 * SET SESSION AUTHORIZATION (when kind == VAR_SET_VALUE) with the
+	 * IRREVOCABLE or WITH COOKIE tail, and for RESET ROLE / RESET SESSION
+	 * AUTHORIZATION WITH COOKIE (when kind == VAR_RESET).  Values match
+	 * AuthLockKind in utils/auth_lock.h: 0 = no modifier, 1 = IRREVOCABLE,
+	 * 2 = WITH COOKIE.  For WITH COOKIE in the RESET form, the cookie
+	 * literal appears in args[0] as a string A_Const.
+	 */
+	int			auth_lock_kind;
 	/* token location, or -1 if unknown */
 	ParseLoc	location pg_node_attr(query_jumble_location);
 } VariableSetStmt;

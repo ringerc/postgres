@@ -757,6 +757,15 @@ _jumbleVariableSetStmt(JumbleState *jstate, Node *node)
 	if (expr->jumble_args)
 		JUMBLE_NODE(args);
 	JUMBLE_FIELD(is_local);
+	/*
+	 * Include the IRREVOCABLE / WITH COOKIE modifier so SET ROLE x and
+	 * SET ROLE x IRREVOCABLE / WITH COOKIE jumble to distinct queries.
+	 * The cookie literal itself is jumbled away by the jumble_args=false
+	 * default — distinct cookies normalise to the same query, which is
+	 * what we want for pg_stat_statements (cookie values must not appear
+	 * in normalised query text).
+	 */
+	JUMBLE_FIELD(auth_lock_kind);
 	JUMBLE_LOCATION(location);
 }
 
