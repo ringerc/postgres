@@ -807,11 +807,27 @@ retry:
 			{
 				/*
 				 * Any option beginning with _pq_. is reserved for use as a
-				 * protocol-level option, but at present no such options are
-				 * defined.
+				 * protocol-level option.  Recognised options are consumed
+				 * and set the matching Port flags; unrecognised ones are
+				 * reported back to the client via NegotiateProtocolVersion
+				 * so the client can detect non-support and fall back.
 				 */
-				unrecognized_protocol_options =
-					lappend(unrecognized_protocol_options, pstrdup(nameptr));
+				if (strcmp(nameptr, "_pq_.auth_channel") == 0)
+				{
+					/*
+					 * Accept any non-empty / non-"0" value as "enable".  The
+					 * value space is reserved for future capability levels;
+					 * v1 ignores it but the parsing is documented as a
+					 * single-integer-version-number.
+					 */
+					if (valptr[0] != '\0' && strcmp(valptr, "0") != 0)
+						port->auth_channel_enabled = true;
+				}
+				else
+				{
+					unrecognized_protocol_options =
+						lappend(unrecognized_protocol_options, pstrdup(nameptr));
+				}
 			}
 			else
 			{

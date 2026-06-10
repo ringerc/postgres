@@ -77,6 +77,7 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/auth_lock.h"
 #include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
@@ -452,6 +453,14 @@ SocketBackend(StringInfo inBuf)
 
 		case PqMsg_CopyDone:
 		case PqMsg_CopyFail:
+			maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
+			doing_extended_query_message = false;
+			break;
+
+		case PqMsg_AuthSetRole:
+		case PqMsg_AuthSetSession:
+		case PqMsg_AuthResetRole:
+		case PqMsg_AuthResetSession:
 			maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
 			doing_extended_query_message = false;
 			break;
@@ -4924,6 +4933,37 @@ PostgresMain(const char *dbname, const char *username)
 
 					/* exec_execute_message does valgrind_report_error_query */
 				}
+				break;
+
+			case PqMsg_AuthSetRole:
+			case PqMsg_AuthSetSession:
+			case PqMsg_AuthResetRole:
+			case PqMsg_AuthResetSession:
+				forbidden_in_wal_sender(firstchar);
+				SetCurrentStatementStartTimestamp();
+				pgstat_report_activity(STATE_FASTPATH, NULL);
+				set_ps_display("<AUTH_LOCK>");
+
+				/*
+				 * The handlers below dispatch to the AuthLock SQL functions
+				 * which do catalog lookups; that requires an active
+				 * transaction.  Wrap in start_xact_command / finish_xact_command,
+				 * matching the F (FunctionCall) message's pattern.
+				 */
+				start_xact_command();
+				MemoryContextSwitchTo(MessageContext);
+
+				if (firstchar == PqMsg_AuthSetRole)
+					HandleAuthSetRoleMessage(&input_message, false);
+				else if (firstchar == PqMsg_AuthSetSession)
+					HandleAuthSetRoleMessage(&input_message, true);
+				else if (firstchar == PqMsg_AuthResetRole)
+					HandleAuthResetRoleMessage(&input_message, false);
+				else
+					HandleAuthResetRoleMessage(&input_message, true);
+
+				finish_xact_command();
+				send_ready_for_query = true;
 				break;
 
 			case PqMsg_FunctionCall:

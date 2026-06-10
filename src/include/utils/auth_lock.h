@@ -148,4 +148,32 @@ extern Datum pg_reset_role_with_cookie(PG_FUNCTION_ARGS);
 extern Datum pg_reset_session_authorization_with_cookie(PG_FUNCTION_ARGS);
 extern Datum pg_auth_lock_status(PG_FUNCTION_ARGS);
 
+/*
+ * Protocol-level handlers (Phase 4 / design §16).  Invoked from
+ * PostgresMain's top-level message loop in response to the
+ * V / v / U / u (AuthSetRole / AuthSetSession / AuthResetRole /
+ * AuthResetSession) frontend tags.  Each handler validates the
+ * channel is enabled, performs the operation via the same C-level
+ * AuthLock API used by the SQL functions, and emits an
+ * AuthLockResponse (Y) message back to the client.
+ *
+ * StringInfo is the partially-parsed message buffer; handlers consume
+ * remaining fields and validate framing.
+ */
+struct StringInfoData;
+extern void HandleAuthSetRoleMessage(struct StringInfoData *input, bool sas);
+extern void HandleAuthResetRoleMessage(struct StringInfoData *input, bool sas);
+
+/* Response status codes (used in AuthLockResponse messages). */
+typedef enum AuthLockResponseStatus
+{
+	AUTH_LOCK_RESP_OK = 0,					/* operation succeeded */
+	AUTH_LOCK_RESP_OK_COOKIE = 1,			/* succeeded + cookie returned */
+	AUTH_LOCK_RESP_LOCK_PROTECTED = 2,		/* lock blocks this operation */
+	AUTH_LOCK_RESP_CEILING_VIOLATION = 3,	/* target above ceiling */
+	AUTH_LOCK_RESP_PERMISSION_DENIED = 4,	/* membership / SAS check failed */
+	AUTH_LOCK_RESP_BAD_COOKIE = 5,			/* presented cookie didn't match */
+	AUTH_LOCK_RESP_UNAVAILABLE = 6,			/* channel not negotiated */
+} AuthLockResponseStatus;
+
 #endif							/* AUTH_LOCK_H */

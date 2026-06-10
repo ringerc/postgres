@@ -36,6 +36,10 @@
 #include "catalog/pg_authid.h"
 #include "common/cryptohash.h"
 #include "funcapi.h"
+#include "libpq/libpq.h"
+#include "libpq/libpq-be.h"
+#include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "miscadmin.h"
 #include "port.h"				/* pg_strong_random */
 #include "utils/acl.h"
@@ -739,4 +743,216 @@ pg_auth_lock_status(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
+}
+
+
+/* ============================================================
+ * Phase 4 / Design §16 — protocol-level handlers
+ * ============================================================
+ *
+ * Backend dispatch for the V / v / U / u frontend tags.  These run
+ * at the same layer as the simple-query handler, not via the parser
+ * or executor.  They reuse the AuthLock C-level API for the lock
+ * state machine.
+ *
+ * Errors raised inside the handlers propagate through the standard
+ * PG error path (ErrorResponse + ReadyForQuery); only well-formed
+ * non-error outcomes emit AuthLockResponse explicitly.  This matches
+ * the F (FunctionCall) message's dispatch shape.
+ */
+
+/*
+ * Build and send an AuthLockResponse (Y) message.  cookie may be NULL
+ * for non-cookie-returning operations.
+ */
+static void
+SendAuthLockResponse(AuthLockResponseStatus status,
+					 const uint8 *cookie, int cookie_len,
+					 const char *message)
+{
+	StringInfoData buf;
+
+	pq_beginmessage(&buf, PqMsg_AuthLockResponse);
+	pq_sendbyte(&buf, (uint8) status);
+	pq_sendint32(&buf, cookie_len);
+	if (cookie_len > 0)
+		pq_sendbytes(&buf, cookie, cookie_len);
+	pq_sendstring(&buf, message ? message : "");
+	pq_endmessage(&buf);
+	pq_flush();
+}
+
+/*
+ * Pre-flight checks shared by all four handlers.  Returns true if
+ * the message may proceed, false if a response has already been sent
+ * (channel disabled, in transaction, etc.).
+ */
+static bool
+auth_channel_check(void)
+{
+	if (MyProcPort == NULL || !MyProcPort->auth_channel_enabled)
+	{
+		SendAuthLockResponse(AUTH_LOCK_RESP_UNAVAILABLE, NULL, 0,
+							 "auth_channel not negotiated; "
+							 "send _pq_.auth_channel=1 in startup packet");
+		return false;
+	}
+
+	if (IsTransactionBlock() || IsSubTransaction())
+	{
+		SendAuthLockResponse(AUTH_LOCK_RESP_LOCK_PROTECTED, NULL, 0,
+							 "auth-channel operations not permitted "
+							 "inside a transaction block");
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * Handle the V (AuthSetRole) and v (AuthSetSession) frontend tags.
+ *
+ * Wire format (input is positioned after the 1-byte tag and 4-byte
+ * length; the message-loop has already validated framing):
+ *
+ *   Int8   kind        (1 = IRREVOCABLE, 2 = WITH COOKIE)
+ *   String role_name   (C-string)
+ *   Int32  flags       (reserved; must be 0)
+ *
+ * On success: emits AuthLockResponse with status OK (kind 1) or
+ * OK_COOKIE (kind 2) and the generated cookie.
+ */
+void
+HandleAuthSetRoleMessage(StringInfo input, bool sas)
+{
+	int			kind_arg;
+	const char *role_name;
+	int			flags;
+	bytea	   *cookie_bytea = NULL;
+
+	if (!auth_channel_check())
+		return;
+
+	kind_arg = pq_getmsgbyte(input);
+	role_name = pq_getmsgstring(input);
+	flags = pq_getmsgint(input, 4);
+	pq_getmsgend(input);
+
+	if (flags != 0)
+	{
+		SendAuthLockResponse(AUTH_LOCK_RESP_LOCK_PROTECTED, NULL, 0,
+							 "non-zero flags reserved for future use");
+		return;
+	}
+
+	/*
+	 * Dispatch via the SQL function bodies so we share validation,
+	 * lock installation, and cookie generation.  These functions
+	 * ereport(ERROR) on validation failure, which propagates to the
+	 * top-level loop and emits an ErrorResponse + ReadyForQuery; the
+	 * client sees the failure even without our AuthLockResponse.
+	 *
+	 * For more refined per-status responses (CEILING_VIOLATION vs
+	 * PERMISSION_DENIED, etc.), future work could replace the
+	 * ereports inside the SQL functions with structured returns.
+	 * Phase 4 v1 uses the simpler path.
+	 */
+	if (kind_arg == (int) AUTH_LOCK_IRREVOCABLE)
+	{
+		if (sas)
+			DirectFunctionCall1(pg_set_session_authorization_irrevocable,
+								CStringGetTextDatum(role_name));
+		else
+			DirectFunctionCall1(pg_set_role_irrevocable,
+								CStringGetTextDatum(role_name));
+
+		SendAuthLockResponse(AUTH_LOCK_RESP_OK, NULL, 0, "");
+	}
+	else if (kind_arg == (int) AUTH_LOCK_COOKIE)
+	{
+		Datum		cookie_datum;
+
+		if (sas)
+			cookie_datum = DirectFunctionCall1(pg_set_session_authorization_with_cookie,
+											   CStringGetTextDatum(role_name));
+		else
+			cookie_datum = DirectFunctionCall1(pg_set_role_with_cookie,
+											   CStringGetTextDatum(role_name));
+
+		cookie_bytea = DatumGetByteaPP(cookie_datum);
+		SendAuthLockResponse(AUTH_LOCK_RESP_OK_COOKIE,
+							 (const uint8 *) VARDATA_ANY(cookie_bytea),
+							 VARSIZE_ANY_EXHDR(cookie_bytea),
+							 "");
+	}
+	else
+	{
+		SendAuthLockResponse(AUTH_LOCK_RESP_LOCK_PROTECTED, NULL, 0,
+							 "invalid auth-set kind (must be 1=IRREVOCABLE or 2=WITH COOKIE)");
+	}
+}
+
+/*
+ * Handle the U (AuthResetRole) and u (AuthResetSession) frontend tags.
+ *
+ * Wire format:
+ *
+ *   Int8   has_cookie  (0 or 1)
+ *   [Int32 cookie_len + ByteN cookie]   iff has_cookie == 1
+ *
+ * On success: emits AuthLockResponse with status OK.  On bad cookie:
+ * BAD_COOKIE.  On no-lock-or-not-cookie: LOCK_PROTECTED.
+ */
+void
+HandleAuthResetRoleMessage(StringInfo input, bool sas)
+{
+	int			has_cookie;
+	bytea	   *cookie_bytea;
+	int			cookie_len;
+	const char *cookie_bytes_ptr;
+
+	if (!auth_channel_check())
+		return;
+
+	has_cookie = pq_getmsgbyte(input);
+
+	if (has_cookie != 1)
+	{
+		/* No cookie presented.  Refused outright. */
+		pq_getmsgend(input);
+		SendAuthLockResponse(AUTH_LOCK_RESP_LOCK_PROTECTED, NULL, 0,
+							 "cookie required to clear an authorization lock");
+		return;
+	}
+
+	cookie_len = pq_getmsgint(input, 4);
+	if (cookie_len < 0 || cookie_len > 1024)
+	{
+		pq_getmsgend(input);
+		SendAuthLockResponse(AUTH_LOCK_RESP_BAD_COOKIE, NULL, 0,
+							 "invalid cookie length");
+		return;
+	}
+	cookie_bytes_ptr = pq_getmsgbytes(input, cookie_len);
+	pq_getmsgend(input);
+
+	/* Construct a bytea wrapping the bytes (palloc'd locally). */
+	cookie_bytea = (bytea *) palloc(VARHDRSZ + cookie_len);
+	SET_VARSIZE(cookie_bytea, VARHDRSZ + cookie_len);
+	memcpy(VARDATA(cookie_bytea), cookie_bytes_ptr, cookie_len);
+
+	/*
+	 * Dispatch via the existing SQL reset functions.  They ereport on
+	 * mismatch / no-lock, producing ErrorResponse to the client.  Both
+	 * variants are aliases (Phase 2 §16.9), so the choice of sas
+	 * doesn't matter for the unlock path; we honor it for API symmetry.
+	 */
+	if (sas)
+		DirectFunctionCall1(pg_reset_session_authorization_with_cookie,
+							PointerGetDatum(cookie_bytea));
+	else
+		DirectFunctionCall1(pg_reset_role_with_cookie,
+							PointerGetDatum(cookie_bytea));
+
+	SendAuthLockResponse(AUTH_LOCK_RESP_OK, NULL, 0, "");
 }

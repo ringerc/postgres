@@ -160,6 +160,15 @@ typedef struct Port
 	char	   *application_name;
 
 	/*
+	 * Protocol-extension flags negotiated via "_pq_.*" startup options.
+	 * auth_channel_enabled is true if the client requested
+	 * _pq_.auth_channel = 1 in the startup packet, allowing it to issue
+	 * the protocol-level role-management messages V/v/U/u.  Without this
+	 * the backend refuses those tags with UNAVAILABLE.
+	 */
+	bool		auth_channel_enabled;
+
+	/*
 	 * Information that needs to be held during the authentication cycle.
 	 */
 	HbaLine    *hba;
