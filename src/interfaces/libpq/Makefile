@@ -31,6 +31,7 @@ endif
 
 OBJS = \
 	$(WIN32RES) \
+	fe-auth-channel.o \
 	fe-auth-scram.o \
 	fe-cancel.o \
 	fe-connect.o \

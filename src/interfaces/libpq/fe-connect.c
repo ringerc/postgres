@@ -380,6 +380,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"Replication", "D", 5,
 	offsetof(struct pg_conn, replication)},
 
+	{"auth_channel", NULL, NULL, NULL,
+		"Auth-Channel", "", 4, /* "1" or "on" */
+	offsetof(struct pg_conn, auth_channel)},
+
 	{"target_session_attrs", "PGTARGETSESSIONATTRS",
 		DefaultTargetSessionAttrs, NULL,
 		"Target-Session-Attrs", "", 15, /* sizeof("prefer-standby") = 15 */

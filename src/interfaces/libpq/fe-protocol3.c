@@ -1545,6 +1545,16 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 		{
 			found_test_protocol_negotiation = true;
 		}
+		else if (strcmp(conn->workBuffer.data, "_pq_.auth_channel") == 0)
+		{
+			/*
+			 * Server doesn't support the protocol-level role-management
+			 * channel (irrevocable-privilege-drop Phase 4 / design §16).
+			 * This is a graceful negotiation: connect succeeds, but
+			 * PQauthSetRole / PQauthResetRole will return errors.
+			 */
+			conn->auth_channel_enabled = false;
+		}
 		else
 		{
 			libpq_append_conn_error(conn, "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"%s\")",
@@ -2531,6 +2541,30 @@ build_startup_packet(const PGconn *conn, char *packet,
 	 */
 	if (conn->pversion == PG_PROTOCOL_GREASE)
 		ADD_STARTUP_OPTION("_pq_.test_protocol_negotiation", "");
+
+	/*
+	 * Opt-in to the protocol-level role-management channel
+	 * (irrevocable-privilege-drop Phase 4 / design §16).  If the server
+	 * doesn't recognise the option it will appear in the
+	 * NegotiateProtocolVersion unrecognized list, and we'll mark
+	 * auth_channel_enabled=false so PQauthSetRole / PQauthResetRole
+	 * return a clean error.
+	 *
+	 * Tentatively mark the flag true at request time; the negotiation
+	 * handler in pqGetNegotiateProtocolVersion3 flips it to false if
+	 * the server reports the option unrecognized.
+	 */
+	if (conn->auth_channel && conn->auth_channel[0] &&
+		pg_strcasecmp(conn->auth_channel, "0") != 0 &&
+		pg_strcasecmp(conn->auth_channel, "off") != 0 &&
+		pg_strcasecmp(conn->auth_channel, "false") != 0)
+	{
+		ADD_STARTUP_OPTION("_pq_.auth_channel", "1");
+		/* `conn` is const here; the caller's `conn` is mutable.  Set in
+		 * the non-const sizing pass via a cast — same pattern as other
+		 * libpq code that needs to update conn state from this builder. */
+		((PGconn *) conn)->auth_channel_enabled = true;
+	}
 
 	/* Add any environment-driven GUC settings needed */
 	for (next_eo = options; next_eo->envName; next_eo++)

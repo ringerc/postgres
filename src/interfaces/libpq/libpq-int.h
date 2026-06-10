@@ -391,6 +391,8 @@ struct pg_conn
 	char	   *fbappname;		/* fallback application name */
 	char	   *dbName;			/* database name */
 	char	   *replication;	/* connect as the replication standby? */
+	char	   *auth_channel;	/* requested _pq_.auth_channel; "1" / "on" */
+	bool		auth_channel_enabled;	/* server accepted the negotiation */
 	char	   *pgservice;		/* Postgres service, if any */
 	char	   *pgservicefile;	/* path to a service file containing
 								 * service(s) */

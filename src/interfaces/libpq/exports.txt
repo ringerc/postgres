@@ -211,3 +211,8 @@ PQdefaultAuthDataHook     208
 PQfullProtocolVersion     209
 appendPQExpBufferVA       210
 PQgetThreadLock           211
+PQauthChannelEnabled      212
+PQauthSetRole             213
+PQauthSetSession          214
+PQauthResetRole           215
+PQauthResetSession        216

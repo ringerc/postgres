@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 libpq_sources = files(
+  'fe-auth-channel.c',
   'fe-auth-oauth.c',
   'fe-auth-scram.c',
   'fe-auth.c',

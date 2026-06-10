@@ -431,6 +431,7 @@ extern PGpipelineStatus PQpipelineStatus(const PGconn *conn);
 extern int	PQconnectionNeedsPassword(const PGconn *conn);
 extern int	PQconnectionUsedPassword(const PGconn *conn);
 extern int	PQconnectionUsedGSSAPI(const PGconn *conn);
+extern int	PQauthChannelEnabled(const PGconn *conn);
 extern int	PQclientEncoding(const PGconn *conn);
 extern int	PQsetClientEncoding(PGconn *conn, const char *encoding);
 
@@ -594,6 +595,37 @@ extern PGresult *PQfn(PGconn *conn,
 					  int result_is_int,
 					  const PQArgBlock *args,
 					  int nargs);
+
+/*
+ * Protocol-level role-management channel (irrevocable-privilege-drop
+ * Phase 4 / design §16).  The connection must have been opened with
+ * the auth_channel=1 connection parameter; check PQauthChannelEnabled()
+ * before calling.
+ *
+ * PQauthSetRole / PQauthSetSession with kind=PG_AUTH_LOCK_IRREVOCABLE
+ * lock the session; with kind=PG_AUTH_LOCK_WITH_COOKIE the server
+ * returns a one-shot cookie via the PGresult's first binary field
+ * (PQgetvalue, PQgetlength) that the caller can later present to
+ * PQauthResetRole / PQauthResetSession to clear the lock.
+ *
+ * All four return a PGresult whose PQresultStatus is PGRES_COMMAND_OK
+ * on success or PGRES_FATAL_ERROR on failure; the SQLSTATE is in
+ * PQresultErrorField(res, PG_DIAG_SQLSTATE).
+ */
+typedef enum
+{
+	PG_AUTH_LOCK_IRREVOCABLE = 1,
+	PG_AUTH_LOCK_WITH_COOKIE = 2,
+} PGauthLockKind;
+
+extern PGresult *PQauthSetRole(PGconn *conn, const char *role_name,
+							   PGauthLockKind kind);
+extern PGresult *PQauthSetSession(PGconn *conn, const char *role_name,
+								  PGauthLockKind kind);
+extern PGresult *PQauthResetRole(PGconn *conn,
+								 const void *cookie, size_t cookie_len);
+extern PGresult *PQauthResetSession(PGconn *conn,
+									const void *cookie, size_t cookie_len);
 
 /* Accessor functions for PGresult objects */
 extern ExecStatusType PQresultStatus(const PGresult *res);
