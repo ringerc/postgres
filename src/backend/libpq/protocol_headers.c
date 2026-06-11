@@ -222,10 +222,16 @@ ProcessRequestHeadersMessage(StringInfo msg)
 	/*
 	 * If the GUC has been disabled at runtime, or if the client never
 	 * negotiated _pq_.headers, receipt of an 'M' message is a protocol
-	 * violation.  Drop the connection.
+	 * violation.  Report an ERROR rather than FATAL --- the message body
+	 * has already been consumed by the framing layer, so there is no
+	 * desynchronized protocol state to recover from, and the session
+	 * remains usable via the standard sigsetjmp recovery path.  Killing
+	 * the backend on receipt of one unexpected 'M' is disproportionate
+	 * and inconsistent with how other in-band protocol parse errors are
+	 * reported.
 	 */
 	if (!protocol_headers_enabled || !ProtocolHeadersNegotiated)
-		ereport(FATAL,
+		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("RequestHeaders message received but protocol headers feature was not negotiated")));
 
@@ -239,11 +245,11 @@ ProcessRequestHeadersMessage(StringInfo msg)
 
 	n = pq_getmsgint(msg, 2);
 	if (n < 0)
-		ereport(FATAL,
+		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid RequestHeaders entry count: %d", n)));
 	if (n > max_protocol_header_entries)
-		ereport(FATAL,
+		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("RequestHeaders entry count exceeds max_protocol_header_entries (%d > %d)",
 						n, max_protocol_header_entries)));
@@ -264,7 +270,7 @@ ProcessRequestHeadersMessage(StringInfo msg)
 		 */
 		entry_size = strlen(key) + 1 + strlen(value) + 1;
 		if (entry_size > (size_t) max_protocol_header_size)
-			ereport(FATAL,
+			ereport(ERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("RequestHeaders entry %d (key \"%s\") exceeds max_protocol_header_size (%zu > %d)",
 							i, key, entry_size, max_protocol_header_size)));

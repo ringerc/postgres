@@ -2048,19 +2048,31 @@ errannot(const char *key, const char *value)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
+	/*
+	 * Bump recursion_depth across the allocating work in
+	 * set_annotation / record_rejected_annotation so a nested ereport
+	 * (e.g. OOM from pstrdup) is short-circuited by errstart's
+	 * recursion guard rather than re-entering elog with the same
+	 * stack depth.  Mirrors the pattern in errmsg_internal et al.
+	 */
+	recursion_depth++;
 	CHECK_STACK_DEPTH();
 
 	if (!is_valid_annotation_key(key))
+	{
+		recursion_depth--;
 		return 0;				/* silently ignore malformed key */
+	}
 
 	if (is_reserved_annotation_key(key))
 	{
 		record_rejected_annotation(edata, key);
+		recursion_depth--;
 		return 0;
 	}
 
 	set_annotation(edata, key, value);
+	recursion_depth--;
 	return 0;					/* return value does not matter */
 }
 
@@ -2075,15 +2087,20 @@ errannotf(const char *key, const char *fmt, ...)
 	size_t		len = 128;
 	char	   *value;
 
-	/* we don't bother incrementing recursion_depth */
+	/* See errannot() for the rationale on the recursion_depth pair. */
+	recursion_depth++;
 	CHECK_STACK_DEPTH();
 
 	if (!is_valid_annotation_key(key))
+	{
+		recursion_depth--;
 		return 0;
+	}
 
 	if (is_reserved_annotation_key(key))
 	{
 		record_rejected_annotation(edata, key);
+		recursion_depth--;
 		return 0;
 	}
 
@@ -2106,6 +2123,7 @@ errannotf(const char *key, const char *fmt, ...)
 
 	set_annotation(edata, key, value);
 	pfree(value);
+	recursion_depth--;
 	return 0;
 }
 
