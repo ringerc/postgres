@@ -4803,12 +4803,40 @@ PostgresMain(const char *dbname, const char *username)
 			/*
 			 * Fire pre_ready_for_query_hook so extensions can run any
 			 * end-of-command-cycle teardown they need.  See the
-			 * declaration in tcop/tcopprot.h for the naming rationale
-			 * and a discussion of how this differs from a per-statement
-			 * hook.
+			 * declaration in tcop/tcopprot.h.
+			 *
+			 * Wrap in PG_TRY/PG_CATCH so a hook that ereports does
+			 * NOT loop indefinitely: sigsetjmp recovery re-sets
+			 * send_ready_for_query = true, which would re-fire the
+			 * hook and, if the hook deterministically errors, never
+			 * exit the cycle.  We log + swallow instead, so the
+			 * cycle progresses to ReadyForQuery and the session
+			 * remains usable.  Hook authors are still expected to
+			 * keep this code path non-throwing; the catch is a
+			 * safety net, not an excuse to ignore errors.
 			 */
 			if (pre_ready_for_query_hook != NULL)
-				pre_ready_for_query_hook();
+			{
+				PG_TRY();
+				{
+					pre_ready_for_query_hook();
+				}
+				PG_CATCH();
+				{
+					ErrorData  *edata;
+					MemoryContext ecxt;
+
+					ecxt = MemoryContextSwitchTo(ErrorContext);
+					edata = CopyErrorData();
+					ereport(LOG,
+							(errmsg("pre_ready_for_query_hook raised an error; cycle continues"),
+							 errdetail("%s", edata->message)));
+					FreeErrorData(edata);
+					FlushErrorState();
+					MemoryContextSwitchTo(ecxt);
+				}
+				PG_END_TRY();
+			}
 
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;

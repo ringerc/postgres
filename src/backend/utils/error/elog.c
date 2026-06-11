@@ -197,6 +197,7 @@ static void FreeErrorDataContents(ErrorData *edata);
 static bool is_valid_annotation_key(const char *key);
 static bool is_reserved_annotation_key(const char *key);
 static ErrorAnnotation *find_annotation(ErrorAnnotation *head, const char *key);
+static void append_annotation_escaped(StringInfo buf, const char *value);
 static void set_annotation(ErrorData *edata, const char *key, const char *value);
 static void record_rejected_annotation(ErrorData *edata, const char *key);
 static ErrorAnnotation *copy_annotations(MemoryContext cxt,
@@ -1863,10 +1864,29 @@ is_valid_annotation_key(const char *key)
 /*
  * is_reserved_annotation_key --- check the static reserved-key table.
  *
- * The set of reserved keys may grow in any future PostgreSQL release,
- * including minor releases, whenever a new built-in field is added to the
- * JSON log record.  Extensions are encouraged to namespace their keys
- * (e.g. "<extname>.<key>") to minimize the risk of future collisions.
+ * Reserved-key release policy:
+ *
+ *	 * The set of reserved keys may grow only in MAJOR PostgreSQL
+ *	   releases.  Minor releases never add new reserved keys --- an
+ *	   extension that ships against PG 19.0 and calls errannot("foo",
+ *	   ...) will not silently lose its annotation in PG 19.3 because
+ *	   core decided to add "foo" as a JSON log field.
+ *	 * When a new built-in JSON log field is added in a major release,
+ *	   the project WILL prefer the "pg_" prefix (e.g. "pg_query_id"
+ *	   rather than bare "query_id") for newly-introduced field names,
+ *	   to leave the un-prefixed namespace available for extensions.
+ *	   This is a documented preference, not a guarantee: the existing
+ *	   list above (filled with bare names like "message" / "detail" /
+ *	   "context") is grandfathered, and a future major release may
+ *	   still occasionally add a bare-name reservation if the matching
+ *	   JSON log field already exists by that name for historical
+ *	   reasons.
+ *	 * Extensions are nevertheless still encouraged to namespace their
+ *	   keys --- prefer "<extname>.<key>" or "<extname>_<key>" --- to
+ *	   minimise the risk of collision with both core and other
+ *	   extensions.  This is doubly important for keys an extension
+ *	   wants to add to the JSON log format, since unnamespaced keys
+ *	   are first-claim only.
  */
 static bool
 is_reserved_annotation_key(const char *key)
@@ -1894,12 +1914,77 @@ find_annotation(ErrorAnnotation *head, const char *key)
 }
 
 /*
+ * append_annotation_escaped --- append `value` to `buf`, escaping any
+ * character that could corrupt a one-line text-log record.
+ *
+ *	 '"'  and '\\'  -> backslash-escaped (consumers of the %A
+ *	                   "k1=\"v1\" k2=\"v2\"" rendering need them
+ *	                   escaped inside the quoted region; consumers of
+ *	                   the bare %{key}A rendering get them escaped
+ *	                   too for consistency).
+ *	 '\n', '\r', '\t' -> backslash letter escapes.
+ *	 any other byte < 0x20, or 0x7F -> '\xHH' two-hex-digit escape.
+ *	 everything else -> verbatim (high-byte UTF-8 sequences pass
+ *	                   through; multibyte sequences are fully outside
+ *	                   the control-character set).
+ *
+ * Per-line corruption is the load-bearing concern: a value
+ * containing '\n' would split the log line in two, breaking grep,
+ * journald, fluentd, and every other line-oriented log shipper.  All
+ * the other escapes are spec-internal hygiene.
+ */
+static void
+append_annotation_escaped(StringInfo buf, const char *value)
+{
+	for (const char *s = value; *s != '\0'; s++)
+	{
+		unsigned char c = (unsigned char) *s;
+
+		switch (c)
+		{
+			case '"':
+			case '\\':
+				appendStringInfoChar(buf, '\\');
+				appendStringInfoChar(buf, c);
+				break;
+			case '\n':
+				appendStringInfoString(buf, "\\n");
+				break;
+			case '\r':
+				appendStringInfoString(buf, "\\r");
+				break;
+			case '\t':
+				appendStringInfoString(buf, "\\t");
+				break;
+			default:
+				if (c < 0x20 || c == 0x7F)
+					appendStringInfo(buf, "\\x%02x", c);
+				else
+					appendStringInfoChar(buf, c);
+				break;
+		}
+	}
+}
+
+/*
  * set_annotation --- attach (or replace) an annotation on edata
  *
- * The caller is responsible for ensuring that the current memory context
- * is appropriate for allocations (typically edata->assoc_context).  Strings
- * are deep-copied via pstrdup().  A NULL value is treated as the empty
- * string for storage purposes; passing NULL is not an error.
+ * Allocations are placed in edata->assoc_context, the same context
+ * that owns every other variable-length string on the ErrorData
+ * (message, detail, hint, ...).  That context is:
+ *
+ *	 * ErrorContext         --- for hard errors raised via ereport()
+ *	                            and friends.  Survives the entire error
+ *	                            propagation; freed by FlushErrorState().
+ *	 * CurrentMemoryContext --- for soft errors raised via errsave()
+ *	                            into an ErrorSaveContext, and for the
+ *	                            output of CopyErrorData().  The caller
+ *	                            chose that context; same lifetime
+ *	                            rules apply to annotations as to
+ *	                            edata->message and friends.
+ *
+ * Strings are deep-copied via pstrdup().  A NULL value is treated as
+ * the empty string for storage purposes; passing NULL is not an error.
  *
  * If an annotation with the same key already exists, its value is
  * replaced.  This lets nested error context callbacks override outer
@@ -4019,8 +4104,12 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 					/*
 					 * %A renders all errannot() annotations as
 					 * key="value" key="value" (space-separated, values
-					 * quoted with \" and \\ escaped, insertion order as
-					 * stored in the linked list).  Padding, if any,
+					 * quoted with \" / \\ escaped and any control
+					 * characters --- including newline, tab, NUL ---
+					 * escaped via append_annotation_escaped() so a
+					 * value containing '\n' cannot inject a line
+					 * break into the log record).  Insertion order
+					 * matches the linked list.  Padding, if any,
 					 * applies to the whole rendered block.
 					 *
 					 * Annotation values are never re-interpreted as a
@@ -4039,12 +4128,7 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 							appendStringInfoChar(&annbuf, ' ');
 						appendStringInfoString(&annbuf, ann->key);
 						appendStringInfoString(&annbuf, "=\"");
-						for (const char *s = ann->value; *s != '\0'; s++)
-						{
-							if (*s == '"' || *s == '\\')
-								appendStringInfoChar(&annbuf, '\\');
-							appendStringInfoChar(&annbuf, *s);
-						}
+						append_annotation_escaped(&annbuf, ann->value);
 						appendStringInfoChar(&annbuf, '"');
 					}
 					if (padding != 0)
@@ -4118,10 +4202,25 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 
 					if (ann != NULL)
 					{
+						/*
+						 * Render through append_annotation_escaped so
+						 * a value with embedded '\n' / '\t' / NUL /
+						 * other control characters does not corrupt
+						 * the log line.  Apply padding to the escaped
+						 * form rather than the raw value so the
+						 * caller's intent for column width survives.
+						 */
 						if (padding != 0)
-							appendStringInfo(buf, "%*s", padding, ann->value);
+						{
+							StringInfoData escbuf;
+
+							initStringInfo(&escbuf);
+							append_annotation_escaped(&escbuf, ann->value);
+							appendStringInfo(buf, "%*s", padding, escbuf.data);
+							pfree(escbuf.data);
+						}
 						else
-							appendStringInfoString(buf, ann->value);
+							append_annotation_escaped(buf, ann->value);
 					}
 					else if (padding != 0)
 						appendStringInfo(buf, "%*s", padding, "");

@@ -233,22 +233,14 @@ extern int	errannot(const char *key, const char *value);
 extern int	errannotf(const char *key, const char *fmt, ...) pg_attribute_printf(2, 3);
 
 /*
- * Well-known annotation keys.  Core call sites and extensions that emit
- * standard observability attributes should use these constants rather than
- * literal strings so that spellings stay consistent across the tree.
- *
- * Keys not listed here may also be used freely; the only constraint is the
- * reserved-name list checked inside errannot() (see elog.c).
- */
-#define ERRANNOT_KEY_TRACE_ID		"trace_id"
-#define ERRANNOT_KEY_SPAN_ID		"span_id"
-#define ERRANNOT_KEY_TRACE_FLAGS	"trace_flags"
-
-/*
  * Reserved aggregator key used to surface annotation attempts that collided
  * with a core-owned JSON log field name.  Its value is a comma-separated
  * list of rejected key names (values are intentionally discarded; see
  * elog.c).  Extensions may NOT call errannot() with this key.
+ *
+ * Extension-specific well-known keys (e.g. OTel's trace_id / span_id /
+ * trace_flags) live in the extension's own header --- core elog does not
+ * pre-define keys that name external ecosystems.
  */
 #define ERRANNOT_KEY_REJECTED		"pg_rejected_annotations"
 

@@ -114,17 +114,47 @@ RegisterProtocolHeaderHandler(const char *prefix,
 {
 	ProtocolHeaderHandler *h;
 	MemoryContext oldcxt;
+	size_t		prefix_len;
 
 	if (prefix == NULL || prefix[0] == '\0')
 		elog(ERROR, "protocol header prefix must be non-empty");
 	if (set_cb == NULL)
 		elog(ERROR, "protocol header handler must supply a set callback");
 
+	prefix_len = strlen(prefix);
+
+	/*
+	 * Reject exact-prefix collisions at registration time rather than
+	 * silently letting the second-loaded extension win the dispatch.
+	 * Two extensions claiming the same prefix is always a configuration
+	 * error: one of them has misappropriated the other's namespace.
+	 * Subset/superset prefix relations (e.g. "otel." and "otel.metrics.")
+	 * are fine --- the lookup picks the longest prefix unambiguously.
+	 *
+	 * Registration happens from each extension's _PG_init under
+	 * shared_preload_libraries, i.e. in postmaster context.  ereport(ERROR)
+	 * here aborts postmaster startup with a clear message, which is the
+	 * right severity: the operator must resolve the conflict before any
+	 * backend serves traffic.
+	 */
+	for (ProtocolHeaderHandler *existing = handler_list;
+		 existing != NULL;
+		 existing = existing->next)
+	{
+		if (existing->prefix_len == prefix_len &&
+			memcmp(existing->prefix, prefix, prefix_len) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("protocol header prefix \"%s\" is already registered",
+							prefix),
+					 errhint("Two extensions cannot register handlers for identical prefixes; the registration order is silent and ambiguous.  Resolve by choosing distinct prefixes for the conflicting extensions.")));
+	}
+
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
 	h = palloc0_object(ProtocolHeaderHandler);
 	h->prefix = prefix;
-	h->prefix_len = strlen(prefix);
+	h->prefix_len = prefix_len;
 	h->set_cb = set_cb;
 	h->ctx = ctx;
 
@@ -258,6 +288,7 @@ ProcessRequestHeadersMessage(StringInfo msg)
 
 	for (int i = 0; i < n; i++)
 	{
+		size_t		wire_start = msg->cursor;
 		const char *key = pq_getmsgstring(msg);
 		const char *value = pq_getmsgstring(msg);
 		size_t		entry_size;
@@ -267,8 +298,17 @@ ProcessRequestHeadersMessage(StringInfo msg)
 		 * for this (key, value) pair --- the two NUL-terminated strings
 		 * including their terminators.  Empty key + empty value is 2
 		 * bytes; setting the GUC to 0 therefore rejects every entry.
+		 *
+		 * Compute the wire size from the cursor delta rather than
+		 * strlen() on the returned pointers: (a) pq_getmsgstring has
+		 * already walked the bytes once to find the NUL, so a second
+		 * strlen() is wasteful (an attacker could provoke 2x the parse
+		 * cost), and (b) the returned strings are after
+		 * pq_client_to_server's encoding conversion --- their byte
+		 * count can differ from the on-wire size, which is the thing
+		 * the GUC is supposed to bound.
 		 */
-		entry_size = strlen(key) + 1 + strlen(value) + 1;
+		entry_size = msg->cursor - wire_start;
 		if (entry_size > (size_t) max_protocol_header_size)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),

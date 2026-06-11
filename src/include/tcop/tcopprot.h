@@ -47,34 +47,43 @@ extern PGDLLIMPORT int log_statement;
 extern PGDLLIMPORT int restrict_nonsystem_relation_kind;
 
 /*
- * Hook fired by PostgresMain just before each ReadyForQuery message
- * is sent.  This is the v3 protocol cycle boundary: the moment after
- * which PostgresMain tells the client "I'm idle again."  Useful for
- * extensions that need to run end-of-command-cycle teardown ---
- * notably, a useful place to hook end-of-statement cleanup that
- * cannot be expressed cleanly via the existing per-statement /
- * per-utility hooks.
+ * Hook fired by PostgresMain immediately before each ReadyForQuery
+ * message is sent --- the v3 protocol cycle boundary, after the
+ * command(s) have completed and just before the server announces
+ * itself idle again.
  *
- * Naming: this hook is named after its exact wire-protocol call
- * site (mirroring the project's ExecutorStart_hook /
- * post_parse_analyze_hook / emit_log_hook convention), and NOT
- * end_of_statement_hook, because ReadyForQuery is NOT per-statement:
+ * Intended use: end-of-cycle teardown that needs to run once per
+ * round-trip, not once per statement.  ReadyForQuery isn't
+ * per-statement (multi-statement simple-Query, Bind/Execute
+ * between Syncs, copy completion, error-recovery skip-till-Sync
+ * all share one), so callers needing per-statement granularity
+ * should combine post_parse_analyze_hook, ExecutorEnd_hook, and
+ * ProcessUtility_hook instead.
  *
- *	 - A simple-Query message carrying multiple SQL statements (e.g.
- *	   "SELECT 1; SELECT 2;") produces a single ReadyForQuery after
- *	   all of them complete.
- *	 - In the extended-query protocol, every Bind/Execute cycle
- *	   between two Syncs shares a single ReadyForQuery (one per
- *	   Sync).
- *	 - ReadyForQuery is also emitted after error-recovery skip-till-
- *	   Sync, after CopyDone / CopyFail completion, and other
- *	   non-statement protocol transitions.
+ * Chaining: this is a single function pointer.  Multiple extensions
+ * sharing the hook MUST chain explicitly --- the second installer
+ * silently overrides the first otherwise:
  *
- * Hooks that genuinely require per-statement granularity should
- * combine post_parse_analyze_hook, ExecutorEnd_hook, and
- * ProcessUtility_hook.  This hook is the right place when the unit
- * of work is "one network round-trip cycle" --- i.e. when the unit
- * the extension cares about is bounded by ReadyForQuery messages.
+ *	 static pre_ready_for_query_hook_type prev_hook;
+ *
+ *	 static void my_hook(void) {
+ *	     ... do work ...
+ *	     if (prev_hook)
+ *	         prev_hook();
+ *	 }
+ *
+ *	 void _PG_init(void) {
+ *	     prev_hook = pre_ready_for_query_hook;
+ *	     pre_ready_for_query_hook = my_hook;
+ *	 }
+ *
+ * Error handling: PostgresMain wraps the call in PG_TRY/PG_CATCH and
+ * logs+swallows any error raised by the hook so an ereport from
+ * teardown code does not produce an infinite cycle (sigsetjmp
+ * recovery re-sets send_ready_for_query, which would otherwise
+ * re-fire the hook).  Hook authors should still treat their bodies
+ * as non-throwing; the catch is a safety net, not a licence to
+ * ignore errors.
  */
 typedef void (*pre_ready_for_query_hook_type) (void);
 extern PGDLLIMPORT pre_ready_for_query_hook_type pre_ready_for_query_hook;

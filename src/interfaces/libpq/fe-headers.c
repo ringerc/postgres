@@ -45,6 +45,23 @@ static bool ensure_capacity(PGconn *conn);
  * PQattachHeader --- queue a (key, value) header for the next operation.
  *
  * Returns 1 on success, 0 on failure (conn->errorMessage set).
+ *
+ * Threading: the same rule as every other PGconn-mutating libpq call
+ * applies.  A PGconn is owned by exactly one thread; calling this
+ * function from a different thread while the owner is also using
+ * `conn` is undefined behaviour.  This includes the read-only
+ * PQheadersAvailable() / pqReleaseQueuedHeaders() helpers.
+ *
+ * Embedded NULs: the v3 protocol's RequestHeaders message encodes
+ * each (key, value) entry as two NUL-terminated strings.  This API
+ * takes C strings, so anything past the first '\0' in `key` or
+ * `value` is *silently dropped on the floor* --- the caller's
+ * intent for the dropped bytes is unrepresentable on the wire.
+ * If you have keys or values with embedded NUL bytes (e.g. binary
+ * data), this API can't carry them; the protocol layer can't
+ * either.  Notable failure mode: a zero-initialised, not-yet-
+ * populated buffer (`char k[N] = {0};`) reads as an empty string;
+ * that's why we reject empty keys below.
  */
 int
 PQattachHeader(PGconn *conn, const char *key, const char *value)
@@ -62,26 +79,26 @@ PQattachHeader(PGconn *conn, const char *key, const char *value)
 		return 0;
 	}
 
+	/*
+	 * Reject empty key.  Empty key cannot match any handler-registered
+	 * prefix on the server side, and it's almost always a caller bug:
+	 * the typical shape is "I passed a zero-initialised buffer thinking
+	 * strlen() would tell me something useful".  Empty value is fine
+	 * --- protocol convention is "empty value means clear this key".
+	 */
+	if (key[0] == '\0')
+	{
+		libpq_append_conn_error(conn,
+								"PQattachHeader: key must not be empty");
+		return 0;
+	}
+
 	if (!conn->headersAvailable)
 	{
 		libpq_append_conn_error(conn,
 								"server did not negotiate _pq_.headers; PQattachHeader is not available on this connection");
 		return 0;
 	}
-
-	/*
-	 * Disallow embedded NUL bytes --- the protocol's NUL-terminated string
-	 * encoding cannot represent them and the server would misparse the
-	 * message.  strlen() finds the first NUL; if it equals the underlying
-	 * argument length the caller's string is clean.  We can't directly know
-	 * the underlying length, but the only way a NUL inside the visible
-	 * string can occur is via deliberate construction; in normal usage
-	 * strlen of a C string is the canonical length, so checking that the
-	 * key and value contain no further data is sufficient.  We restrict
-	 * key and value to the length strlen reports.
-	 */
-	/* (We accept whatever strlen() reports; there's no way for a caller's
-	 * normal C string to embed a NUL that strlen would miss.) */
 
 	if (!ensure_capacity(conn))
 	{
