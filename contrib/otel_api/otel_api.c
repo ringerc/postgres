@@ -182,6 +182,7 @@ api_any_emit_consumer_present(void)
  */
 static const OtelTracingApi otel_tracing_api = {
 	.version = OTEL_TRACING_API_VERSION,
+	.struct_size = sizeof(OtelTracingApi),
 	.register_emit_hook = api_register_emit_hook,
 	.register_sampler_hook = api_register_sampler_hook,
 	.set_sampler_policy = api_set_sampler_policy,

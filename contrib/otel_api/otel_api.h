@@ -51,19 +51,27 @@
  *
  * External modules MUST verify both:
  *
- *	   OTEL_API_MAJOR(api->version) == OTEL_TRACING_API_MAJOR   // strict
- *	   OTEL_API_MINOR(api->version) >= OTEL_TRACING_API_MINOR   // >=
+ *	   OTEL_API_MAJOR(api->version) == OTEL_TRACING_API_MAJOR
+ *	   api->struct_size >= sizeof(struct OtelTracingApi)
  *
  * Strict equality on MAJOR is intentional: an exporter built against
  * MAJOR=N has no way to know whether MAJOR=N+1 moved a function
  * pointer, changed a struct layout, or repurposed a field.  Force
  * the rebuild.
  *
- * MINOR is asymmetric: a producer at (M, N+k) is fine for a consumer
- * built at (M, N) because additive changes only add fields after the
- * prefix the consumer reads.  The other direction (consumer minor >
- * producer minor) is not safe -- the consumer would read past the
- * end of the producer's struct, hence the >= check.
+ * struct_size guards against the consumer being newer than the
+ * producer (consumer's compile-time sizeof is larger than what the
+ * producer actually exposes) --- reading past the producer's end is
+ * UB.  The other direction (producer newer than consumer) is fine:
+ * the consumer reads the prefix it knows about and ignores any
+ * appended fields.
+ *
+ * The MINOR halfword is informational only.  It used to be the
+ * load-bearing additive-extension check, but struct_size is a
+ * stronger guarantee (it survives header-drift bugs, LD_PRELOAD
+ * mismatches, and the .so-vs-header skew cases where two parties
+ * disagree on the struct layout without disagreeing on the version
+ * number).
  *
  * Use OTEL_MAKE_VERSION(maj, min) to construct version literals.
  * Use OTEL_API_MAJOR(v) and OTEL_API_MINOR(v) to extract halfwords.
@@ -112,12 +120,41 @@
 typedef struct OtelTracingApi
 {
 	/*
-	 * Set to OTEL_TRACING_API_VERSION at module init.  External
-	 * consumers must verify both halfwords match what they were
-	 * compiled against (strict on MAJOR, >= on MINOR); see the
-	 * comment on OTEL_TRACING_API_VERSION.
+	 * Set to OTEL_TRACING_API_VERSION at module init.  Halfword-
+	 * packed MAJOR/MINOR.  Today the MAJOR halfword must match
+	 * strictly; the MINOR halfword is informational (the load-bearing
+	 * compatibility check is struct_size below).
 	 */
 	uint32		version;
+
+	/*
+	 * sizeof(OtelTracingApi) at the producer's compile time.  Consumers
+	 * compare this against their own compile-time sizeof to detect
+	 * struct-layout mismatch independently of the version halfwords.
+	 *
+	 * The two fields together form the load-bearing compatibility
+	 * check:
+	 *
+	 *	   OTEL_API_MAJOR(api->version) != OTEL_TRACING_API_MAJOR
+	 *	       -> incompatible struct layout / repurposed fields.
+	 *	   api->struct_size < sizeof(struct OtelTracingApi)
+	 *	       -> producer is older than my header; reading past the
+	 *	          producer's end is UB.
+	 *	   otherwise -> safe to use up to sizeof(*api); any further
+	 *	                fields the producer exposes are ignored.
+	 *
+	 * Placed immediately after version so its offset stays at a
+	 * fixed, layout-independent position (4 bytes in) forever ---
+	 * a consumer can read version + struct_size before relying on
+	 * any compile-time knowledge of the rest of the struct.
+	 *
+	 * Pre-1.0 status note: until the API is declared stable (1.0+),
+	 * we use struct_size for layout validation without bumping
+	 * MAJOR on additive changes.  Consumers must rebuild whenever
+	 * the struct grows; struct_size catches "you forgot to rebuild"
+	 * at runtime.
+	 */
+	uint32		struct_size;
 
 	/*
 	 * Register a span emit callback.  If prev_out is non-NULL, the
@@ -181,12 +218,48 @@ typedef struct OtelTracingApi
 	 * PL handlers, replication apply workers, custom SPI callers
 	 * --- all use the same surface.
 	 *
-	 * Memory model: the consumer owns the OtelSpan allocation (in
-	 * its own MemoryContext, typically palloc'd in a per-statement
-	 * context or kept in a static slab).  The active-span stack
-	 * holds borrowed pointers; the consumer MUST emit before
-	 * destroying the underlying memory.  (Commit C will add a
-	 * MemoryContextCallback safety net for ereport-unwind cases.)
+	 * --------------------------------------------------------------
+	 * Push-time requirements
+	 * --------------------------------------------------------------
+	 *
+	 * The push functions capture two things and remember them
+	 * until span_emit or unwind: the OtelSpan pointer, and the
+	 * active CurrentMemoryContext.
+	 *
+	 * The OtelSpan storage:
+	 *
+	 *   * OTEL_UNWIND_DROP (default): on-stack or anywhere else
+	 *     is fine; the unwind path does not read the span.  The
+	 *     stack entry stores NULL for the span pointer under
+	 *     this policy, so even a stale dangling address is never
+	 *     observed.
+	 *   * OTEL_UNWIND_ERROR: must NOT be on the C stack.  Use a
+	 *     static slab or palloc / malloc.  Storage must stay
+	 *     valid until span_emit returns OR the unwind callback
+	 *     finishes dispatching the span.
+	 *
+	 * The CurrentMemoryContext at push:
+	 *
+	 *   * Defines when the unwind safety net fires --- otel_api
+	 *     registers a MemoryContextResetCallback against the
+	 *     active CurrentMemoryContext at push time, and that
+	 *     context's reset (e.g. on an ereport that unwinds
+	 *     through it) is what triggers OTEL_UNWIND_*.
+	 *   * Typically this is already the right per-statement /
+	 *     per-function context you're in.  If you need a wider
+	 *     or narrower scope, MemoryContextSwitchTo before
+	 *     pushing; the binding is captured at push and later
+	 *     switches don't move it.
+	 *   * Do NOT push under TopMemoryContext, CacheMemoryContext,
+	 *     or ErrorContext: those don't reset on ereport, so under
+	 *     OTEL_UNWIND_ERROR the safety net never fires.  This is
+	 *     enforced with a LOG-level server message at push time;
+	 *     cassert builds Assert() on the misuse.
+	 *
+	 * After span_emit (success path) the storage can be freed and
+	 * the binding is forgotten.  After ereport(ERROR) no cleanup
+	 * is required: the callback pops the stack entry and applies
+	 * the unwind_policy automatically.
 	 *
 	 * Three variants for starting a span:
 	 *
