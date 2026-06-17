@@ -18,7 +18,14 @@ EXTENSION = test_otel_exporter
 DATA = test_otel_exporter--0.1.1.sql
 
 TAP_TESTS = 1
-NO_INSTALLCHECK = 1
+
+# See otel_api/Makefile for the rationale: empty REGRESS / ISOLATION
+# make PGXS's installcheck a no-op for the SQL-regression and isolation
+# runners (which can't reconfigure shared_preload_libraries), while
+# leaving NO_INSTALLCHECK unset so prove_installcheck still runs the
+# TAP suite under t/.
+REGRESS =
+ISOLATION =
 
 # <otel_api/otel.h> --- same in-tree vs PGXS paths as the consumers.
 ifdef USE_PGXS

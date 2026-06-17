@@ -2,10 +2,10 @@
 #
 # Resource-attribute API end-to-end test (OTEL_TRACING_API v2.1).
 #
-# Verifies that contrib/otel populates an OTel Resource for the
+# Verifies that otel_api populates an OTel Resource for the
 # postmaster process, exposes it via OtelTracingApi.
 # get_resource_attributes(), and that operators can override the
-# defaults via the otel.service_name and otel.service_instance_id
+# defaults via the otel_api.service_name and otel_api.service_instance_id
 # GUCs.
 
 use strict;
@@ -53,8 +53,8 @@ EOCONF
 	$node->init;
 	$node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
-otel.service_name = 'orders-db-primary'
-otel.service_instance_id = 'instance-abc-42'
+otel_api.service_name = 'orders-db-primary'
+otel_api.service_instance_id = 'instance-abc-42'
 log_min_messages = warning
 EOCONF
 	$node->start;

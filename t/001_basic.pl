@@ -4,7 +4,7 @@
 #
 # Loads both contrib/otel and the test-only span exporter
 # (test_otel_exporter) into a cluster, attaches a W3C traceparent
-# via the per-message RequestHeaders ('M') protocol mechanism, runs
+# via the TraceContext ('M') protocol message, runs
 # a query, and reads the captured span back through the exporter's
 # SQL surface.
 
@@ -47,7 +47,7 @@ $node->safe_psql('postgres',
 sub send_startup
 {
 	my ($sock, @kv) = @_;
-	my $body = pack('N', 0x00030000);
+	my $body = pack('N', 0x00030003);	# protocol 3.3
 	while (@kv)
 	{
 		my $k = shift @kv;
@@ -108,16 +108,13 @@ sub drain_to_rfq
 
 sub headers_body
 {
-	my @kv = @_;
-	my $n  = scalar(@kv) / 2;
-	my $body = pack('n', $n);
-	while (@kv)
-	{
-		my $k = shift @kv;
-		my $v = shift @kv;
-		$body .= $k . "\0" . $v . "\0";
-	}
-	return $body;
+	# TraceContext ('M') wire body: two NUL-terminated strings
+	# (traceparent, tracestate).  Accepts the legacy keyed-pair calling
+	# convention and maps recognised keys to wire positions.
+	my %h = @_;
+	my $tp = $h{'otel.traceparent'} // '';
+	my $ts = $h{'otel.tracestate'} // '';
+	return "$tp\0$ts\0";
 }
 
 sub first_value
@@ -151,9 +148,8 @@ my $superuser = getpwuid($<);
 my $sock = $node->raw_connect();
 send_startup(
 	$sock,
-	user           => $superuser,
-	database       => 'postgres',
-	'_pq_.headers' => '1');
+	user     => $superuser,
+	database => 'postgres');
 drain_to_rfq($sock);
 
 # ----------------------------------------------------------------------
@@ -319,11 +315,19 @@ like($span, qr/event\.message=test-warn/,
 # ----------------------------------------------------------------------
 # Test 6: explicit BEGIN/COMMIT cycle - the BEGIN and COMMIT statements
 # each produce a utility span with the matching name.
+#
+# Under the TraceContext until-RFQ scope, a trace context is cleared at
+# every ReadyForQuery, so each top-level pipeline must carry its own
+# 'M'.  BEGIN and COMMIT are sent as separate simple queries (separate
+# RFQ windows), so a traceparent is re-injected before each -- this is
+# exactly what libpq's armed mode (PQsetTraceContext) does automatically
+# per pipeline.
 # ----------------------------------------------------------------------
 
 run_query($sock, 'SELECT test_otel_clear()');
 send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'BEGIN');
+send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'COMMIT');
 
 # At least two spans (BEGIN and COMMIT); names should reflect.
