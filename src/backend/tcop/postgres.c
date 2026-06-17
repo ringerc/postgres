@@ -5081,10 +5081,22 @@ PostgresMain(const char *dbname, const char *username)
 			case PqMsg_TraceContext:
 
 				/*
-				 * Trace-context protocol message.  Available when the
-				 * client negotiated protocol 3.3.  No reply is sent;
-				 * the context is applied immediately and cleared at the
-				 * next ReadyForQuery.
+				 * Trace-context protocol message ('M').  Available when the
+				 * client negotiated protocol 3.3.  No reply is sent; the
+				 * context is applied immediately and cleared at the next
+				 * ReadyForQuery.
+				 *
+				 * Acceptance-state guarantee: this dispatch site is only
+				 * reached from the top-level PostgresMain command loop.
+				 * Mid-COPY-in, the backend is inside CopyGetData (copyfromparse.c)
+				 * which has its own message-reading loop that rejects any
+				 * unexpected type — including 'M' — with
+				 * ERRCODE_PROTOCOL_VIOLATION.  During walsender streaming,
+				 * the backend is inside WalSndLoop / ProcessRepliesIfAny
+				 * (walsender.c) which likewise rejects 'M' with
+				 * ERRCODE_PROTOCOL_VIOLATION (ERROR, not FATAL).  So 'M'
+				 * can only reach this case when the backend is genuinely
+				 * waiting for a top-level command.
 				 */
 				ProcessTraceContextMessage(&input_message);
 				break;
