@@ -51,7 +51,7 @@ if (!$node->raw_connect_works())
 sub send_startup
 {
 	my ($sock, @kv) = @_;
-	my $body = pack('N', 0x00030000);
+	my $body = pack('N', 0x00030003);	# protocol 3.3
 	while (@kv)
 	{
 		my $k = shift @kv;
@@ -112,16 +112,13 @@ sub drain_to_rfq
 
 sub headers_body
 {
-	my @kv = @_;
-	my $n  = scalar(@kv) / 2;
-	my $body = pack('n', $n);
-	while (@kv)
-	{
-		my $k = shift @kv;
-		my $v = shift @kv;
-		$body .= $k . "\0" . $v . "\0";
-	}
-	return $body;
+	# TraceContext ('M') wire body: two NUL-terminated strings
+	# (traceparent, tracestate).  Accepts the legacy keyed-pair calling
+	# convention and maps recognised keys to wire positions.
+	my %h = @_;
+	my $tp = $h{'otel.traceparent'} // '';
+	my $ts = $h{'otel.tracestate'} // '';
+	return "$tp\0$ts\0";
 }
 
 sub first_value
@@ -174,9 +171,8 @@ my $superuser = getpwuid($<);
 my $sock = $node->raw_connect();
 send_startup(
 	$sock,
-	user           => $superuser,
-	database       => 'postgres',
-	'_pq_.headers' => '1');
+	user     => $superuser,
+	database => 'postgres');
 drain_to_rfq($sock);
 
 # By default the test_otel_exporter sampler hook returns DROP --- we
