@@ -90,9 +90,9 @@ otel_emit_log_hook(ErrorData *edata)
 		 * hook-installed trace context is the most authoritative for
 		 * this log line.
 		 */
-		errannot(ERRANNOT_KEY_TRACE_ID, rc.trace_id);
-		errannot(ERRANNOT_KEY_SPAN_ID, rc.span_id);
-		errannot(ERRANNOT_KEY_TRACE_FLAGS, rc.trace_flags);
+		errannot(OTEL_ERRANNOT_KEY_TRACE_ID, rc.trace_id);
+		errannot(OTEL_ERRANNOT_KEY_SPAN_ID, rc.span_id);
+		errannot(OTEL_ERRANNOT_KEY_TRACE_FLAGS, rc.trace_flags);
 #else
 		/*
 		 * Fallback for unpatched servers without ErrorData

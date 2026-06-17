@@ -104,7 +104,7 @@ static void otel_ProcessUtility(PlannedStmt *pstmt,
 								QueryEnvironment *queryEnv,
 								DestReceiver *dest,
 								QueryCompletion *qc);
-static void otel_xact_callback(XactEvent event, void *arg);
+static void otel_pgtracing_xact_callback(XactEvent event, void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
 static OtelSamplerDecision decide_whether_to_record(const char *name_hint);
 static void start_span(QueryDesc *queryDesc);
@@ -137,7 +137,7 @@ otel_trace_install_hooks(void)
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = otel_ProcessUtility;
 
-	RegisterXactCallback(otel_xact_callback, NULL);
+	RegisterXactCallback(otel_pgtracing_xact_callback, NULL);
 	on_proc_exit(otel_proc_exit_cb, (Datum) 0);
 }
 
@@ -721,7 +721,7 @@ otel_ProcessUtility(PlannedStmt *pstmt,
  * emit it now with ERROR status.
  */
 static void
-otel_xact_callback(XactEvent event, void *arg)
+otel_pgtracing_xact_callback(XactEvent event, void *arg)
 {
 	switch (event)
 	{

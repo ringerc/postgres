@@ -93,14 +93,16 @@ _PG_init(void)
 				(errmsg("otel_postgres_tracing requires contrib/otel to be loaded first"),
 				 errhint("In shared_preload_libraries, 'otel' must come before 'otel_postgres_tracing'.")));
 	if (OTEL_API_MAJOR(otel_api->version) != OTEL_TRACING_API_MAJOR ||
-		OTEL_API_MINOR(otel_api->version) < OTEL_TRACING_API_MINOR)
+		otel_api->struct_size < sizeof(*otel_api))
 		ereport(ERROR,
-				(errmsg("OtelTracingApi version mismatch"),
-				 errdetail("Loaded contrib/otel exposes api version %u.%u; otel_postgres_tracing was built against version %u.%u.",
+				(errmsg("OtelTracingApi compatibility check failed"),
+				 errdetail("Loaded otel_api exposes api version %u.%u (struct_size %u); otel_postgres_tracing was built against version %u.%u (struct_size %zu).",
 						   OTEL_API_MAJOR(otel_api->version),
 						   OTEL_API_MINOR(otel_api->version),
+						   otel_api->struct_size,
 						   OTEL_TRACING_API_MAJOR,
-						   OTEL_TRACING_API_MINOR)));
+						   OTEL_TRACING_API_MINOR,
+						   sizeof(*otel_api))));
 
 	/*
 	 * trace_all_queries is owned by this module post-split: it's a
