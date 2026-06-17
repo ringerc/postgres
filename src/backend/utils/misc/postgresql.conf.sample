@@ -93,15 +93,10 @@
                                         # disconnection while running queries;
                                         # 0 for never
 
-# - Per-message protocol headers -
+# - Trace context -
 
-#protocol_headers = on                  # accept _pq_.headers opt-in and
-                                        # RequestHeaders ('M') messages
-#max_protocol_header_entries = 64       # max entries per RequestHeaders;
-                                        # 0 disables the feature at handshake
-#max_protocol_header_size = 4096        # max bytes per (key, value) entry,
-                                        # including NUL terminators;
-                                        # 0 disables the feature at handshake
+#trace_context_enabled = on		# accept TraceContext ('M') messages
+					# from protocol 3.3 clients
 
 # - Authentication -
 

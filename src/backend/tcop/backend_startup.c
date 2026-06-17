@@ -25,7 +25,6 @@
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
-#include "libpq/protocol_headers.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
@@ -803,36 +802,6 @@ retry:
 									"replication",
 									valptr),
 							 errhint("Valid values are: \"false\", 0, \"true\", 1, \"database\".")));
-			}
-			else if (strcmp(nameptr, "_pq_.headers") == 0)
-			{
-				/*
-				 * Client is opting in to the per-message RequestHeaders
-				 * mechanism (message type 'M').  Honor the opt-in only if
-				 * the feature is fully usable on this server:
-				 *
-				 *   - the value is exactly "1" (the documented opt-in
-				 *     spelling; reject "0", missing, and unknown values
-				 *     so future value-based semantics remain available),
-				 *   - the protocol_headers_enabled kill-switch is on, AND
-				 *   - both per-message caps allow at least one entry
-				 *     (max_protocol_header_entries > 0 AND
-				 *      max_protocol_header_size > 0).
-				 *
-				 * If either cap is 0, every 'M' message would be rejected
-				 * by ProcessRequestHeadersMessage anyway, so it's better
-				 * to advertise the feature as unavailable up-front via
-				 * NegotiateProtocolVersion than to accept the opt-in and
-				 * then FATAL-on-send.
-				 */
-				if (strcmp(valptr, "1") == 0
-					&& protocol_headers_enabled
-					&& max_protocol_header_entries > 0
-					&& max_protocol_header_size > 0)
-					ProtocolHeadersNegotiated = true;
-				else
-					unrecognized_protocol_options =
-						lappend(unrecognized_protocol_options, pstrdup(nameptr));
 			}
 			else if (strncmp(nameptr, "_pq_.", 5) == 0)
 			{

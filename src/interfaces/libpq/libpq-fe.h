@@ -676,41 +676,40 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
 
 
 
-/* === in fe-headers.c === */
+/* === in fe-trace-context.c === */
 
 /*
- * Per-message protocol headers.
+ * Trace-context protocol message ('M' / TraceContext).
  *
- * PQattachHeader queues a (key, value) header to be sent as a single
- * RequestHeaders ('M') message immediately before the next PQsend* /
- * PQexec* operation on this connection.  The queue is flushed at the
- * start of that operation and is then empty for the next one.
+ * Available when the negotiated protocol version is >= 3.3
+ * (PQtraceContextAvailable returns 1).  Trace context is advisory:
+ * not for use in authorization decisions.
  *
- * Headers are advisory only and must not be used in authorization
- * decisions.  The server side dispatches headers to extension-supplied
- * handlers by key prefix.
+ * PQsetTraceContext: arm the connection.  libpq emits a fresh 'M'
+ * before each subsequent pipeline (at the start of each PQsend* /
+ * PQexec*) until disarmed.  Pass traceparent = NULL to disarm.
+ * tracestate may be NULL.  Scope: until next RFQ (cleared by core
+ * at each ReadyForQuery boundary); client re-sends per pipeline.
  *
- * Returns 1 on success, 0 on failure (use PQerrorMessage).  Failure
- * cases: the server did not negotiate _pq_.headers (see
- * PQheadersAvailable); key or value contains a NUL byte; out of memory.
+ * PQattachTraceContext: one-shot.  Emits one 'M' before the next
+ * message; covers that pipeline's RFQ window; not re-sent.
+ *
+ * Both return 1 on success, 0 on failure (use PQerrorMessage).
+ * Failure cases: protocol < 3.3; out of memory.
  */
-extern int	PQattachHeader(PGconn *conn,
-						   const char *key,
-						   const char *value);
+extern int	PQsetTraceContext(PGconn *conn,
+							  const char *traceparent,
+							  const char *tracestate);
 
-/* Discard any queued headers without sending them. */
-extern void PQclearHeaders(PGconn *conn);
+extern int	PQattachTraceContext(PGconn *conn,
+								 const char *traceparent,
+								 const char *tracestate);
 
 /*
- * Returns 1 if the server affirmatively negotiated _pq_.headers during
- * the startup handshake (i.e. the server emitted a ParameterStatus
- * "protocol_features" listing "headers"); 0 otherwise.  Note that the
- * absence of a NegotiateProtocolVersion is NOT sufficient evidence on
- * its own, since an intermediary may have silently stripped the
- * client's _pq_.headers opt-in; PQheadersAvailable rides on the
- * affirmative ParameterStatus instead.
+ * Returns 1 if the negotiated protocol supports trace context (>= 3.3);
+ * 0 otherwise.
  */
-extern int	PQheadersAvailable(const PGconn *conn);
+extern int	PQtraceContextAvailable(const PGconn *conn);
 
 
 

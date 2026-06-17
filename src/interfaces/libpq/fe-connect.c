@@ -726,13 +726,11 @@ pqDropServerData(PGconn *conn)
 	}
 
 	/*
-	 * Drop any queued protocol headers and clear the negotiation flag.  A
-	 * fresh handshake will re-confirm headersAvailable via protocol_features;
-	 * carrying headers or the flag across a reset would either send stale
-	 * metadata or misreport the new connection's capabilities.
+	 * Drop any pending trace context.  A fresh handshake may negotiate a
+	 * different protocol version; carrying armed state across a reset could
+	 * send stale trace context on a connection that no longer supports it.
 	 */
-	pqReleaseQueuedHeaders(conn);
-	conn->headersAvailable = false;
+	pqReleaseTraceContext(conn);
 }
 
 
@@ -5186,9 +5184,8 @@ freePGconn(PGconn *conn)
 	free(conn->outBuffer);
 	free(conn->rowBuf);
 
-	/* Drop any queued protocol headers and the array itself. */
-	pqReleaseQueuedHeaders(conn);
-	free(conn->queuedHeaders);
+	/* Drop any pending trace context. */
+	pqReleaseTraceContext(conn);
 
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);

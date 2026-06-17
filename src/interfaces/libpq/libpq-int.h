@@ -350,15 +350,6 @@ typedef struct PGcmdQueueEntry
 } PGcmdQueueEntry;
 
 /*
- * One queued protocol-header entry; key and value are malloc'd.
- */
-typedef struct PQqueuedHeader
-{
-	char	   *key;
-	char	   *value;
-} PQqueuedHeader;
-
-/*
  * pg_conn_host stores all information about each of possibly several hosts
  * mentioned in the connection string.  Most fields are derived by splitting
  * the relevant connection parameter (e.g., pghost) at commas.
@@ -508,22 +499,19 @@ struct pg_conn
 	PGcmdQueueEntry *cmd_queue_recycle;
 
 	/*
-	 * Per-message protocol headers ('M' / RequestHeaders).
+	 * Trace-context protocol message ('M' / TraceContext).
+	 * Availability is derived from conn->pversion (>= 3.3), not a
+	 * negotiated flag.
 	 *
-	 * headersAvailable is set to true only when the server emitted a
-	 * "protocol_features" ParameterStatus listing "headers" during the
-	 * startup handshake --- an affirmative acknowledgement that survives
-	 * proxies that might silently strip _pq_.headers from the
-	 * StartupMessage.
-	 *
-	 * queuedHeaders holds key/value pairs queued by PQattachHeader; the
-	 * queue is flushed as a single RequestHeaders message at the start
-	 * of the next PQsend* / PQexec* operation.
+	 * tcTraceparent / tcTracestate are malloc'd strings, NULL when unset.
+	 * tcArmed: re-emit once per pipeline until disarmed (PQsetTraceContext).
+	 * tcPendingOneShot: emit once before next message, then clear
+	 *   (PQattachTraceContext).
 	 */
-	bool		headersAvailable;
-	int			nQueuedHeaders;
-	int			queuedHeadersCapacity;
-	PQqueuedHeader *queuedHeaders;
+	char	   *tcTraceparent;
+	char	   *tcTracestate;
+	bool		tcArmed;
+	bool		tcPendingOneShot;
 
 	/* Connection data */
 	pgsocket	sock;			/* FD for socket, PGINVALID_SOCKET if
@@ -775,10 +763,10 @@ extern pgthreadlock_t pg_g_threadlock;
 #define pglock_thread()		pg_g_threadlock(true)
 #define pgunlock_thread()	pg_g_threadlock(false)
 
-/* === in fe-headers.c === */
+/* === in fe-trace-context.c === */
 
-extern int	pqFlushHeaders(PGconn *conn);
-extern void pqReleaseQueuedHeaders(PGconn *conn);
+extern int	pqFlushTraceContext(PGconn *conn);
+extern void pqReleaseTraceContext(PGconn *conn);
 
 
 /* === in fe-exec.c === */
