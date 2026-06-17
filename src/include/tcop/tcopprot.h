@@ -46,48 +46,6 @@ extern PGDLLIMPORT int log_statement;
 
 extern PGDLLIMPORT int restrict_nonsystem_relation_kind;
 
-/*
- * Hook fired by PostgresMain immediately before each ReadyForQuery
- * message is sent --- the v3 protocol cycle boundary, after the
- * command(s) have completed and just before the server announces
- * itself idle again.
- *
- * Intended use: end-of-cycle teardown that needs to run once per
- * round-trip, not once per statement.  ReadyForQuery isn't
- * per-statement (multi-statement simple-Query, Bind/Execute
- * between Syncs, copy completion, error-recovery skip-till-Sync
- * all share one), so callers needing per-statement granularity
- * should combine post_parse_analyze_hook, ExecutorEnd_hook, and
- * ProcessUtility_hook instead.
- *
- * Chaining: this is a single function pointer.  Multiple extensions
- * sharing the hook MUST chain explicitly --- the second installer
- * silently overrides the first otherwise:
- *
- *	 static pre_ready_for_query_hook_type prev_hook;
- *
- *	 static void my_hook(void) {
- *	     ... do work ...
- *	     if (prev_hook)
- *	         prev_hook();
- *	 }
- *
- *	 void _PG_init(void) {
- *	     prev_hook = pre_ready_for_query_hook;
- *	     pre_ready_for_query_hook = my_hook;
- *	 }
- *
- * Error handling: PostgresMain wraps the call in PG_TRY/PG_CATCH and
- * logs+swallows any error raised by the hook so an ereport from
- * teardown code does not produce an infinite cycle (sigsetjmp
- * recovery re-sets send_ready_for_query, which would otherwise
- * re-fire the hook).  Hook authors should still treat their bodies
- * as non-throwing; the catch is a safety net, not a licence to
- * ignore errors.
- */
-typedef void (*pre_ready_for_query_hook_type) (void);
-extern PGDLLIMPORT pre_ready_for_query_hook_type pre_ready_for_query_hook;
-
 extern List *pg_parse_query(const char *query_string);
 extern List *pg_rewrite_query(Query *query);
 extern List *pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,

@@ -111,9 +111,6 @@ int			client_connection_check_interval = 0;
 /* flags for non-system relation kinds to restrict use */
 int			restrict_nonsystem_relation_kind;
 
-/* Hook fired just before each ReadyForQuery; see tcopprot.h. */
-pre_ready_for_query_hook_type pre_ready_for_query_hook = NULL;
-
 /*
  * Include signal sender PID/UID in the server log when available
  * (SA_SIGINFO). The caller must supply the already-captured pid and uid
@@ -4790,49 +4787,9 @@ PostgresMain(const char *dbname, const char *username)
 			}
 
 			/*
-			 * Fire pre_ready_for_query_hook so extensions can run any
-			 * end-of-command-cycle teardown they need.  See the
-			 * declaration in tcop/tcopprot.h.
-			 *
-			 * Wrap in PG_TRY/PG_CATCH so a hook that ereports does
-			 * NOT loop indefinitely: sigsetjmp recovery re-sets
-			 * send_ready_for_query = true, which would re-fire the
-			 * hook and, if the hook deterministically errors, never
-			 * exit the cycle.  We log + swallow instead, so the
-			 * cycle progresses to ReadyForQuery and the session
-			 * remains usable.  Hook authors are still expected to
-			 * keep this code path non-throwing; the catch is a
-			 * safety net, not an excuse to ignore errors.
-			 */
-			if (pre_ready_for_query_hook != NULL)
-			{
-				PG_TRY();
-				{
-					pre_ready_for_query_hook();
-				}
-				PG_CATCH();
-				{
-					ErrorData  *edata;
-					MemoryContext ecxt;
-
-					ecxt = MemoryContextSwitchTo(ErrorContext);
-					edata = CopyErrorData();
-					ereport(LOG,
-							(errmsg("pre_ready_for_query_hook raised an error; cycle continues"),
-							 errdetail("%s", edata->message)));
-					FreeErrorData(edata);
-					FlushErrorState();
-					MemoryContextSwitchTo(ecxt);
-				}
-				PG_END_TRY();
-			}
-
-			/*
 			 * Clear any trace context applied during this command cycle.
 			 * The TraceContext ('M') scope is until-RFQ, so the recorded
-			 * context is reset here -- after any pre_ready_for_query_hook
-			 * teardown (which may still want to observe it) and
-			 * immediately before ReadyForQuery.
+			 * context is reset here -- immediately before ReadyForQuery.
 			 */
 			ClearTraceContext();
 
