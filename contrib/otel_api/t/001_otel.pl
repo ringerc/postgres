@@ -38,6 +38,7 @@ $node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing'
 log_statement = 'all'
 log_min_messages = log
+log_line_prefix = '%m [%p] %A %q%a '
 EOCONF
 $node->start;
 
@@ -175,10 +176,18 @@ my $log_offset = -s $node->logfile;
 send_msg($sock, 'M', trace_context_body($TRACEPARENT, ''));
 run_query($sock, 'SELECT 1');
 
-$node->wait_for_log(
-	qr/CONTEXT:\s+trace_id=$TRACE_ID\s+span_id=$SPAN_ID/,
-	$log_offset);
-pass('SELECT 1 CONTEXT has trace_id and span_id from TraceContext M');
+# Trace context surfaces in the log either as errannot annotations
+# (rendered by %A as trace_id="..." when the server has errannot) or,
+# on a server without errannot, as a "CONTEXT: trace_id=..." fallback
+# line.  Match either form, and check the fields independently since the
+# %A and CONTEXT renderings order them differently.
+$node->wait_for_log(qr/trace_id="?$TRACE_ID/, $log_offset);
+my $sel1_log =
+  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+like($sel1_log, qr/trace_id="?$TRACE_ID/,
+	'SELECT 1 log has trace_id from TraceContext M');
+like($sel1_log, qr/span_id="?$SPAN_ID/,
+	'SELECT 1 log has span_id from TraceContext M');
 
 # ----------------------------------------------------------------------
 # Test 2: SQL-level introspection via otel_current_traceparent().
@@ -208,7 +217,7 @@ my $post_rfq = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 # The SELECT 3 log line must NOT contain our trace_id
 unlike(
 	$post_rfq,
-	qr/trace_id=$TRACE_ID/,
+	qr/trace_id="?$TRACE_ID/,
 	'SELECT 3 without preceding M has no trace context (cleared at RFQ)');
 
 # ----------------------------------------------------------------------
@@ -240,7 +249,7 @@ run_query($sock, 'SELECT 5');
 my $after_set = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 like(
 	$after_set,
-	qr/trace_id=$TRACE_ID/,
+	qr/trace_id="?$TRACE_ID/,
 	'SET-installed context present after SET');
 
 # The context should survive another RFQ (it was installed via SET, not M)
@@ -249,7 +258,7 @@ run_query($sock, 'SELECT 6');
 my $still_set = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 like(
 	$still_set,
-	qr/trace_id=$TRACE_ID/,
+	qr/trace_id="?$TRACE_ID/,
 	'SET-installed context survives an RFQ (not cleared by M-context clear)');
 
 # Clean up the SET
