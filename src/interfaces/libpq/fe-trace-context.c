@@ -36,6 +36,10 @@
 /*
  * PQtraceContextAvailable --- 1 if the negotiated protocol supports
  * trace context (>= 3.3).
+ *
+ * Threading: a PGconn must be used from only one thread at a time.
+ * Concurrent calls on the same conn (from any libpq function) are
+ * undefined behaviour; see "Behavior in Threaded Programs" in the docs.
  */
 int
 PQtraceContextAvailable(const PGconn *conn)
@@ -52,6 +56,21 @@ PQtraceContextAvailable(const PGconn *conn)
  * Pass traceparent = NULL to disarm and free stored strings.
  * tracestate may be NULL (treated as "").
  * Returns 1 on success, 0 on failure (conn->errorMessage set).
+ *
+ * Threading: the caller must ensure exclusive access to conn for the
+ * duration of this call.  A PGconn must not be used concurrently from
+ * multiple threads; doing so is undefined behaviour.  See "Behavior in
+ * Threaded Programs" in the libpq documentation.
+ *
+ * Embedded NULs: traceparent and tracestate are transmitted as
+ * NUL-terminated strings on the wire (pqPuts writes strlen(s)+1 bytes).
+ * A value that contains an embedded NUL byte will be silently truncated
+ * at that byte; the server receives a shorter string than intended.
+ * To catch the common zero-filled-buffer bug, PQsetTraceContext rejects
+ * an empty traceparent (returns 0 with an error message).  The server
+ * treats a malformed traceparent as "no context" rather than an error, so
+ * other truncation cases are not catastrophic, but callers should not
+ * rely on that.
  */
 int
 PQsetTraceContext(PGconn *conn, const char *traceparent,
@@ -65,6 +84,17 @@ PQsetTraceContext(PGconn *conn, const char *traceparent,
 	{
 		pqReleaseTraceContext(conn);
 		return 1;
+	}
+
+	/*
+	 * Reject an empty traceparent.  A valid W3C traceparent is always
+	 * non-empty; an empty string most likely indicates a zero-initialized
+	 * buffer passed by mistake, which would otherwise be sent silently.
+	 */
+	if (traceparent[0] == '\0')
+	{
+		libpq_append_conn_error(conn, "traceparent must not be empty");
+		return 0;
 	}
 
 	if (!PQtraceContextAvailable(conn))
@@ -102,8 +132,15 @@ PQsetTraceContext(PGconn *conn, const char *traceparent,
  * PQattachTraceContext --- one-shot: emit one 'M' before the next message;
  * covers that pipeline until its RFQ, then is not re-sent.
  *
+ * traceparent must not be NULL or empty.
  * tracestate may be NULL (treated as "").
  * Returns 1 on success, 0 on failure.
+ *
+ * Threading: same single-owner constraint as PQsetTraceContext.  The caller
+ * must have exclusive use of conn for the duration of this call.
+ *
+ * Embedded NULs: same limitation as PQsetTraceContext.  An empty traceparent
+ * is rejected; other embedded-NUL cases result in silent wire truncation.
  */
 int
 PQattachTraceContext(PGconn *conn, const char *traceparent,
@@ -116,6 +153,13 @@ PQattachTraceContext(PGconn *conn, const char *traceparent,
 	{
 		libpq_append_conn_error(conn,
 								"PQattachTraceContext: traceparent must not be NULL");
+		return 0;
+	}
+
+	/* Same empty-string guard as PQsetTraceContext; see comment there. */
+	if (traceparent[0] == '\0')
+	{
+		libpq_append_conn_error(conn, "traceparent must not be empty");
 		return 0;
 	}
 
