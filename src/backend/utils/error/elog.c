@@ -85,6 +85,7 @@
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc_hooks.h"
+#include "utils/json.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/ps_status.h"
@@ -193,6 +194,14 @@ static pg_noinline void set_backtrace(ErrorData *edata, int num_skip);
 static void backtrace_cleanup(int code, Datum arg);
 static void set_errdata_field(MemoryContextData *cxt, char **ptr, const char *str);
 static void FreeErrorDataContents(ErrorData *edata);
+static bool is_valid_annotation_key(const char *key);
+static bool is_reserved_annotation_key(const char *key);
+static ErrorAnnotation *find_annotation(ErrorAnnotation *head, const char *key);
+static void set_annotation(ErrorData *edata, const char *key, const char *value);
+static void record_rejected_annotation(ErrorData *edata, const char *key);
+static ErrorAnnotation *copy_annotations(MemoryContext cxt,
+										 const ErrorAnnotation *src);
+static void free_annotations(ErrorAnnotation *head);
 static int	log_min_messages_cmp(const ListCell *a, const ListCell *b);
 static void write_console(const char *line, int len);
 static const char *process_log_prefix_padding(const char *p, int *ppadding);
@@ -1765,6 +1774,342 @@ set_errdata_field(MemoryContextData *cxt, char **ptr, const char *str)
 }
 
 /*
+ * Sorted list of annotation keys that core owns in the JSON log output.
+ * errannot() refuses to attach annotations under these names so that they
+ * cannot collide with the top-level keys emitted by write_jsonlog(); the
+ * rejected key name (but not its value) is recorded in the aggregator
+ * named by ERRANNOT_KEY_REJECTED so the rejection is visible to operators.
+ *
+ * Kept sorted for bsearch().  When write_jsonlog() gains a new top-level
+ * key, append it here too (and document the addition under "Reserved
+ * annotation keys" in sources.sgml).
+ */
+static const char *const reserved_annotation_keys[] = {
+	"application_name",
+	"backend_type",
+	"context",
+	"cursor_position",
+	"dbname",
+	"detail",
+	"error_severity",
+	"file_line_num",
+	"file_name",
+	"func_name",
+	"hint",
+	"internal_position",
+	"internal_query",
+	"leader_pid",
+	"line_num",
+	"message",
+	ERRANNOT_KEY_REJECTED,		/* "pg_rejected_annotations" */
+	"pid",
+	"ps",
+	"query_id",
+	"remote_host",
+	"remote_port",
+	"session_id",
+	"session_start",
+	"state_code",
+	"statement",
+	"timestamp",
+	"txid",
+	"user",
+	"vxid",
+};
+
+static int
+reserved_annotation_key_cmp(const void *a, const void *b)
+{
+	const char *ka = a;
+	const char *kb = *(const char *const *) b;
+
+	return strcmp(ka, kb);
+}
+
+/*
+ * is_valid_annotation_key --- check key syntax
+ *
+ * Keys must match [A-Za-z_][A-Za-z0-9_.:-]*.  The leading-digit ban keeps
+ * keys safely usable as JSON object members and as identifiers in shells
+ * and scripts.  The other allowed chars cover dotted OTel-style namespaces
+ * (e.g. "db.system") and conventions like "trace.id" or "ext:foo".
+ */
+static bool
+is_valid_annotation_key(const char *key)
+{
+	const unsigned char *p;
+
+	if (key == NULL || *key == '\0')
+		return false;
+
+	p = (const unsigned char *) key;
+	if (!((*p >= 'A' && *p <= 'Z') ||
+		  (*p >= 'a' && *p <= 'z') ||
+		  *p == '_'))
+		return false;
+
+	for (p++; *p != '\0'; p++)
+	{
+		if ((*p >= 'A' && *p <= 'Z') ||
+			(*p >= 'a' && *p <= 'z') ||
+			(*p >= '0' && *p <= '9') ||
+			*p == '_' || *p == '.' || *p == ':' || *p == '-')
+			continue;
+		return false;
+	}
+	return true;
+}
+
+/*
+ * is_reserved_annotation_key --- check the static reserved-key table.
+ *
+ * The set of reserved keys may grow in any future PostgreSQL release,
+ * including minor releases, whenever a new built-in field is added to the
+ * JSON log record.  Extensions are encouraged to namespace their keys
+ * (e.g. "<extname>.<key>") to minimize the risk of future collisions.
+ */
+static bool
+is_reserved_annotation_key(const char *key)
+{
+	return bsearch(key, reserved_annotation_keys,
+				   lengthof(reserved_annotation_keys),
+				   sizeof(reserved_annotation_keys[0]),
+				   reserved_annotation_key_cmp) != NULL;
+}
+
+/*
+ * find_annotation --- locate an existing annotation by key
+ */
+static ErrorAnnotation *
+find_annotation(ErrorAnnotation *head, const char *key)
+{
+	ErrorAnnotation *ann;
+
+	for (ann = head; ann != NULL; ann = ann->next)
+	{
+		if (strcmp(ann->key, key) == 0)
+			return ann;
+	}
+	return NULL;
+}
+
+/*
+ * set_annotation --- attach (or replace) an annotation on edata
+ *
+ * The caller is responsible for ensuring that the current memory context
+ * is appropriate for allocations (typically edata->assoc_context).  Strings
+ * are deep-copied via pstrdup().  A NULL value is treated as the empty
+ * string for storage purposes; passing NULL is not an error.
+ *
+ * If an annotation with the same key already exists, its value is
+ * replaced.  This lets nested error context callbacks override outer
+ * values predictably.
+ */
+static void
+set_annotation(ErrorData *edata, const char *key, const char *value)
+{
+	ErrorAnnotation *ann;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(edata->assoc_context);
+
+	ann = find_annotation(edata->annotations, key);
+	if (ann != NULL)
+	{
+		pfree(ann->value);
+		ann->value = pstrdup(value != NULL ? value : "");
+	}
+	else
+	{
+		ann = palloc(sizeof(ErrorAnnotation));
+		ann->key = pstrdup(key);
+		ann->value = pstrdup(value != NULL ? value : "");
+		ann->next = edata->annotations;
+		edata->annotations = ann;
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * record_rejected_annotation --- append a key name to the rejection aggregator
+ *
+ * Used when errannot() is called with a reserved key (collides with a
+ * built-in JSON log field).  The value the caller supplied is intentionally
+ * dropped on the floor; recording the name is enough to make the rejection
+ * diagnosable from the log record without risking leakage of a sensitive
+ * value into an unexpected output channel.
+ */
+static void
+record_rejected_annotation(ErrorData *edata, const char *key)
+{
+	ErrorAnnotation *ann;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(edata->assoc_context);
+
+	ann = find_annotation(edata->annotations, ERRANNOT_KEY_REJECTED);
+	if (ann == NULL)
+	{
+		ann = palloc(sizeof(ErrorAnnotation));
+		ann->key = pstrdup(ERRANNOT_KEY_REJECTED);
+		ann->value = pstrdup(key);
+		ann->next = edata->annotations;
+		edata->annotations = ann;
+	}
+	else
+	{
+		size_t		oldlen = strlen(ann->value);
+		size_t		addlen = strlen(key);
+		char	   *newval = palloc(oldlen + 1 + addlen + 1);
+
+		memcpy(newval, ann->value, oldlen);
+		newval[oldlen] = ',';
+		memcpy(newval + oldlen + 1, key, addlen);
+		newval[oldlen + 1 + addlen] = '\0';
+		pfree(ann->value);
+		ann->value = newval;
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * copy_annotations --- deep-copy a linked list of annotations into cxt
+ *
+ * Preserves insertion order.  Returns NULL if src is NULL.
+ */
+static ErrorAnnotation *
+copy_annotations(MemoryContext cxt, const ErrorAnnotation *src)
+{
+	ErrorAnnotation *head = NULL;
+	ErrorAnnotation *tail = NULL;
+	MemoryContext oldcxt;
+
+	if (src == NULL)
+		return NULL;
+
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	for (; src != NULL; src = src->next)
+	{
+		ErrorAnnotation *ann = palloc(sizeof(ErrorAnnotation));
+
+		ann->key = pstrdup(src->key);
+		ann->value = pstrdup(src->value);
+		ann->next = NULL;
+		if (tail == NULL)
+			head = ann;
+		else
+			tail->next = ann;
+		tail = ann;
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	return head;
+}
+
+/*
+ * free_annotations --- pfree every entry in the list
+ */
+static void
+free_annotations(ErrorAnnotation *head)
+{
+	while (head != NULL)
+	{
+		ErrorAnnotation *next = head->next;
+
+		pfree(head->key);
+		pfree(head->value);
+		pfree(head);
+		head = next;
+	}
+}
+
+/*
+ * errannot --- attach a key/value annotation to the current error
+ *
+ * Annotations are surfaced in the JSON and CSV log formats and via the
+ * %A and %{key}A log_line_prefix escapes.  They are not propagated over
+ * the v3 error/notice wire protocol.
+ *
+ * Calling errannot() with a key that is reserved for use by core (see
+ * reserved_annotation_keys[]) does not attach the annotation; instead,
+ * the key name is appended to the special "pg_rejected_annotations"
+ * aggregator so the rejection remains visible.  The value passed by the
+ * caller is discarded in that case to avoid promoting potentially
+ * sensitive data into a log field the caller did not intend.
+ *
+ * If the same key is annotated more than once on a single ErrorData,
+ * later calls replace earlier values.
+ */
+int
+errannot(const char *key, const char *value)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+
+	/* we don't bother incrementing recursion_depth */
+	CHECK_STACK_DEPTH();
+
+	if (!is_valid_annotation_key(key))
+		return 0;				/* silently ignore malformed key */
+
+	if (is_reserved_annotation_key(key))
+	{
+		record_rejected_annotation(edata, key);
+		return 0;
+	}
+
+	set_annotation(edata, key, value);
+	return 0;					/* return value does not matter */
+}
+
+/*
+ * errannotf --- printf-style variant of errannot()
+ */
+int
+errannotf(const char *key, const char *fmt, ...)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+	int			save_errno = errno;
+	size_t		len = 128;
+	char	   *value;
+
+	/* we don't bother incrementing recursion_depth */
+	CHECK_STACK_DEPTH();
+
+	if (!is_valid_annotation_key(key))
+		return 0;
+
+	if (is_reserved_annotation_key(key))
+	{
+		record_rejected_annotation(edata, key);
+		return 0;
+	}
+
+	for (;;)
+	{
+		va_list		args;
+		size_t		newlen;
+
+		value = (char *) palloc(len);
+		errno = save_errno;
+		va_start(args, fmt);
+		newlen = pvsnprintf(value, len, fmt, args);
+		va_end(args);
+
+		if (newlen < len)
+			break;
+		pfree(value);
+		len = newlen;
+	}
+
+	set_annotation(edata, key, value);
+	pfree(value);
+	return 0;
+}
+
+/*
  * geterrcode --- return the currently set SQLSTATE error code
  *
  * This is only intended for use in error callback subroutines, since there
@@ -1997,6 +2342,9 @@ CopyErrorData(void)
 		newedata->constraint_name = pstrdup(newedata->constraint_name);
 	if (newedata->internalquery)
 		newedata->internalquery = pstrdup(newedata->internalquery);
+	if (newedata->annotations)
+		newedata->annotations = copy_annotations(CurrentMemoryContext,
+												 newedata->annotations);
 
 	/* Use the calling context for string allocation */
 	newedata->assoc_context = CurrentMemoryContext;
@@ -2049,6 +2397,8 @@ FreeErrorDataContents(ErrorData *edata)
 		pfree(edata->constraint_name);
 	if (edata->internalquery)
 		pfree(edata->internalquery);
+	if (edata->annotations)
+		free_annotations(edata->annotations);
 }
 
 /*
@@ -2130,6 +2480,9 @@ ThrowErrorData(ErrorData *edata)
 	newedata->internalpos = edata->internalpos;
 	if (edata->internalquery)
 		newedata->internalquery = pstrdup(edata->internalquery);
+	if (edata->annotations)
+		newedata->annotations = copy_annotations(newedata->assoc_context,
+												 edata->annotations);
 
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
@@ -2185,6 +2538,9 @@ ReThrowError(ErrorData *edata)
 		newedata->constraint_name = pstrdup(newedata->constraint_name);
 	if (newedata->internalquery)
 		newedata->internalquery = pstrdup(newedata->internalquery);
+	if (newedata->annotations)
+		newedata->annotations = copy_annotations(ErrorContext,
+												 newedata->annotations);
 
 	/* Reset the assoc_context to be ErrorContext */
 	newedata->assoc_context = ErrorContext;
@@ -3639,6 +3995,119 @@ log_status_format(StringInfo buf, const char *format, ErrorData *edata)
 				else
 					appendStringInfo(buf, "%" PRId64,
 									 pgstat_get_my_query_id());
+				break;
+			case 'A':
+				{
+					/*
+					 * %A renders all errannot() annotations as
+					 * key="value" key="value" (space-separated, values
+					 * quoted with \" and \\ escaped, insertion order as
+					 * stored in the linked list).  Padding, if any,
+					 * applies to the whole rendered block.
+					 *
+					 * Annotation values are never re-interpreted as a
+					 * format string; appendStringInfoChar/String are used
+					 * exclusively so a value containing '%' will not
+					 * trigger further substitution.
+					 */
+					StringInfoData annbuf;
+
+					initStringInfo(&annbuf);
+					for (ErrorAnnotation *ann = edata->annotations;
+						 ann != NULL;
+						 ann = ann->next)
+					{
+						if (annbuf.len > 0)
+							appendStringInfoChar(&annbuf, ' ');
+						appendStringInfoString(&annbuf, ann->key);
+						appendStringInfoString(&annbuf, "=\"");
+						for (const char *s = ann->value; *s != '\0'; s++)
+						{
+							if (*s == '"' || *s == '\\')
+								appendStringInfoChar(&annbuf, '\\');
+							appendStringInfoChar(&annbuf, *s);
+						}
+						appendStringInfoChar(&annbuf, '"');
+					}
+					if (padding != 0)
+						appendStringInfo(buf, "%*s", padding, annbuf.data);
+					else
+						appendStringInfoString(buf, annbuf.data);
+					pfree(annbuf.data);
+				}
+				break;
+			case '{':
+				{
+					/*
+					 * %{key}A --- emit the value of a single annotation
+					 * by name, or empty if not set.
+					 *
+					 * The key must match the same syntax as is accepted
+					 * by errannot(): [A-Za-z_][A-Za-z0-9_.:-]*.  We scan
+					 * for valid key characters and then require '}A' to
+					 * follow; anything else is a format error.
+					 *
+					 * On format error we consume the entire malformed
+					 * escape so it does not bleed into the literal text:
+					 *   - if a '}' was found but the trailing letter is
+					 *     not 'A', consume through that wrong letter
+					 *     (move p to point at it; the outer loop's p++
+					 *     advances past it);
+					 *   - if no '}' was found before the first non-key
+					 *     character (including end-of-string), consume
+					 *     up to but not including that character (the
+					 *     outer loop will then emit it literally).
+					 */
+					const char *q = p + 1;
+					char	   *key;
+					ErrorAnnotation *ann;
+
+					if (!((*q >= 'A' && *q <= 'Z') ||
+						  (*q >= 'a' && *q <= 'z') ||
+						  *q == '_'))
+					{
+						/*
+						 * No valid key start.  Leave p at '{' so the
+						 * outer p++ skips just the '{'; the next loop
+						 * iteration will emit any remaining content
+						 * literally.
+						 */
+						break;
+					}
+					q++;
+					while ((*q >= 'A' && *q <= 'Z') ||
+						   (*q >= 'a' && *q <= 'z') ||
+						   (*q >= '0' && *q <= '9') ||
+						   *q == '_' || *q == '.' ||
+						   *q == ':' || *q == '-')
+						q++;
+
+					if (*q != '}' || q[1] != 'A')
+					{
+						if (*q == '}')
+							p = q + 1;	/* consume %{key}X including X */
+						else
+							p = q - 1;	/* consume %{key, non-key char emits literally */
+						break;
+					}
+
+					/* Good case: q at '}', q[1] is 'A'. */
+					key = pnstrdup(p + 1, q - (p + 1));
+					ann = find_annotation(edata->annotations, key);
+					pfree(key);
+
+					p = q + 1;	/* point at 'A'; outer p++ moves past */
+
+					if (ann != NULL)
+					{
+						if (padding != 0)
+							appendStringInfo(buf, "%*s", padding, ann->value);
+						else
+							appendStringInfoString(buf, ann->value);
+					}
+					else if (padding != 0)
+						appendStringInfo(buf, "%*s", padding, "");
+				}
 				break;
 			default:
 				/* format error - ignore it */
