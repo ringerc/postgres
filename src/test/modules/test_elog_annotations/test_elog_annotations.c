@@ -19,11 +19,13 @@
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pg_test_errannot_emit);
 PG_FUNCTION_INFO_V1(pg_test_errannot_rethrow);
+PG_FUNCTION_INFO_V1(pg_test_errannot_throwdata);
 
 /*
  * Decode an SQL elevel name into the corresponding numeric constant.  We
@@ -221,6 +223,141 @@ pg_test_errannot_rethrow(PG_FUNCTION_ARGS)
 	 */
 	ereport(LOG,
 			errmsg_internal("rethrow probe"),
+			replay_annotations(copy->annotations));
+
+	FreeErrorData(copy);
+	PG_RETURN_VOID();
+}
+
+/*
+ * pg_test_errannot_throwdata --- verify annotations survive ThrowErrorData().
+ *
+ * Memory-context correctness proof for the ThrowErrorData path:
+ *
+ *   1. We build an ErrorData in a short-lived child context (child of
+ *      CurrentMemoryContext).  Its annotations live in that child context.
+ *   2. ThrowErrorData() calls errstart(), which allocates a fresh live
+ *      error-stack entry with assoc_context = ErrorContext, then copies
+ *      every field — including annotations — into ErrorContext.  The
+ *      child-context originals are never read again by the error subsystem.
+ *   3. Inside PG_CATCH we CopyErrorData() (into CurrentMemoryContext = oldcxt)
+ *      then FlushErrorState() which resets ErrorContext.  The copy's annotations
+ *      live in oldcxt and therefore survive.
+ *   4. We delete the child context to show its storage is already gone, and
+ *      then emit a LOG with the copy's annotations re-attached.  If the
+ *      annotations had NOT been copied out of the child context they would
+ *      be dangling pointers at this point.
+ *
+ * The TAP test inspects the LOG record to confirm the correct values.
+ */
+Datum
+pg_test_errannot_throwdata(PG_FUNCTION_ARGS)
+{
+	ArrayType  *keys = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType  *values = PG_GETARG_ARRAYTYPE_P(1);
+	MemoryContext oldcxt = CurrentMemoryContext;
+	MemoryContext child;
+	ErrorData  *src;
+	ErrorData  *copy = NULL;
+
+	/*
+	 * Build a throwable ErrorData in a child context.  We use palloc0 so
+	 * every field we don't set explicitly is zeroed (same as what errstart
+	 * initialises).  The annotations we attach via foreach_kv will be
+	 * allocated in this child context.
+	 */
+	child = AllocSetContextCreate(CurrentMemoryContext,
+								  "errannot_throwdata_child",
+								  ALLOCSET_SMALL_SIZES);
+	MemoryContextSwitchTo(child);
+
+	src = palloc0(sizeof(ErrorData));
+	src->elevel = ERROR;
+	src->sqlerrcode = ERRCODE_RAISE_EXCEPTION;
+	src->assoc_context = child;
+	/* filename/lineno/funcname left as NULL/0 — ThrowErrorData tolerates that */
+
+	/*
+	 * Attach annotations.  These are allocated in the child context because
+	 * src->assoc_context == child and set_annotation() switches into
+	 * assoc_context.  (errannot() cannot be called here because there is no
+	 * live ereport() in progress; we call the internal helper directly via the
+	 * public array-walking path.)
+	 *
+	 * We can't call errannot() outside an ereport() so we set annotations by
+	 * hand using the same structure that set_annotation() would produce.
+	 */
+	{
+		Datum	   *k_datums,
+				   *v_datums;
+		bool	   *k_nulls,
+				   *v_nulls;
+		int			k_count,
+					v_count;
+
+		deconstruct_array_builtin(keys, TEXTOID, &k_datums, &k_nulls, &k_count);
+		deconstruct_array_builtin(values, TEXTOID, &v_datums, &v_nulls, &v_count);
+
+		if (k_count != v_count)
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					errmsg("annotation key/value arrays must have the same length"));
+
+		/* Build list in child context (assoc_context = child) */
+		for (int i = 0; i < k_count; i++)
+		{
+			ErrorAnnotation *ann;
+
+			if (k_nulls[i] || v_nulls[i])
+				ereport(ERROR,
+						errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						errmsg("annotation key/value entries must not be NULL"));
+
+			ann = palloc(sizeof(ErrorAnnotation));
+			ann->key = pstrdup(TextDatumGetCString(k_datums[i]));
+			ann->value = pstrdup(TextDatumGetCString(v_datums[i]));
+			ann->next = src->annotations;
+			src->annotations = ann;
+		}
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+
+	/*
+	 * Now throw the error.  ThrowErrorData() will copy the annotations out of
+	 * the child context and into ErrorContext before it longjmps.
+	 */
+	PG_TRY();
+	{
+		ThrowErrorData(src);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		copy = CopyErrorData();
+		FlushErrorState();			/* resets ErrorContext */
+	}
+	PG_END_TRY();
+
+	/*
+	 * Delete the child context that held the original annotations.  After this
+	 * the src->annotations pointers are dangling.  The live-error copy's
+	 * annotations were copied into ErrorContext by ThrowErrorData, and then
+	 * into oldcxt by CopyErrorData — so copy->annotations must be intact.
+	 */
+	MemoryContextDelete(child);
+	src = NULL;					/* prevent accidental use */
+
+	if (copy == NULL || copy->annotations == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("annotations were lost across ThrowErrorData()"));
+
+	/*
+	 * Re-emit as a LOG so the TAP test can grep for the annotation values.
+	 */
+	ereport(LOG,
+			errmsg_internal("throwdata probe"),
 			replay_annotations(copy->annotations));
 
 	FreeErrorData(copy);

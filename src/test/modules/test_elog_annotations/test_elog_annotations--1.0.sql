@@ -20,3 +20,10 @@ CREATE FUNCTION pg_test_errannot_rethrow(
 RETURNS void
 AS 'MODULE_PATHNAME', 'pg_test_errannot_rethrow'
 LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_test_errannot_throwdata(
+    ann_keys text[],
+    ann_vals text[])
+RETURNS void
+AS 'MODULE_PATHNAME', 'pg_test_errannot_throwdata'
+LANGUAGE C VOLATILE STRICT;

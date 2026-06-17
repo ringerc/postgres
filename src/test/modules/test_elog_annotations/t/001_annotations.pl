@@ -265,6 +265,52 @@ like(
 	qr!ext\.quoted="a\\"b\\\\c"!,
 	'%A escapes embedded " and \\ in values');
 
+#---------------------------------------------------------------------
+# Test 5: annotations survive ThrowErrorData() across a context deletion.
+#
+# pg_test_errannot_throwdata() proves the key memory-safety invariant from
+# review §3a:
+#
+#   set_annotation() allocates annotation strings in edata->assoc_context.
+#   For a live error created by errstart() that context IS ErrorContext, so
+#   annotations never live in a "caller context" that could vanish.
+#   ThrowErrorData() calls errstart() to get a fresh live-error stack entry
+#   (assoc_context = ErrorContext), copies the supplied edata's annotations
+#   into ErrorContext, and then longjmps.  The original edata and its
+#   annotations — which may be in any context the caller chose — are not
+#   touched after the copy.
+#
+# The test function:
+#   1. Builds an ErrorData in a short-lived child memory context (annotations
+#      live there too, since edata->assoc_context == child).
+#   2. Calls ThrowErrorData() — annotations are copied into ErrorContext.
+#   3. PG_CATCH: CopyErrorData() into caller context, FlushErrorState()
+#      (resets ErrorContext — the live-error copy of the annotations is gone).
+#   4. MemoryContextDelete(child) — the original annotations are now freed.
+#   5. Emits a LOG re-attaching copy->annotations, which live in caller
+#      context and are therefore intact.
+#
+# If annotations had NOT been copied out of the child context before step 4,
+# copy->annotations would be dangling pointers and the LOG would crash or
+# emit garbage.
+#---------------------------------------------------------------------
+%offs = snapshot_offsets();
+$node->safe_psql(
+	'postgres',
+	"SELECT pg_test_errannot_throwdata("
+	  . "ARRAY['trace_id','myext.step'], "
+	  . "ARRAY['aabbccddeeff00112233445566778899','throwdata-tag']);");
+
+$json_slice =
+  wait_for_collected('jsonlog', 'throwdata probe', $offs{jsonlog});
+($json_line) = grep { /throwdata probe/ } split(/\n/, $json_slice);
+ok(defined $json_line, 'throwdata probe reached jsonlog');
+$rec = decode_json($json_line);
+is($rec->{trace_id}, 'aabbccddeeff00112233445566778899',
+	'jsonlog: trace_id survives ThrowErrorData() + child-context deletion');
+is($rec->{'myext.step'}, 'throwdata-tag',
+	'jsonlog: extension annotation survives ThrowErrorData() + child-context deletion');
+
 $node->stop;
 
 done_testing();
