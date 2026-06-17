@@ -167,6 +167,32 @@ static bool stack_overflow_warned = false;
 
 
 /*
+ * span_id_on_stack --- return true if a span with the given span_id is
+ * already present anywhere on the active stack.
+ *
+ * Used as a defensive uniqueness check at push time.  The unwind
+ * lookup in both on_memory_context_reset() and otel_producer_span_emit()
+ * relies on span_id uniqueness across the entire active stack: the first
+ * matching entry is treated as the canonical one.  A duplicate span_id
+ * would cause the lookup to pop the WRONG entry, silently corrupting
+ * stack state.  Catching it at push time is cheaper than diagnosing the
+ * resulting mis-pop.
+ */
+static bool
+span_id_on_stack(const char span_id[OTEL_SPAN_ID_LEN + 1])
+{
+	int			i;
+
+	for (i = 0; i <= span_stack_top; i++)
+	{
+		if (memcmp(span_stack[i].span_id, span_id, OTEL_SPAN_ID_LEN + 1) == 0)
+			return true;
+	}
+	return false;
+}
+
+
+/*
  * MemoryContextCallback support.  When a consumer pushes a span via
  * api->span_link_to_active_and_push, we allocate a small node in
  * CurrentMemoryContext and register it as a reset callback.  When
@@ -447,6 +473,12 @@ on_memory_context_reset(void *arg)
 	OtelSpanUnwindNode *node = (OtelSpanUnwindNode *) arg;
 	int			i;
 
+	/*
+	 * Unwind-stack lookup invariant: span_id values on the active stack are
+	 * unique (enforced by the duplicate-check in both push functions).
+	 * Stopping at the first match is therefore correct and sufficient ---
+	 * there can be at most one matching entry.
+	 */
 	for (i = span_stack_top; i >= 0; i--)
 	{
 		OtelSpanStackEntry *e = &span_stack[i];
@@ -575,6 +607,28 @@ otel_producer_span_push(OtelSpan *span)
 		OtelSpanStackEntry *entry;
 		OtelSpanUnwindNode *node;
 
+		/*
+		 * Uniqueness invariant: every span_id on the active stack must be
+		 * distinct.  The unwind lookup (on_memory_context_reset and
+		 * otel_producer_span_emit) does a linear scan and treats the first
+		 * match as canonical --- a duplicate would silently pop the wrong
+		 * entry and corrupt stack state.
+		 *
+		 * In assert builds, die loudly so the caller can fix the ID
+		 * generation bug.  In production builds, emit a WARNING and refuse
+		 * to push the duplicate rather than silently corrupt the stack.
+		 */
+		if (span_id_on_stack(span->span_id))
+		{
+			Assert(false);		/* duplicate span_id in push path */
+			ereport(WARNING,
+					(errmsg("otel: duplicate span_id \"%s\" already on active stack; push refused",
+							span->span_id),
+					 errdetail("The span was not pushed. span_id uniqueness is required for correct unwind-stack operation."),
+					 errhint("Check span_id generation; pg_strong_random failure may be producing colliding fallback IDs.")));
+			return;
+		}
+
 		span_stack_top++;
 		entry = &span_stack[span_stack_top];
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
@@ -649,6 +703,22 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 	{
 		OtelSpanStackEntry *entry;
 		OtelSpanUnwindNode *node;
+
+		/*
+		 * Uniqueness invariant: every span_id on the active stack must be
+		 * distinct.  See the identical check in otel_producer_span_push for
+		 * the full rationale.
+		 */
+		if (span_id_on_stack(span->span_id))
+		{
+			Assert(false);		/* duplicate span_id in push path */
+			ereport(WARNING,
+					(errmsg("otel: duplicate span_id \"%s\" already on active stack; push refused",
+							span->span_id),
+					 errdetail("The span was not pushed. span_id uniqueness is required for correct unwind-stack operation."),
+					 errhint("Check span_id generation; pg_strong_random failure may be producing colliding fallback IDs.")));
+			return;
+		}
 
 		span_stack_top++;
 		entry = &span_stack[span_stack_top];
@@ -818,8 +888,15 @@ otel_producer_span_emit(OtelSpan *span)
 	if (span == NULL)
 		return;
 
-	/* Locate the span on the stack (if pushed).  Search from top down
-	 * since the common case is "emit the most recently pushed". */
+	/*
+	 * Locate the span on the stack (if pushed).  Search from top down
+	 * since the common case is "emit the most recently pushed".
+	 *
+	 * Relies on the uniqueness invariant: span_id values on the active stack
+	 * are unique (enforced at push time by span_id_on_stack checks in both
+	 * push functions).  Stopping at the first match is correct --- there is
+	 * at most one matching entry.
+	 */
 	for (i = span_stack_top; i >= 0; i--)
 	{
 		if (memcmp(span_stack[i].span_id, span->span_id,
