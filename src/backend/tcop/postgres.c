@@ -45,6 +45,7 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
+#include "libpq/trace_context.h"
 #include "mb/pg_wchar.h"
 #include "mb/stringinfo_mb.h"
 #include "miscadmin.h"
@@ -443,6 +444,12 @@ SocketBackend(StringInfo inBuf)
 			ignore_till_sync = false;
 			/* mark not-extended, so that a new error doesn't begin skip */
 			doing_extended_query_message = false;
+			break;
+
+		case PqMsg_TraceContext:
+			maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
+			/* TraceContext precedes another operation and does not by
+			 * itself put us into extended-query mode. */
 			break;
 
 		case PqMsg_CopyData:
@@ -4559,6 +4566,15 @@ PostgresMain(const char *dbname, const char *username)
 		jit_reset_after_error();
 
 		/*
+		 * Clear any trace context installed by an 'M' message in this
+		 * command cycle.  The context applies on receipt so it may
+		 * already be active when an unrelated ERROR fires; clear it
+		 * here so it cannot leak into the next pipeline.  ClearTraceContext
+		 * is idempotent.
+		 */
+		ClearTraceContext();
+
+		/*
 		 * Now return to normal top-level context and clear ErrorContext for
 		 * next time.
 		 */
@@ -4770,6 +4786,7 @@ PostgresMain(const char *dbname, const char *username)
 							   (double) auth_duration / NS_PER_US));
 			}
 
+			ClearTraceContext();
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;
 		}
@@ -5059,6 +5076,29 @@ PostgresMain(const char *dbname, const char *username)
 				finish_xact_command();
 				valgrind_report_error_query("SYNC message");
 				send_ready_for_query = true;
+				break;
+
+			case PqMsg_TraceContext:
+
+				/*
+				 * Trace-context protocol message ('M').  Available when the
+				 * client negotiated protocol 3.3.  No reply is sent; the
+				 * context is applied immediately and cleared at the next
+				 * ReadyForQuery.
+				 *
+				 * Acceptance-state guarantee: this dispatch site is only
+				 * reached from the top-level PostgresMain command loop.
+				 * Mid-COPY-in, the backend is inside CopyGetData (copyfromparse.c)
+				 * which has its own message-reading loop that rejects any
+				 * unexpected type — including 'M' — with
+				 * ERRCODE_PROTOCOL_VIOLATION.  During walsender streaming,
+				 * the backend is inside WalSndLoop / ProcessRepliesIfAny
+				 * (walsender.c) which likewise rejects 'M' with
+				 * ERRCODE_PROTOCOL_VIOLATION (ERROR, not FATAL).  So 'M'
+				 * can only reach this case when the backend is genuinely
+				 * waiting for a top-level command.
+				 */
+				ProcessTraceContextMessage(&input_message);
 				break;
 
 				/*

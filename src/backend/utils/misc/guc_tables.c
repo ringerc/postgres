@@ -54,6 +54,7 @@
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
 #include "libpq/oauth.h"
+#include "libpq/trace_context.h"
 #include "libpq/scram.h"
 #include "nodes/queryjumble.h"
 #include "optimizer/cost.h"

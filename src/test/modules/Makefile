@@ -11,6 +11,7 @@ SUBDIRS = \
 		  dummy_index_am \
 		  dummy_seclabel \
 		  index \
+		  libpq_trace_context \
 		  libpq_pipeline \
 		  oauth_validator \
 		  plsample \
@@ -43,6 +44,7 @@ SUBDIRS = \
 		  test_pg_dump \
 		  test_plan_advice \
 		  test_predtest \
+		  test_trace_context \
 		  test_radixtree \
 		  test_rbtree \
 		  test_regex \
