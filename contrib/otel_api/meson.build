@@ -23,8 +23,8 @@ otel_api_include_args = [
   '-I' + meson.project_build_root() / 'src/include',
 ]
 otel_api_cppflags = []
-if cc.has_header('libpq/protocol_headers.h', args: otel_api_include_args)
-  otel_api_cppflags += '-DOTEL_HAVE_PROTOCOL_HEADERS'
+if cc.has_header('libpq/trace_context.h', args: otel_api_include_args)
+  otel_api_cppflags += '-DOTEL_HAVE_TRACE_CONTEXT'
 endif
 # Detect errannot() in utils/elog.h.  A compile probe doesn't work
 # here: utils/elog.h includes utils/errcodes.h, which is generated

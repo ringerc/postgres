@@ -1,12 +1,19 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
-# End-to-end test for the contrib/otel module: register the otel.*
-# protocol-header handler, parse a W3C traceparent received from the
-# client, and propagate the trace context into log emission via the
-# emit_log_hook + log_line_prefix %{key}A annotation escapes.
+# End-to-end test for the otel_api module: register the trace-context
+# handler, parse a W3C traceparent received from the client via 'M',
+# and verify until-RFQ lifecycle semantics.
 #
-# The test bashes the v3 wire protocol on a raw socket so it can send
-# RequestHeaders ('M') messages, which no libpq API yet exposes.
+# The test speaks the v3.3 wire protocol on a raw socket so it can send
+# TraceContext ('M') messages directly.
+#
+# Wire format (protocol 3.3):
+#   'M' | Int32 length | String traceparent | String tracestate
+# (Two NUL-terminated strings; no entry count.)
+#
+# Trace context appears in the server log via a CONTEXT line appended
+# by otel_postgres_tracing's emit_log_hook:
+#   CONTEXT: trace_id=<trace_id> span_id=<span_id> trace_flags=<flags>
 
 use strict;
 use warnings FATAL => 'all';
@@ -16,9 +23,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 # A representative W3C TraceContext to use throughout the test.
-my $TRACE_ID	= 'aabbccddeeff00112233445566778899';
-my $SPAN_ID	 = '0011223344556677';
-my $FLAGS	   = '01';
+my $TRACE_ID    = 'aabbccddeeff00112233445566778899';
+my $SPAN_ID     = '0011223344556677';
+my $FLAGS       = '01';
 my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-$FLAGS";
 
 # ----------------------------------------------------------------------
@@ -31,7 +38,6 @@ $node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing'
 log_statement = 'all'
 log_min_messages = log
-log_line_prefix = 'TR[%{trace_id}A] SP[%{span_id}A] '
 EOCONF
 $node->start;
 
@@ -44,13 +50,13 @@ if (!$node->raw_connect_works())
 }
 
 # ----------------------------------------------------------------------
-# Raw-protocol helpers (same shape as test_protocol_headers)
+# Raw-protocol helpers
 # ----------------------------------------------------------------------
 
 sub send_startup
 {
 	my ($sock, @kv) = @_;
-	my $body = pack('N', 0x00030000);
+	my $body = pack('N', 0x00030003);    # protocol 3.3
 	while (@kv)
 	{
 		my $k = shift @kv;
@@ -77,57 +83,48 @@ sub recv_exact
 	while (length($buf) < $n)
 	{
 		my $chunk = '';
-		my $got = $sock->recv($chunk, $n - length($buf));
+		my $got   = $sock->recv($chunk, $n - length($buf));
 		die "recv_exact: $!" unless defined $got;
-		return undef if length($chunk) == 0;
+		return undef if length($chunk) == 0;    # EOF
 		$buf .= $chunk;
 	}
 	return $buf;
 }
 
-sub recv_msg
+sub read_msg
 {
 	my ($sock) = @_;
 	my $hdr = recv_exact($sock, 5);
-	return undef unless defined $hdr;
-	my ($type, $len) = unpack('A1 N', $hdr);
+	return (undef, undef) unless defined $hdr;
+	my $type = substr($hdr, 0, 1);
+	my $len  = unpack('N', substr($hdr, 1, 4));
 	my $body = ($len > 4) ? recv_exact($sock, $len - 4) : '';
 	return ($type, $body);
 }
 
-# Read and accumulate messages until ReadyForQuery; return the list of
-# (type, body) pairs that arrived.
 sub drain_to_rfq
 {
 	my ($sock) = @_;
 	my @msgs;
 	while (1)
 	{
-		my ($type, $body) = recv_msg($sock);
-		die "connection closed before ReadyForQuery" unless defined $type;
-		push @msgs, [ $type, $body ];
+		my ($type, $body) = read_msg($sock);
+		die "EOF during drain" unless defined $type;
+		push @msgs, [$type, $body];
 		last if $type eq 'Z';
 	}
 	return @msgs;
 }
 
-sub headers_body
+# Build a TraceContext ('M') wire body: two NUL-terminated strings.
+sub trace_context_body
 {
-	my @kv = @_;
-	my $n = scalar(@kv) / 2;
-	my $body = pack('n', $n);
-	while (@kv)
-	{
-		my $k = shift @kv;
-		my $v = shift @kv;
-		$body .= $k . "\0" . $v . "\0";
-	}
-	return $body;
+	my ($tp, $ts) = @_;
+	$ts //= '';
+	return "$tp\x00$ts\x00";
 }
 
 # Extract the first column of the first DataRow from a list of messages.
-# Returns the value as a string, or undef if the column was NULL or no
-# DataRow was found.
 sub first_value
 {
 	my (@msgs) = @_;
@@ -138,7 +135,7 @@ sub first_value
 		my $nfields = unpack('n', substr($body, 0, 2));
 		return undef if $nfields == 0;
 		my $len = unpack('N', substr($body, 2, 4));
-		return undef if $len == 0xFFFFFFFF;	   # SQL NULL
+		return undef if $len == 0xFFFFFFFF;    # SQL NULL
 		return substr($body, 6, $len);
 	}
 	return undef;
@@ -153,155 +150,155 @@ sub run_query
 }
 
 # ----------------------------------------------------------------------
-# Handshake with _pq_.headers=1
+# Handshake with protocol 3.3 (TraceContext available by default)
 # ----------------------------------------------------------------------
 
 my $superuser = getpwuid($<);
-my $sock = $node->raw_connect();
+my $sock      = $node->raw_connect();
 send_startup(
 	$sock,
-	user => $superuser,
-	database => 'postgres',
-	'_pq_.headers' => '1');
+	user     => $superuser,
+	database => 'postgres');
 
 my @startup = drain_to_rfq($sock);
 ok(!(grep { $_->[0] eq 'v' } @startup),
-	'_pq_.headers=1 accepted (no NegotiateProtocolVersion)');
+	'protocol 3.3 handshake accepted (no NegotiateProtocolVersion)');
 
 # ----------------------------------------------------------------------
-# Test 1: an M with otel.traceparent makes the trace_id appear in
-# subsequent log lines via log_line_prefix.
+# Test 1: M before Q -> trace_id appears in CONTEXT log line.
+# The emit_log_hook appends a CONTEXT line with trace_id/span_id.
+# until-RFQ: context applies for that one query, cleared at its RFQ.
 # ----------------------------------------------------------------------
 
 my $log_offset = -s $node->logfile;
 
-send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+send_msg($sock, 'M', trace_context_body($TRACEPARENT, ''));
 run_query($sock, 'SELECT 1');
 
 $node->wait_for_log(
-	qr/TR\[$TRACE_ID\] SP\[$SPAN_ID\] LOG:\s+statement: SELECT 1/,
+	qr/CONTEXT:\s+trace_id=$TRACE_ID\s+span_id=$SPAN_ID/,
 	$log_offset);
-pass('SELECT 1 logged with trace_id and span_id from otel.traceparent');
+pass('SELECT 1 CONTEXT has trace_id and span_id from TraceContext M');
 
 # ----------------------------------------------------------------------
 # Test 2: SQL-level introspection via otel_current_traceparent().
-#
-# The implicit transaction around Test 1's SELECT 1 cleared the
-# transaction-scope context, so send another M before this query.
+# Send a fresh M before this query (prior RFQ cleared the previous context).
 # ----------------------------------------------------------------------
 
-send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+send_msg($sock, 'M', trace_context_body($TRACEPARENT, ''));
 my @msgs = run_query($sock, 'SELECT otel_current_traceparent()');
 is(first_value(@msgs), $TRACEPARENT,
 	'otel_current_traceparent() returns the active traceparent');
 
 # ----------------------------------------------------------------------
-# Test 3: transaction-scope persistence and clear at COMMIT.
+# Test 3: until-RFQ semantics: context is cleared at RFQ.
+# After a query, a subsequent query without M must NOT carry the context.
 # ----------------------------------------------------------------------
 
-run_query($sock, 'BEGIN');
+$log_offset = -s $node->logfile;
+
+send_msg($sock, 'M', trace_context_body($TRACEPARENT, ''));
+run_query($sock, 'SELECT 2');    # carries the context
+
+# Now a query WITHOUT M: context should be cleared
+$log_offset = -s $node->logfile;
+run_query($sock, 'SELECT 3');    # must NOT carry the context
+my $post_rfq = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+
+# The SELECT 3 log line must NOT contain our trace_id
+unlike(
+	$post_rfq,
+	qr/trace_id=$TRACE_ID/,
+	'SELECT 3 without preceding M has no trace context (cleared at RFQ)');
+
+# ----------------------------------------------------------------------
+# Test 4: a malformed traceparent is silently ignored (advisory);
+# the operation proceeds untagged.
+# ----------------------------------------------------------------------
 
 $log_offset = -s $node->logfile;
-send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
-
-run_query($sock, 'SELECT 2');
-run_query($sock, 'SELECT 3');
-
-# Both statements within the BEGIN block should carry the trace context.
-my $mid_log =
-  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
-like(
-	$mid_log,
-	qr/TR\[$TRACE_ID\] SP\[$SPAN_ID\] LOG:\s+statement: SELECT 2/,
-	'SELECT 2 inside transaction has trace context');
-like(
-	$mid_log,
-	qr/TR\[$TRACE_ID\] SP\[$SPAN_ID\] LOG:\s+statement: SELECT 3/,
-	'SELECT 3 inside transaction has trace context');
-
-run_query($sock, 'COMMIT');
-
-# After COMMIT, the per-transaction effect should have cleared.  A new
-# unrelated statement must NOT carry the trace context.
-$log_offset = -s $node->logfile;
+send_msg($sock, 'M', trace_context_body('not-a-valid-traceparent', ''));
 run_query($sock, 'SELECT 4');
-my $post_commit =
-  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
-like(
-	$post_commit,
-	qr/TR\[\] SP\[\] LOG:\s+statement: SELECT 4/,
-	'SELECT 4 after COMMIT has empty trace context (cleared at COMMIT)');
-
-# ----------------------------------------------------------------------
-# Test 4: a malformed traceparent is silently ignored; no trace context
-# is installed.
-# ----------------------------------------------------------------------
-
-$log_offset = -s $node->logfile;
-send_msg($sock, 'M',
-	headers_body('otel.traceparent' => 'not-a-valid-traceparent'));
-run_query($sock, 'SELECT 5');
-my $malformed =
-  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
-like(
+my $malformed = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+unlike(
 	$malformed,
-	qr/TR\[\] SP\[\] LOG:\s+statement: SELECT 5/,
-	'malformed traceparent is ignored; no trace context attached');
+	qr/trace_id=/,
+	'malformed traceparent is ignored; operation proceeds untagged');
 
 # ----------------------------------------------------------------------
-# Test 5: empty value clears a previously-set traceparent.
+# Test 5: SET otel_api.traceparent survives an RFQ.
+# An M-installed context is cleared at RFQ; a SET-installed context is
+# NOT cleared (it lives at the GUC-machinery scope the user chose).
 # ----------------------------------------------------------------------
 
-run_query($sock, 'BEGIN');
-send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
+run_query($sock,
+	"SET otel_api.traceparent = '$TRACEPARENT'");    # session scope
+
+# Verify context is present
+$log_offset = -s $node->logfile;
+run_query($sock, 'SELECT 5');
+my $after_set = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+like(
+	$after_set,
+	qr/trace_id=$TRACE_ID/,
+	'SET-installed context present after SET');
+
+# The context should survive another RFQ (it was installed via SET, not M)
 $log_offset = -s $node->logfile;
 run_query($sock, 'SELECT 6');
-my $with_trace =
-  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+my $still_set = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 like(
-	$with_trace,
-	qr/TR\[$TRACE_ID\] SP\[$SPAN_ID\] LOG:\s+statement: SELECT 6/,
-	'SELECT 6 inside transaction has trace context (before explicit clear)');
+	$still_set,
+	qr/trace_id=$TRACE_ID/,
+	'SET-installed context survives an RFQ (not cleared by M-context clear)');
 
-send_msg($sock, 'M', headers_body('otel.traceparent' => ''));
-$log_offset = -s $node->logfile;
-run_query($sock, 'SELECT 7');
-my $after_clear =
-  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
-like(
-	$after_clear,
-	qr/TR\[\] SP\[\] LOG:\s+statement: SELECT 7/,
-	'SELECT 7 has no trace context after explicit empty-value clear');
-
-run_query($sock, 'ROLLBACK');
+# Clean up the SET
+run_query($sock, 'RESET otel_api.traceparent');
 
 # ----------------------------------------------------------------------
 # Test 6: parallel-worker propagation.
-#
-# The trace context is stored in custom GUCs (otel_api.traceparent,
-# otel_api.tracestate); custom GUCs propagate to parallel workers as part
-# of the standard parallel-state machinery (RestoreGUCState during
-# worker startup).  The worker's assign_hook fires during that
-# restore, populating the worker's in-memory OtelContext.
-#
-# debug_parallel_query=regress forces every query through a Gather,
-# so otel_current_traceparent() runs in a worker rather than the
-# leader.  Without propagation the function would return NULL (the
-# worker's otel_ctx would be empty); with propagation it returns the
-# leader's active traceparent.
+# Trace context is stored in GUCs; GUCs propagate to parallel workers.
+# With debug_parallel_query=regress, otel_current_traceparent() runs in
+# a worker rather than the leader.
 # ----------------------------------------------------------------------
 
-run_query($sock, "SET debug_parallel_query = regress");
+run_query($sock, 'SET debug_parallel_query = regress');
 
-run_query($sock, 'BEGIN');
-send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
-
+send_msg($sock, 'M', trace_context_body($TRACEPARENT, ''));
 my @parallel_msgs = run_query($sock, 'SELECT otel_current_traceparent()');
 is(first_value(@parallel_msgs), $TRACEPARENT,
-	'parallel worker sees the trace context (GUC propagated, assign_hook populated worker otel_ctx)');
+	'parallel worker sees the trace context (GUC propagated, assign_hook fired)');
 
-run_query($sock, 'COMMIT');
-run_query($sock, "SET debug_parallel_query = off");
+run_query($sock, 'SET debug_parallel_query = off');
+
+# ----------------------------------------------------------------------
+# Test 7: W3C forward-compat --- higher-version traceparents (01..fe) are
+# parsed for their known 55-char prefix; "ff" is W3C-reserved invalid.
+# ----------------------------------------------------------------------
+
+# Future version with no trailing fields.
+send_msg($sock, 'M',
+	trace_context_body("01-$TRACE_ID-$SPAN_ID-$FLAGS", ''));
+my @v01_msgs = run_query($sock, 'SELECT otel_current_traceparent()');
+is(first_value(@v01_msgs), "00-$TRACE_ID-$SPAN_ID-$FLAGS",
+	'v01 traceparent parsed for known prefix; version pin "00" in output');
+
+# Future version with trailing additional fields.
+send_msg($sock, 'M',
+	trace_context_body("01-$TRACE_ID-$SPAN_ID-$FLAGS-future-field-data", ''));
+my @v01ext_msgs = run_query($sock, 'SELECT otel_current_traceparent()');
+is(first_value(@v01ext_msgs), "00-$TRACE_ID-$SPAN_ID-$FLAGS",
+	'v01 traceparent with trailing fields is accepted; trailing data ignored');
+
+# "ff" is W3C-reserved invalid --- rejected, no trace context applied.
+$log_offset = -s $node->logfile;
+send_msg($sock, 'M', trace_context_body("ff-$TRACE_ID-$SPAN_ID-$FLAGS", ''));
+run_query($sock, 'SELECT 7');
+my $ff_log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+unlike(
+	$ff_log,
+	qr/trace_id=$TRACE_ID/,
+	'version "ff" traceparent is rejected; no trace context applied');
 
 # ----------------------------------------------------------------------
 # Tidy up.

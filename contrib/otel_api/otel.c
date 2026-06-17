@@ -4,8 +4,8 @@
  *	  OpenTelemetry trace-context support for PostgreSQL --- module
  *	  setup, coordination, and trace-context input layer.
  *
- * Loadable module that consumes the per-message RequestHeaders ('M')
- * mechanism to receive a W3C Trace Context from the client and attach
+ * Loadable module that consumes the TraceContext ('M') protocol message
+ * to receive a W3C Trace Context from the client and attach
  * the trace-id, span-id and trace-flags to every log message emitted
  * for the remainder of the current transaction.
  *
@@ -99,18 +99,13 @@
  *
  * Client-side propagation:
  *
- *	 The PRIMARY entry point is the per-message 'M' RequestHeaders
- *	 protocol message: the client sends an otel_api.traceparent header
- *	 with the next Query, the handler attaches it for the duration
- *	 of that transaction, and our XactCallback (otel_xact_callback)
- *	 auto-clears it at top-level COMMIT / ROLLBACK / PREPARE.  Note
- *	 that dispatch is deferred --- core's protocol-headers
- *	 dispatcher invokes our set_cb at the start of the next
- *	 Query/Parse/Bind/Execute, so a handler error fails the SQL
- *	 operation rather than producing a standalone error.  Drivers
+ *	 The PRIMARY entry point is the TraceContext ('M') protocol message
+ *	 (protocol 3.3+): the client sends traceparent and tracestate fields,
+ *	 the handler attaches the context immediately and our clear_cb
+ *	 auto-clears it at the next ReadyForQuery boundary.  Drivers
  *	 that implement the 'M' message (e.g. via libpq's
- *	 PQattachHeader, see src/test/modules/libpq_headers/) get the
- *	 scoping and the zero-extra-round-trip behaviour for free.
+ *	 PQattachTraceContext, see src/test/modules/libpq_trace_context/) get
+ *	 the scoping and the zero-extra-round-trip behaviour for free.
  *
  *	 ALTERNATIVELY, clients may set the GUCs directly with SQL:
  *
@@ -151,12 +146,12 @@
  *			 multiple statements in the same explicit transaction
  *			 all share the same context, even if they represent
  *			 different logical operations being traced separately.
- *		 The 'M' header is naturally statement-scoped in
- *		 single-statement-per-message protocol use (each Query
- *		 message can carry its own headers) and naturally
+ *		 The 'M' (TraceContext) message is naturally statement-scoped
+ *		 in single-statement-per-message protocol use (each Query
+ *		 message can carry its own context) and naturally
  *		 transaction-scoped under explicit BEGIN/COMMIT because
- *		 our otel_xact_callback clears the in-memory derived
- *		 state at top-level transaction end.
+ *		 ClearTraceContext() is called at ReadyForQuery boundaries,
+ *		 which clears the in-memory derived state.
  *	   * Connection-pooler interaction.  SET state on a pooled
  *		 connection in TRANSACTION or STATEMENT mode pooling can
  *		 leak the trace context to whichever client happens to
@@ -188,9 +183,7 @@
 
 #include "access/xact.h"
 #include "fmgr.h"
-#ifdef OTEL_HAVE_PROTOCOL_HEADERS
-#include "libpq/protocol_headers.h"
-#endif
+#include "libpq/trace_context.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -293,143 +286,69 @@ assign_traceparent(const char *newval, void *extra)
 		otel_ctx_reset();
 }
 
-#ifdef OTEL_HAVE_PROTOCOL_HEADERS
 /*
  * Tracks whether the in-memory otel_ctx was last populated by an 'M'
- * header (as opposed to a user-issued SET or a sqlcommenter parse).
- * Read by otel_xact_callback to decide whether to clear at top-level
- * transaction end --- only M-installed context is transaction-scoped
- * by default; SET-installed context lives at whatever scope the user
- * chose (SET = session; SET LOCAL = transaction, handled by the GUC
- * machinery itself).
+ * TraceContext message (as opposed to a user-issued SET or a sqlcommenter
+ * parse).  Used by otel_trace_context_clear_cb to decide whether to
+ * clear at the ReadyForQuery boundary.
  */
 static bool otel_ctx_from_M_header = false;
 
 /*
- * Header set callback: invoked once per matching entry in an incoming
- * RequestHeaders message.  Routes through SetConfigOption so the GUC
- * machinery propagates to parallel workers and triggers the assign
- * hook (which updates the in-memory derived state).
+ * Trace-context apply callback: invoked immediately on 'M' receipt
+ * (protocol 3.3+).  Routes traceparent/tracestate through SetConfigOption
+ * so the GUC machinery propagates to parallel workers and triggers the
+ * assign hook (which updates the in-memory derived state).
  *
- * Note: dispatch is deferred by the core dispatcher --- this callback
- * fires at the start of the next Query / Parse / Bind / Execute, not
- * on receipt of the 'M' message itself.  A handler ERROR thus
- * propagates as that SQL operation's ERROR.  See
- * src/backend/libpq/protocol_headers.c for the rationale.
+ * Malformed values are rejected by the GUC check-hook at LOG level so the
+ * operation proceeds untagged rather than failing.
  */
 static void
-otel_set_cb(const char *key, const char *value, void *cb_ctx)
+otel_trace_context_apply_cb(const char *traceparent, const char *tracestate,
+							void *cb_ctx)
 {
-	const char *guc;
-
 	/*
-	 * Wire-key -> GUC-name mapping.  The wire keys (clients send them
-	 * in the 'M' frame) stay in the legacy "otel.*" namespace --- they
-	 * are a protocol-level contract and changing them would be a wire
-	 * breaking change.  The GUCs they map into were renamed to the
-	 * "otel_api.*" namespace when extension naming was aligned to the
-	 * package directory.  See DefineCustom* calls in _PG_init.
+	 * An empty traceparent means "clear".  Map it to a GUC reset by
+	 * passing NULL.
 	 */
-	if (strcmp(key, "otel.traceparent") == 0)
-		guc = "otel_api.traceparent";
-	else if (strcmp(key, "otel.tracestate") == 0)
-		guc = "otel_api.tracestate";
-	else
-		return;					/* unknown otel.* wire key */
+	(void) set_config_option("otel_api.traceparent",
+							 (traceparent[0] == '\0') ? NULL : traceparent,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, LOG, false);
 
-	/*
-	 * An empty value is the documented "clear this key" convention; map
-	 * it to a GUC reset by passing NULL as the value.  Malformed
-	 * traceparent values are rejected by the GUC check-hook with a LOG
-	 * (we swallow the error so a misbehaving client cannot abort the
-	 * caller's operation; the operation proceeds without a trace
-	 * context).
-	 */
-	(void) set_config_option(guc,
-							 value[0] == '\0' ? NULL : value,
+	(void) set_config_option("otel_api.tracestate",
+							 (tracestate[0] == '\0') ? NULL : tracestate,
 							 PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SET, true, LOG, false);
 
 	/*
-	 * Mark the in-memory state as M-installed so otel_xact_callback
-	 * will clear it at top-level transaction end.  We check
-	 * otel_ctx.is_set so that if the GUC machinery rejected the value
-	 * (malformed traceparent), we don't promise a clear that doesn't
-	 * correspond to anything.  Note that traceparent is the
-	 * load-bearing key; we don't flag tracestate-only sets because
-	 * tracestate without traceparent is not a meaningful trace
-	 * context.
+	 * Mark as M-installed only when traceparent was actually accepted (a
+	 * malformed value leaves otel_ctx.is_set false).
 	 */
 	if (otel_ctx.is_set)
 		otel_ctx_from_M_header = true;
 }
 
 /*
- * Transaction-end cleanup of M-installed trace context.
+ * Trace-context clear callback: invoked at the ReadyForQuery boundary by
+ * ClearTraceContext in core.  Resets the in-memory derived state for
+ * M-installed context.
  *
- * The protocol-headers dispatcher in core is intentionally lifecycle-
- * free: it only routes (key, value) entries to our set_cb and does
- * nothing about scope.  We install this XactCallback to mirror the
- * previous PROTOCOL_HEADER_SCOPE_TRANSACTION behaviour --- a header
- * installed via 'M' applies until the top-level transaction ends, at
- * which point the in-memory derived state is reset.
+ * Context installed via SET / SET LOCAL is owned by the GUC machinery;
+ * we only clear what we installed via apply_cb.
  *
- * Only context installed via 'M' is cleared here.  Context installed
- * via SET / SET LOCAL is owned by the GUC machinery and lives at
- * whatever scope the user chose.  Without this discrimination, a
- * naive xact-end reset would clobber SET-installed values too, which
- * would defeat the user's session-scope intent.  The
- * otel_ctx_from_M_header flag is set by otel_set_cb (only on
- * successful traceparent application) and cleared here.
- *
- * Resets the in-memory derived state directly --- DO NOT attempt to
- * reset the backing GUCs via set_config_option here.  This function
- * runs from inside the XactCallback chain during AbortTransaction (or
- * CommitTransaction), and any set_config_option call from that
- * context is part of the same transaction that is now ending: on
- * the abort path the GUC change gets rolled back to whatever the
- * GUC was before, which re-fires the assign_hook with the OLD value
- * and re-populates otel_ctx, defeating the clear.
- *
- * Leaving the GUC variable stale relative to in-memory state is
- * acceptable because otel_ctx.is_set is the authoritative flag that
- * start_span reads.  The next M (or explicit SET) will overwrite
- * the GUC cleanly.  SHOW otel_api.traceparent may briefly show a stale
- * value between an aborted transaction and the next assignment ---
- * a known cosmetic limitation.
- *
- * Subtransactions are deliberately NOT instrumented --- no
- * RegisterSubXactCallback is installed.  Header context set inside a
- * SAVEPOINT block survives a ROLLBACK TO that savepoint; it clears
- * only at top-level COMMIT/ROLLBACK/PREPARE.  Matches the contract
- * that test_protocol_headers documents for transaction-scope keys,
- * and matches what the previous PROTOCOL_HEADER_SCOPE_TRANSACTION
- * registration did.
+ * Resets otel_ctx directly rather than via set_config_option to avoid any
+ * GUC-rollback interaction when the reset occurs during error recovery.
  */
 static void
-otel_xact_callback(XactEvent event, void *arg)
+otel_trace_context_clear_cb(void *cb_ctx)
 {
-	switch (event)
+	if (otel_ctx_from_M_header)
 	{
-		case XACT_EVENT_COMMIT:
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_COMMIT:
-		case XACT_EVENT_PARALLEL_ABORT:
-		case XACT_EVENT_PREPARE:
-			if (otel_ctx_from_M_header)
-			{
-				otel_ctx_reset();
-				otel_ctx_from_M_header = false;
-			}
-			break;
-		case XACT_EVENT_PRE_COMMIT:
-		case XACT_EVENT_PARALLEL_PRE_COMMIT:
-		case XACT_EVENT_PRE_PREPARE:
-			/* nothing */
-			break;
+		otel_ctx_reset();
+		otel_ctx_from_M_header = false;
 	}
 }
-#endif							/* OTEL_HAVE_PROTOCOL_HEADERS */
 
 /*
  * SQL function: return the currently-active traceparent in W3C
@@ -564,17 +483,12 @@ _PG_init(void)
 	 */
 	MarkGUCPrefixReserved("otel_api");
 
-#ifdef OTEL_HAVE_PROTOCOL_HEADERS
 	/*
-	 * Register the per-message header handler.  Core's dispatcher is
-	 * lifecycle-free: it routes our prefix to otel_set_cb and that's
-	 * all.  Our own XactCallback below provides the
-	 * "clear-at-transaction-end" behaviour that used to live in the
-	 * dispatcher under PROTOCOL_HEADER_SCOPE_TRANSACTION.
+	 * Register the trace-context handler.  Core invokes apply_cb on 'M'
+	 * receipt and clear_cb at the next ReadyForQuery boundary.
 	 */
-	RegisterProtocolHeaderHandler("otel.", otel_set_cb, NULL);
-	RegisterXactCallback(otel_xact_callback, NULL);
-#endif
+	RegisterTraceContextHandler(otel_trace_context_apply_cb,
+								otel_trace_context_clear_cb, NULL);
 
 	/* otel_log_install_hooks() and otel_trace_install_hooks() moved
 	 * to contrib/otel_postgres_tracing in Phase 4.  Operators must
@@ -589,25 +503,63 @@ _PG_init(void)
 /*
  * Parse a W3C traceparent value into *out.  Returns true on success.
  *
- * Format: "{version}-{trace-id}-{parent-id}-{flags}" where
- *	 version		2 lowercase hex chars; only "00" is currently
- *					accepted (per the W3C spec, future versions may
- *					append fields after the flags).
+ * Format: "{version}-{trace-id}-{parent-id}-{flags}[-future-fields]"
+ *
+ *	 version		2 lowercase hex chars.  Version "00" is the only
+ *					version this code knows in detail; per the W3C
+ *					spec, higher versions MUST be parsed by reading
+ *					the known prefix (trace-id, parent-id, flags) and
+ *					ignoring any trailing additional fields.  Version
+ *					"ff" is W3C-reserved as invalid.
  *	 trace-id		32 lowercase hex chars, not all-zeros.
  *	 parent-id		16 lowercase hex chars, not all-zeros.
  *	 flags			2 lowercase hex chars.
+ *
+ * For version "00" the input MUST be exactly 55 chars.  For higher
+ * versions the input MUST be at least 55 chars and the byte at
+ * position 55 (if present) MUST be a hyphen introducing trailing
+ * fields, which this implementation accepts and ignores.
  */
 static bool
 parse_traceparent(const char *s, OtelContext *out)
 {
-	if (strlen(s) != OTEL_TRACEPARENT_LEN)
+	size_t		len = strlen(s);
+	bool		is_v00;
+
+	if (len < OTEL_TRACEPARENT_LEN)
 		return false;
 	if (s[2] != '-' || s[35] != '-' || s[52] != '-')
 		return false;
 
-	/* only version "00" is supported */
-	if (s[0] != '0' || s[1] != '0')
+	/*
+	 * Version: must be lowercase hex.  "ff" is reserved as invalid by
+	 * the W3C spec.  "00" enables strict-parse mode; anything else
+	 * (01..fe) is treated as a future version and parsed for the
+	 * known prefix only.
+	 */
+	if (!all_hex(s, 2))
 		return false;
+	if (s[0] == 'f' && s[1] == 'f')
+		return false;
+	is_v00 = (s[0] == '0' && s[1] == '0');
+
+	/*
+	 * Length / trailing-field policy.
+	 *	 v00:        exactly 55 chars, no trailing fields allowed.
+	 *	 v01..vfe:   55 chars OK; longer OK iff char 55 is '-' (a new
+	 *	             field separator) --- the trailing data is parsed
+	 *	             out by future implementations and ignored here.
+	 */
+	if (is_v00)
+	{
+		if (len != OTEL_TRACEPARENT_LEN)
+			return false;
+	}
+	else
+	{
+		if (len > OTEL_TRACEPARENT_LEN && s[OTEL_TRACEPARENT_LEN] != '-')
+			return false;
+	}
 
 	if (!all_hex(s + 3, OTEL_TRACE_ID_LEN))
 		return false;
