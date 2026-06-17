@@ -425,8 +425,21 @@ unwind_to(int target_top, const char *reason)
  * MemoryContextCallback driver.  Called when the consumer's
  * CurrentMemoryContext (at push time) is reset or deleted ---
  * typically because ereport unwound through it.  Find the matching
- * span_id in the stack and unwind everything from that entry up to
- * the current top.
+ * span_id in the stack and unwind THAT ENTRY ONLY.
+ *
+ * Critically: we do NOT touch entries above the matched one.  A
+ * producer that pushes A under context ctx-A, then
+ * MemoryContextSwitchTo(ctx-B) and pushes B (with ctx-B's reset
+ * scope), produces a stack with A at a lower index than B but a
+ * callback registered against ctx-A.  When ctx-A resets, this
+ * callback fires for A's entry.  B was pushed under ctx-B, which
+ * has not been reset; B's stack entry must survive.
+ *
+ * Implementation: remove the matched entry in place and slide
+ * entries above it down by one.  span_stack_top decrements by one.
+ * Lookup keys (span_id) are stable across the move because each
+ * entry is a value-copy.  Callbacks for entries that moved still
+ * find their span_id via memcmp at the new index.
  */
 static void
 on_memory_context_reset(void *arg)
@@ -436,13 +449,30 @@ on_memory_context_reset(void *arg)
 
 	for (i = span_stack_top; i >= 0; i--)
 	{
-		if (memcmp(span_stack[i].span_id, node->span_id,
+		OtelSpanStackEntry *e = &span_stack[i];
+
+		if (memcmp(e->span_id, node->span_id,
 				   sizeof(node->span_id)) == 0)
 		{
-			/* Found it.  Drain from current top down to and including
-			 * this entry.  Drain target is i - 1 because unwind_to is
-			 * exclusive (drains while top > target). */
-			unwind_to(i - 1, "unwound by ereport");
+			/* Apply unwind_policy to THIS entry only. */
+			if (e->unwind_policy == OTEL_UNWIND_ERROR && e->span != NULL)
+			{
+				if (e->span->status == OTEL_STATUS_UNSET)
+					e->span->status = OTEL_STATUS_ERROR;
+				e->span->status_description = "unwound by ereport";
+				e->span->end_time = GetCurrentTimestamp();
+				dispatch_span(e->span);
+			}
+
+			/* Remove the matched entry; slide entries above down by
+			 * one to keep the stack contiguous.  For a top-of-stack
+			 * match the loop body executes zero times --- a
+			 * straightforward pop. */
+			for (int j = i; j < span_stack_top; j++)
+				span_stack[j] = span_stack[j + 1];
+			memset(&span_stack[span_stack_top], 0,
+				   sizeof(span_stack[span_stack_top]));
+			span_stack_top--;
 			return;
 		}
 	}
@@ -479,6 +509,45 @@ on_memory_context_reset(void *arg)
  * observable overflow.
  */
 /*
+ * check_unwind_context --- defensive misuse check for push time.
+ *
+ * The push functions register a MemoryContextResetCallback against
+ * the active CurrentMemoryContext.  Under OTEL_UNWIND_ERROR that
+ * callback is the safety net that emits an aborted span on ereport
+ * unwind --- but only if the context actually resets in the normal
+ * course of operation.  TopMemoryContext, CacheMemoryContext, and
+ * ErrorContext don't, so binding the safety net to them silently
+ * defeats it.
+ *
+ * Emit a LOG-level message (server log only --- never delivered to
+ * the client connection, which is the right severity for an API
+ * misuse the SQL caller had no way to cause) and Assert() so cassert
+ * builds crash where the bug is rather than later when the missing
+ * span causes a confusing absence in trace output.
+ *
+ * Only fires under OTEL_UNWIND_ERROR; under OTEL_UNWIND_DROP the
+ * callback isn't load-bearing, so the context choice is harmless.
+ */
+static void
+check_unwind_context(const OtelSpan *span)
+{
+	if (span->unwind_policy != OTEL_UNWIND_ERROR)
+		return;
+
+	if (CurrentMemoryContext == TopMemoryContext ||
+		CurrentMemoryContext == CacheMemoryContext ||
+		CurrentMemoryContext == ErrorContext)
+	{
+		ereport(LOG,
+				(errmsg("otel_api: span pushed under OTEL_UNWIND_ERROR with a long-lived MemoryContext"),
+				 errdetail("CurrentMemoryContext = \"%s\"; the MemoryContextResetCallback that drives the unwind safety net will not fire as expected.",
+						   CurrentMemoryContext->name),
+				 errhint("MemoryContextSwitchTo a per-statement or per-executor context before calling the push function.")));
+		Assert(false);
+	}
+}
+
+/*
  * otel_producer_span_push --- push the span onto the active stack
  * without fetching a parent context.  Used internally by
  * otel_trace.c during Phase 2 migration so the existing
@@ -499,6 +568,8 @@ otel_producer_span_push(OtelSpan *span)
 	if (span == NULL)
 		return;
 
+	check_unwind_context(span);
+
 	if (span_stack_top + 1 < MAX_SPAN_STACK_DEPTH)
 	{
 		OtelSpanStackEntry *entry;
@@ -509,7 +580,14 @@ otel_producer_span_push(OtelSpan *span)
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
-		entry->span = span;
+		/*
+		 * Only OTEL_UNWIND_ERROR ever needs to dereference the
+		 * borrowed pointer at unwind time.  Under OTEL_UNWIND_DROP
+		 * store NULL outright so there is structurally no
+		 * dangling-pointer hazard --- even an on-stack OtelSpan
+		 * cannot become a stale dereference target.
+		 */
+		entry->span = (span->unwind_policy == OTEL_UNWIND_ERROR) ? span : NULL;
 
 		node = (OtelSpanUnwindNode *) MemoryContextAllocExtended(CurrentMemoryContext,
 																 sizeof(*node),
@@ -541,6 +619,8 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 {
 	if (span == NULL)
 		return;
+
+	check_unwind_context(span);
 
 	/* Fetch parent: top-of-stack > root context > none. */
 	if (span_stack_top >= 0)
@@ -575,7 +655,8 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
-		entry->span = span;
+		/* DROP entries store NULL --- see otel_producer_span_push. */
+		entry->span = (span->unwind_policy == OTEL_UNWIND_ERROR) ? span : NULL;
 
 		/*
 		 * Register a MemoryContextCallback against CurrentMemoryContext

@@ -140,6 +140,31 @@ otel_parallel_shmem_startup(void)
 
 
 /*
+ * on_proc_exit callback: clear the leader-context slot owned by this
+ * backend.  This is a structural belt-and-braces measure: the slot
+ * is ordinarily cleared by the producer (otel_postgres_tracing's
+ * finalize_span calls otel_parallel_clear_leader_context after each
+ * span ends), but there are narrow paths where a slot can be
+ * published and then orphaned --- e.g. an error mid-start_span,
+ * after publish but before the span is pushed, where the producer's
+ * PG_CATCH clears its own state but doesn't re-enter the clearing
+ * path.  Without this exit hook, a stale slot survives until another
+ * backend at the same MyProcNumber overwrites it; in the meantime,
+ * any parallel worker that names this backend as its leader would
+ * pick up the stale context.
+ *
+ * The clear function is no-op-safe when no slot is set or when
+ * MyProcNumber is invalid (postmaster), so unconditional invocation
+ * here is safe.
+ */
+static void
+otel_parallel_proc_exit_cb(int code, Datum arg)
+{
+	otel_parallel_clear_leader_context();
+}
+
+
+/*
  * Register the shmem hooks.  Called from _PG_init.  Must run in the
  * postmaster (i.e. via shared_preload_libraries); ereport's WARNING
  * and falls through if invoked outside the preload context, since
@@ -159,6 +184,16 @@ otel_parallel_init(void)
 	shmem_request_hook = otel_parallel_shmem_request;
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = otel_parallel_shmem_startup;
+
+	/*
+	 * Register the per-backend exit cleanup.  on_proc_exit registered
+	 * from postmaster _PG_init is inherited by every forked backend
+	 * (fork copies the on-exit array), so each backend will clear its
+	 * own slot at exit without us having to find another registration
+	 * site.  The callback's MyProcNumber check makes the postmaster's
+	 * own exit a no-op.
+	 */
+	on_proc_exit(otel_parallel_proc_exit_cb, (Datum) 0);
 }
 
 

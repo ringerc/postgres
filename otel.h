@@ -54,6 +54,18 @@
 #define OTEL_TRACE_FLAGS_LEN	2
 
 /*
+ * Well-known errannot() keys this module attaches.  Defined here
+ * rather than in core <utils/elog.h> because they describe a
+ * specific extension's instrumentation, not a core-controlled
+ * namespace.  Out-of-tree consumers that want to emit the same
+ * keys for cross-extension trace correlation should reference
+ * these macros rather than re-spelling the strings.
+ */
+#define OTEL_ERRANNOT_KEY_TRACE_ID		"trace_id"
+#define OTEL_ERRANNOT_KEY_SPAN_ID		"span_id"
+#define OTEL_ERRANNOT_KEY_TRACE_FLAGS	"trace_flags"
+
+/*
  * SpanContext: the on-the-wire trace-context identifiers as a
  * single struct, with all fields NUL-terminated lowercase hex
  * strings.  Used by the producer API to return parent/current/root
