@@ -685,6 +685,19 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
  * (PQtraceContextAvailable returns 1).  Trace context is advisory:
  * not for use in authorization decisions.
  *
+ * Threading: a PGconn object must be used from only one thread at a time.
+ * No two threads may call these functions (or any other libpq function) on
+ * the same connection concurrently.  Concurrent use is undefined behaviour.
+ * See the "Behavior in Threaded Programs" section of the libpq documentation.
+ *
+ * Embedded NULs: traceparent and tracestate are sent as NUL-terminated
+ * strings on the wire (the 'M' message uses the standard PostgreSQL
+ * string framing).  A value that contains an embedded NUL byte will be
+ * silently truncated at the first NUL before transmission.  As a defensive
+ * measure, PQsetTraceContext and PQattachTraceContext reject traceparent
+ * strings that contain embedded NULs.  The server treats a malformed or
+ * missing traceparent as "no context" and does not error.
+ *
  * PQsetTraceContext: arm the connection.  libpq emits a fresh 'M'
  * before each subsequent pipeline (at the start of each PQsend* /
  * PQexec*) until disarmed.  Pass traceparent = NULL to disarm.
@@ -695,7 +708,7 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
  * message; covers that pipeline's RFQ window; not re-sent.
  *
  * Both return 1 on success, 0 on failure (use PQerrorMessage).
- * Failure cases: protocol < 3.3; out of memory.
+ * Failure cases: protocol < 3.3; out of memory; embedded NUL in traceparent.
  */
 extern int	PQsetTraceContext(PGconn *conn,
 							  const char *traceparent,
@@ -708,6 +721,8 @@ extern int	PQattachTraceContext(PGconn *conn,
 /*
  * Returns 1 if the negotiated protocol supports trace context (>= 3.3);
  * 0 otherwise.
+ *
+ * Threading: same single-owner constraint as PQsetTraceContext applies.
  */
 extern int	PQtraceContextAvailable(const PGconn *conn);
 
