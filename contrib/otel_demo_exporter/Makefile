@@ -11,9 +11,13 @@ PGFILEDESC = "otel_demo_exporter - bare-minimum file exporter for otel_api spans
 
 TAP_TESTS = 1
 
-# Activated via shared_preload_libraries; plain installcheck has neither
-# that preload nor the otel_api module loaded first.
-NO_INSTALLCHECK = 1
+# See otel_api/Makefile for the rationale: empty REGRESS / ISOLATION
+# make PGXS's installcheck a no-op for the SQL-regression and isolation
+# runners (which can't reconfigure shared_preload_libraries), while
+# leaving NO_INSTALLCHECK unset so prove_installcheck still runs the
+# TAP suite under t/.
+REGRESS =
+ISOLATION =
 
 # <otel_api/otel.h> is provided by the otel_api extension.  In-tree we
 # look in contrib/otel_api/ via -I$(top_srcdir)/contrib; under PGXS we
