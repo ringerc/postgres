@@ -1,10 +1,10 @@
-# src/test/modules/libpq_headers/Makefile
+# src/test/modules/libpq_trace_context/Makefile
 
-PGFILEDESC = "libpq_headers - test client for per-message protocol headers"
+PGFILEDESC = "libpq_trace_context - test client for trace-context protocol message"
 PGAPPICON = win32
 
-PROGRAM = libpq_headers
-OBJS = $(WIN32RES) libpq_headers.o
+PROGRAM = libpq_trace_context
+OBJS = $(WIN32RES) libpq_trace_context.o
 
 NO_INSTALL = 1
 
@@ -18,7 +18,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = src/test/modules/libpq_headers
+subdir = src/test/modules/libpq_trace_context
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

@@ -1,10 +1,10 @@
-# src/test/modules/test_protocol_headers/Makefile
+# src/test/modules/test_trace_context/Makefile
 
-MODULE_big = test_protocol_headers
+MODULE_big = test_trace_context
 OBJS = \
 	$(WIN32RES) \
-	test_protocol_headers.o
-PGFILEDESC = "test_protocol_headers - test the per-message protocol headers mechanism"
+	test_trace_context.o
+PGFILEDESC = "test_trace_context - test the trace-context protocol message mechanism"
 
 TAP_TESTS = 1
 
@@ -13,7 +13,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = src/test/modules/test_protocol_headers
+subdir = src/test/modules/test_trace_context
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

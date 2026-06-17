@@ -1155,34 +1155,6 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 		conn->std_strings = (strcmp(value, "on") == 0);
 		static_std_strings = conn->std_strings;
 	}
-	else if (strcmp(name, "protocol_features") == 0)
-	{
-		/*
-		 * Comma-separated list of v3 protocol features the server has
-		 * affirmatively negotiated for this connection.  We only need to
-		 * recognize "headers" here; unknown future names are ignored.
-		 * Scan with explicit token boundaries so a hypothetical feature
-		 * name like "myheaders" cannot be mistaken for "headers".
-		 */
-		const char *p = value;
-
-		while (*p)
-		{
-			const char *start = p;
-			const char *end;
-
-			while (*p && *p != ',')
-				p++;
-			end = p;
-			if (end - start == 7 && memcmp(start, "headers", 7) == 0)
-			{
-				conn->headersAvailable = true;
-				break;
-			}
-			if (*p == ',')
-				p++;
-		}
-	}
 	else if (strcmp(name, "server_version") == 0)
 	{
 		/* We convert the server version to numeric form. */
@@ -1497,11 +1469,11 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 
 	/*
 	 * Argument validation has passed and we are committed to emitting
-	 * a protocol message.  Flush any queued headers as a single
-	 * RequestHeaders ('M') message immediately before the Query so
-	 * the server applies them to the right operation.
+	 * a protocol message.  Flush any pending trace context as a
+	 * TraceContext ('M') message immediately before the Query so
+	 * the server applies it to the right operation.
 	 */
-	if (pqFlushHeaders(conn) != 0)
+	if (pqFlushTraceContext(conn) != 0)
 	{
 		pqRecycleCmdQueueEntry(conn, entry);
 		return 0;
@@ -1623,10 +1595,10 @@ PQsendPrepare(PGconn *conn,
 
 	/*
 	 * Argument validation has passed and we are committed to emitting
-	 * a protocol message.  Flush any queued headers immediately before
-	 * the Parse so the server applies them to the right operation.
+	 * a protocol message.  Flush any pending trace context immediately
+	 * before the Parse so the server applies it to the right operation.
 	 */
-	if (pqFlushHeaders(conn) != 0)
+	if (pqFlushTraceContext(conn) != 0)
 		goto sendFailed;
 
 	/* construct the Parse message */
@@ -1764,11 +1736,11 @@ PQsendQueryStart(PGconn *conn, bool newQuery)
 	}
 
 	/*
-	 * Header flushing is deferred to each caller's own send path
-	 * (pqFlushHeaders, called just before the first pqPutMsgStart for
-	 * the operation) so that queued headers are consumed only when
+	 * Trace-context flushing is deferred to each caller's own send path
+	 * (pqFlushTraceContext, called just before the first pqPutMsgStart for
+	 * the operation) so that trace context is emitted only when
 	 * the caller is committed to emitting a protocol message.  If a
-	 * caller fails its own argument validation, the queue stays
+	 * caller fails its own argument validation, the armed state stays
 	 * intact and the next attempt re-uses it instead of inheriting
 	 * stale metadata.
 	 */
@@ -1848,11 +1820,11 @@ PQsendQueryGuts(PGconn *conn,
 
 	/*
 	 * Caller has already validated arguments and we are committed to
-	 * emitting a protocol message.  Flush any queued headers
+	 * emitting a protocol message.  Flush any pending trace context
 	 * immediately before the first Parse/Bind so the server applies
-	 * them to the right operation.
+	 * it to the right operation.
 	 */
-	if (pqFlushHeaders(conn) != 0)
+	if (pqFlushTraceContext(conn) != 0)
 		goto sendFailed;
 
 	/*
@@ -2687,11 +2659,11 @@ PQsendTypedCommand(PGconn *conn, char command, char type, const char *target)
 
 	/*
 	 * Argument validation has passed and we are committed to emitting
-	 * a protocol message.  Flush any queued headers immediately before
-	 * the Close/Describe so the server applies them to the right
+	 * a protocol message.  Flush any pending trace context immediately
+	 * before the Close/Describe so the server applies it to the right
 	 * operation.
 	 */
-	if (pqFlushHeaders(conn) != 0)
+	if (pqFlushTraceContext(conn) != 0)
 		goto sendFailed;
 
 	/* construct the Close message */

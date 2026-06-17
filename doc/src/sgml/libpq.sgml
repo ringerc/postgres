@@ -2909,7 +2909,6 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
         <member><varname>integer_datetimes</varname></member>
         <member><varname>IntervalStyle</varname></member>
         <member><varname>is_superuser</varname></member>
-        <member><varname>protocol_features</varname></member>
         <member><varname>scram_iterations</varname></member>
         <member><varname>search_path</varname></member>
         <member><varname>server_encoding</varname></member>
@@ -2922,8 +2921,7 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
        <varname>in_hot_standby</varname> were not reported by releases before
        14; <varname>scram_iterations</varname> was not reported by releases
        before 16; <varname>search_path</varname> was not reported by releases
-       before 18; <varname>protocol_features</varname> was not reported by
-       releases before 19.)
+       before 18.)
        Note that
        <varname>server_version</varname> and
        <varname>server_encoding</varname>
@@ -5288,72 +5286,64 @@ unsigned char *PQunescapeBytea(const unsigned char *from, size_t *to_length);
 
  </sect1>
 
- <sect1 id="libpq-headers">
-  <title>Per-Message Protocol Headers</title>
+ <sect1 id="libpq-trace-context">
+  <title>Trace Context Propagation</title>
 
-  <indexterm zone="libpq-headers">
-   <primary>protocol headers</primary>
+  <indexterm zone="libpq-trace-context">
+   <primary>trace context</primary>
+  </indexterm>
+  <indexterm zone="libpq-trace-context">
+   <primary>TraceContext message</primary>
   </indexterm>
 
   <para>
-   Applications can attach a list of <literal>(key, value)</literal>
-   string pairs to the next operation sent to the server.  The pairs
-   travel in a single <literal>RequestHeaders</literal>
+   Applications can attach a W3C Trace Context (traceparent and
+   tracestate strings) to the next operation sent to the server.  The
+   strings travel in a single <literal>TraceContext</literal>
    (<literal>'M'</literal>) protocol message that precedes the
-   operation; the server dispatches each pair to whichever loadable
-   extension has registered interest in the key's prefix.  This is the
-   wire-level mechanism that supports features such as OpenTelemetry
-   trace-context propagation, application-supplied query tags, and
-   per-request correlation IDs without requiring a new protocol-version
-   bump for each consumer.
+   operation.  On the server side, a loadable extension may register
+   a handler via <function>RegisterTraceContextHandler</function> to
+   receive the values and, for example, record them in OpenTelemetry
+   spans.
   </para>
 
   <para>
-   Headers are advisory only.  They are intended to carry observability
-   and routing metadata and <emphasis>must not</emphasis> be used for
-   authorization decisions or as the basis of row-level security
+   Trace context is advisory only.  It is intended to carry
+   observability metadata and <emphasis>must not</emphasis> be used
+   for authorization decisions or as the basis of row-level security
    predicates.  Authentication is handled by the connection's
-   authentication exchange, not by these headers.
+   authentication exchange, not by these messages.
   </para>
 
   <para>
-   The feature is negotiated automatically at startup.
-   <application>libpq</application> always advertises support by
-   sending <literal>_pq_.headers=1</literal> as a protocol option in
-   the <literal>StartupMessage</literal>.  A server that supports the
-   feature confirms acceptance by emitting a
-   <literal>ParameterStatus</literal> message with key
-   <literal>protocol_features</literal> whose comma-separated value
-   includes <literal>headers</literal>.  This affirmative
-   acknowledgement is what indicates that the startup opt-in reached a
-   supporting server &mdash; not the absence of a
-   <literal>NegotiateProtocolVersion</literal>, which a proxy can
-   suppress.  Intermediaries on the data path must still relay
-   <literal>RequestHeaders</literal> messages for the feature to work
-   end-to-end; the acknowledgement does not by itself guarantee that.
-   Use <xref linkend="libpq-PQheadersAvailable"/> to check.
+   The feature is available on protocol 3.3 connections.
+   <application>libpq</application> uses protocol 3.3 by default when
+   connecting to a server that supports it.  Use
+   <xref linkend="libpq-PQtraceContextAvailable"/> to check whether
+   the current connection supports trace-context messages.
   </para>
 
   <variablelist>
-   <varlistentry id="libpq-PQattachHeader">
-    <term><function>PQattachHeader</function><indexterm><primary>PQattachHeader</primary></indexterm></term>
+   <varlistentry id="libpq-PQsetTraceContext">
+    <term><function>PQsetTraceContext</function><indexterm><primary>PQsetTraceContext</primary></indexterm></term>
 
     <listitem>
      <para>
-      Queues a <literal>(key, value)</literal> protocol header to be
-      sent as part of the next operation on the connection.
+      Arms the connection to send a
+      <literal>TraceContext</literal> message before every subsequent
+      operation, until the context is replaced or released.
 
 <synopsis>
-int PQattachHeader(PGconn *conn, const char *key, const char *value);
+int PQsetTraceContext(PGconn *conn, const char *traceparent, const char *tracestate);
 </synopsis>
      </para>
 
      <para>
-      Headers accumulate in a per-connection queue.  The queue is
-      flushed as a single <literal>RequestHeaders</literal> message
-      immediately before the next
-      <function>PQexec</function>/<function>PQsend</function>-family
-      call &mdash; specifically
+      Sets a persistent trace context on the connection.  After a
+      successful call, a <literal>TraceContext</literal> message
+      carrying the given <parameter>traceparent</parameter> and
+      <parameter>tracestate</parameter> values is sent immediately
+      before each of
       <xref linkend="libpq-PQexec"/>,
       <xref linkend="libpq-PQexecParams"/>,
       <xref linkend="libpq-PQprepare"/>,
@@ -5361,139 +5351,88 @@ int PQattachHeader(PGconn *conn, const char *key, const char *value);
       <xref linkend="libpq-PQsendQuery"/>,
       <xref linkend="libpq-PQsendQueryParams"/>,
       <xref linkend="libpq-PQsendPrepare"/>, and
-      <xref linkend="libpq-PQsendQueryPrepared"/>.  Each of those
-      functions flushes the queue only after its own argument
-      validation succeeds, so headers attached ahead of a call that
-      fails client-side are not consumed and remain queued for the
-      next attempt.  After a successful flush the queue is empty, so
-      headers attached to one operation do not bleed into the next.
+      <xref linkend="libpq-PQsendQueryPrepared"/>.
+      The context persists across pipeline re-arm cycles until
+      explicitly replaced by another call to
+      <function>PQsetTraceContext</function> or released by calling
+      <xref linkend="libpq-PQattachTraceContext"/> with
+      <symbol>NULL</symbol> arguments or
+      <xref linkend="libpq-PQtraceContextAvailable"/> returning
+      <literal>0</literal>.
      </para>
 
      <para>
-      Returns <literal>1</literal> on success and <literal>0</literal>
-      on failure.  Failure cases include the server not having
-      negotiated <literal>_pq_.headers</literal> (see
-      <xref linkend="libpq-PQheadersAvailable"/>), a <symbol>NULL</symbol>
-      <parameter>key</parameter> or <parameter>value</parameter>, and
-      out-of-memory.  On failure call
-      <xref linkend="libpq-PQerrorMessage"/> for details.
-     </para>
-
-     <para>
-      The interpretation of header keys and values is the
-      responsibility of whichever server-side extension consumes them.
-      <application>libpq</application> performs no format validation
-      beyond rejecting embedded <literal>NUL</literal> bytes (which
-      would break the protocol's NUL-terminated string encoding).  By
-      convention, keys are namespaced using a prefix that identifies
-      the consumer.  How keys, values, and corner cases such as empty
-      values are handled is defined by the consuming extension, not
-      by this API or by the core server.
-     </para>
-
-     <para>
-      On the server, header dispatch is deferred: handlers are
-      invoked at the start of the next Query / Parse / Bind / Execute,
-      not on receipt of the <literal>RequestHeaders</literal> message
-      itself.  This means a handler that raises an error fails the
-      SQL operation those headers were intended to prefix &mdash; the
-      operation does not run, and the client receives the error as
-      the response to that operation.  A
-      <literal>RequestHeaders</literal> message that is not followed
-      by an operation has no observable effect.
+      <parameter>tracestate</parameter> may be <symbol>NULL</symbol>
+      or an empty string if there is no tracestate to propagate.
+      Returns <literal>1</literal> on success, <literal>0</literal>
+      on failure (out-of-memory or protocol version too old).
      </para>
     </listitem>
    </varlistentry>
 
-   <varlistentry id="libpq-PQclearHeaders">
-    <term><function>PQclearHeaders</function><indexterm><primary>PQclearHeaders</primary></indexterm></term>
+   <varlistentry id="libpq-PQattachTraceContext">
+    <term><function>PQattachTraceContext</function><indexterm><primary>PQattachTraceContext</primary></indexterm></term>
 
     <listitem>
      <para>
-      Discards all headers queued by previous calls to
-      <xref linkend="libpq-PQattachHeader"/> on this connection,
-      without sending them.
+      Sends a <literal>TraceContext</literal> message once, before
+      the next operation, then clears the stored context.
 
 <synopsis>
-void PQclearHeaders(PGconn *conn);
+int PQattachTraceContext(PGconn *conn, const char *traceparent, const char *tracestate);
 </synopsis>
      </para>
 
      <para>
-      Useful when an application has queued headers in preparation for
-      an operation that it has since decided not to issue, or to reset
-      a partially-built header set before retrying with a different
-      one.  The queue is also drained automatically by the next
-      operation that triggers a flush, so explicit
-      <function>PQclearHeaders</function> is only needed to cancel a
-      pending attachment.
+      Unlike <xref linkend="libpq-PQsetTraceContext"/>, the context
+      set by this function is consumed by the next operation and is
+      not re-sent for subsequent operations.  This is useful when
+      each query carries a distinct trace context (for example, when
+      the application issues queries on behalf of multiple
+      independent client requests over the same connection).
+     </para>
+
+     <para>
+      <parameter>tracestate</parameter> may be <symbol>NULL</symbol>
+      or an empty string.  Returns <literal>1</literal> on success,
+      <literal>0</literal> on failure.  Passing <symbol>NULL</symbol>
+      for both arguments releases any pending one-shot context without
+      sending it.
      </para>
     </listitem>
    </varlistentry>
 
-   <varlistentry id="libpq-PQheadersAvailable">
-    <term><function>PQheadersAvailable</function><indexterm><primary>PQheadersAvailable</primary></indexterm></term>
+   <varlistentry id="libpq-PQtraceContextAvailable">
+    <term><function>PQtraceContextAvailable</function><indexterm><primary>PQtraceContextAvailable</primary></indexterm></term>
 
     <listitem>
      <para>
-      Reports whether the server has affirmatively negotiated the
-      per-message protocol headers feature on this connection.
+      Reports whether the connection supports
+      <literal>TraceContext</literal> messages.
 
 <synopsis>
-int PQheadersAvailable(const PGconn *conn);
+int PQtraceContextAvailable(const PGconn *conn);
 </synopsis>
      </para>
 
      <para>
-      Returns <literal>1</literal> if the server emitted a
-      <literal>ParameterStatus</literal> message advertising
-      <literal>protocol_features</literal> with a value containing
-      <literal>headers</literal>, and <literal>0</literal> otherwise.
-      The result is meaningful only after the connection has reached
+      Returns <literal>1</literal> if the negotiated protocol version
+      is 3.3 or later, and <literal>0</literal> otherwise.  The result
+      is meaningful only after the connection has reached
       <literal>CONNECTION_OK</literal>.
      </para>
 
      <para>
-      The <emphasis>absence</emphasis> of a
-      <literal>NegotiateProtocolVersion</literal> rejection during
-      startup is not a sufficient signal of acceptance: a connection
-      pooler in the network path may have silently stripped
-      <application>libpq</application>'s
-      <literal>_pq_.headers</literal> opt-in from the
-      <literal>StartupMessage</literal>, in which case the server
-      never saw the option and emits nothing about it.  Relying on the
-      affirmative <literal>ParameterStatus</literal> &mdash; which
-      proxies relay along with the other startup-time
-      <literal>ParameterStatus</literal> messages such as
-      <varname>server_version</varname> &mdash; closes that gap.
-     </para>
-
-     <para>
-      <xref linkend="libpq-PQattachHeader"/> also fails when this
-      function would return <literal>0</literal>, so applications that
-      do not care to distinguish a feature-supported connection from a
-      not-supported one can simply ignore the return value of
-      <function>PQheadersAvailable</function> and react to a
-      <xref linkend="libpq-PQattachHeader"/> failure instead.
+      <xref linkend="libpq-PQattachTraceContext"/> and
+      <xref linkend="libpq-PQsetTraceContext"/> also return
+      <literal>0</literal> when this function would return
+      <literal>0</literal>, so applications that do not need to
+      distinguish version-capable from non-capable connections can
+      simply react to the return value of those functions instead.
      </para>
     </listitem>
    </varlistentry>
   </variablelist>
-
-  <para>
-   Pooled and proxied deployments require special consideration.  A
-   pooler that does not understand the
-   <literal>RequestHeaders</literal> message will drop the
-   <literal>'M'</literal> wire byte and break the operation that
-   followed it.  Even a pooler that understands the message but
-   operates in transaction-pooling mode cannot meaningfully apply a
-   per-client opt-in to a shared backend connection that was opened
-   without one.  The affirmative <literal>ParameterStatus</literal>
-   acknowledgement protects clients from silently mis-detecting the
-   feature as available in such environments, but it cannot make the
-   feature work; the pooler itself must learn to relay
-   <literal>RequestHeaders</literal> messages.
-  </para>
 
  </sect1>
 

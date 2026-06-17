@@ -45,7 +45,7 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
-#include "libpq/protocol_headers.h"
+#include "libpq/trace_context.h"
 #include "mb/pg_wchar.h"
 #include "mb/stringinfo_mb.h"
 #include "miscadmin.h"
@@ -449,9 +449,9 @@ SocketBackend(StringInfo inBuf)
 			doing_extended_query_message = false;
 			break;
 
-		case PqMsg_RequestHeaders:
+		case PqMsg_TraceContext:
 			maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
-			/* RequestHeaders precedes another operation and does not by
+			/* TraceContext precedes another operation and does not by
 			 * itself put us into extended-query mode. */
 			break;
 
@@ -4410,15 +4410,6 @@ PostgresMain(const char *dbname, const char *username)
 	BeginReportingGUCOptions();
 
 	/*
-	 * Advertise the protocol-level features negotiated for this connection
-	 * (e.g. _pq_.headers).  This rides on the initial ParameterStatus burst
-	 * that proxies are accustomed to relaying, so a client can distinguish
-	 * "server agreed" from "an intermediary stripped my opt-in and the
-	 * absence of NegotiateProtocolVersion is meaningless".
-	 */
-	SendProtocolFeaturesParameterStatus();
-
-	/*
 	 * Also set up handler to log session end; we have to wait till now to be
 	 * sure Log_disconnections has its final value.
 	 */
@@ -4578,15 +4569,13 @@ PostgresMain(const char *dbname, const char *username)
 		jit_reset_after_error();
 
 		/*
-		 * Drop any RequestHeaders entries stashed from a prior 'M'
-		 * message but not yet dispatched.  The ERROR we're recovering
-		 * from may itself have been raised by ApplyPendingRequestHeaders
-		 * mid-iteration, leaving the tail of the list undispatched; or
-		 * it may have come from anywhere else, in which case we still
-		 * want any 'M' that arrived in this command cycle dropped so
-		 * it does not silently apply to the next operation.
+		 * Clear any trace context installed by an 'M' message in this
+		 * command cycle.  The context applies on receipt so it may
+		 * already be active when an unrelated ERROR fires; clear it
+		 * here so it cannot leak into the next pipeline.  ClearTraceContext
+		 * is idempotent.
 		 */
-		ResetPendingRequestHeaders();
+		ClearTraceContext();
 
 		/*
 		 * Now return to normal top-level context and clear ErrorContext for
@@ -4838,6 +4827,15 @@ PostgresMain(const char *dbname, const char *username)
 				PG_END_TRY();
 			}
 
+			/*
+			 * Clear any trace context applied during this command cycle.
+			 * The TraceContext ('M') scope is until-RFQ, so the recorded
+			 * context is reset here -- after any pre_ready_for_query_hook
+			 * teardown (which may still want to observe it) and
+			 * immediately before ReadyForQuery.
+			 */
+			ClearTraceContext();
+
 			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;
 		}
@@ -4912,15 +4910,6 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
-					/*
-					 * Apply any RequestHeaders pending from an earlier 'M'
-					 * message.  A handler ERROR here becomes this Query's
-					 * ERROR, which is exactly the binding we want: the
-					 * client sees the failure scoped to the operation the
-					 * headers were intended to prefix.
-					 */
-					ApplyPendingRequestHeaders();
-
 					query_string = pq_getmsgstring(&input_message);
 					pq_getmsgend(&input_message);
 
@@ -4950,9 +4939,6 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
-					/* See ApplyPendingRequestHeaders comment in Query case. */
-					ApplyPendingRequestHeaders();
-
 					stmt_name = pq_getmsgstring(&input_message);
 					query_string = pq_getmsgstring(&input_message);
 					numParams = pq_getmsgint(&input_message, 2);
@@ -4977,9 +4963,6 @@ PostgresMain(const char *dbname, const char *username)
 				/* Set statement_timestamp() */
 				SetCurrentStatementStartTimestamp();
 
-				/* See ApplyPendingRequestHeaders comment in Query case. */
-				ApplyPendingRequestHeaders();
-
 				/*
 				 * this message is complex enough that it seems best to put
 				 * the field extraction out-of-line
@@ -4998,9 +4981,6 @@ PostgresMain(const char *dbname, const char *username)
 
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
-
-					/* See ApplyPendingRequestHeaders comment in Query case. */
-					ApplyPendingRequestHeaders();
 
 					portal_name = pq_getmsgstring(&input_message);
 					max_rows = pq_getmsgint(&input_message, 4);
@@ -5147,17 +5127,15 @@ PostgresMain(const char *dbname, const char *username)
 				send_ready_for_query = true;
 				break;
 
-			case PqMsg_RequestHeaders:
+			case PqMsg_TraceContext:
 
 				/*
-				 * Per-message protocol headers.  Negotiated at startup via
-				 * the _pq_.headers option; ProcessRequestHeadersMessage()
-				 * enforces the negotiation and configured caps.  The
-				 * message produces no reply on its own --- the effect is
-				 * delivered via registered handlers and the next
-				 * operation's response carries any visible result.
+				 * Trace-context protocol message.  Available when the
+				 * client negotiated protocol 3.3.  No reply is sent;
+				 * the context is applied immediately and cleared at the
+				 * next ReadyForQuery.
 				 */
-				ProcessRequestHeadersMessage(&input_message);
+				ProcessTraceContextMessage(&input_message);
 				break;
 
 				/*

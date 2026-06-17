@@ -35,7 +35,7 @@ OBJS = \
 	fe-cancel.o \
 	fe-connect.o \
 	fe-exec.o \
-	fe-headers.o \
+	fe-trace-context.o \
 	fe-lobj.o \
 	fe-misc.o \
 	fe-print.o \
