@@ -30,8 +30,12 @@ ISOLATION =
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 OTEL_PROBE_INC := $(shell $(PG_CONFIG) --includedir-server)
+OTEL_PROBE_CC  := $(shell $(PG_CONFIG) --cc)
 else
 OTEL_PROBE_INC := $(top_srcdir)/src/include
+# In-tree: CC is set by Makefile.global (included below), but at probe time Make
+# uses its built-in default which is also 'cc' on every supported platform.
+OTEL_PROBE_CC  := cc
 endif
 
 # Optional dependencies on core-postgres features.  otel_api can build
@@ -60,23 +64,47 @@ endif
 # Makefile.global, baking in the current value of PG_CPPFLAGS; any
 # additions made after the include are silently lost from the actual
 # compile command line.
+#
+# Detection uses compile probes rather than text-grepping headers so that
+# signature changes, return-type changes, or the function moving to a
+# different header do not silently disable the feature.  Each probe feeds
+# a minimal C snippet to the compiler and gates on the exit code.
+# -w suppresses all warnings; -Werror=implicit-function-declaration makes
+# an undeclared function a hard error even under C17 (where it is
+# otherwise a non-fatal warning).
 ifeq ($(origin ENABLE_TRACE_CONTEXT),undefined)
-  ifneq (,$(wildcard $(OTEL_PROBE_INC)/libpq/trace_context.h))
-    ENABLE_TRACE_CONTEXT = 1
-  else
-    ENABLE_TRACE_CONTEXT = 0
-  endif
+  # Compile probe: include libpq/trace_context.h and reference the
+  # TraceContextApplyCb type to confirm the header is present and usable.
+  # A plain wildcard/header-presence test would also work here (the header
+  # is new and specific to this feature), but we use a compile probe for
+  # consistency and to catch cases where the header exists but cannot be
+  # compiled (e.g. missing dependencies).
+  ENABLE_TRACE_CONTEXT := $(shell \
+    printf '%s\n' \
+      '#include "postgres.h"' \
+      '#include "libpq/trace_context.h"' \
+      'static TraceContextApplyCb otel_probe_ = NULL;' \
+    | $(OTEL_PROBE_CC) -w -c -I'$(OTEL_PROBE_INC)' -x c - -o /dev/null 2>/dev/null \
+    && echo 1 || echo 0)
 endif
 ifeq ($(ENABLE_TRACE_CONTEXT),1)
   PG_CPPFLAGS += -DOTEL_HAVE_TRACE_CONTEXT
 endif
 
 ifeq ($(origin ENABLE_ERRANNOT),undefined)
-  ifneq (,$(shell grep -l '^extern int[[:space:]].*errannot' $(OTEL_PROBE_INC)/utils/elog.h 2>/dev/null))
-    ENABLE_ERRANNOT = 1
-  else
-    ENABLE_ERRANNOT = 0
-  endif
+  # Compile probe: include utils/elog.h and reference errannot() by name.
+  # An undeclared function is a hard error with -Werror=implicit-function-declaration,
+  # so the probe exits non-zero when errannot() is absent from the header,
+  # regardless of return type or spelling changes.  This replaces the previous
+  # text-grep which would silently mis-fire on return-type or header-location changes.
+  ENABLE_ERRANNOT := $(shell \
+    printf '%s\n' \
+      '#include "postgres.h"' \
+      '#include "utils/elog.h"' \
+      'void otel_probe_(void) { (void)(errannot); }' \
+    | $(OTEL_PROBE_CC) -w -Werror=implicit-function-declaration \
+        -c -I'$(OTEL_PROBE_INC)' -x c - -o /dev/null 2>/dev/null \
+    && echo 1 || echo 0)
 endif
 ifeq ($(ENABLE_ERRANNOT),1)
   PG_CPPFLAGS += -DOTEL_HAVE_ERRANNOT
