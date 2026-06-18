@@ -17,11 +17,12 @@
  * tracing hooks lived inside contrib/otel itself and reached into
  * its internal storage directly.
  *
- * Load order: 'otel,otel_postgres_tracing' in
- * shared_preload_libraries.  contrib/otel publishes the rendezvous
- * api at its _PG_init; this module looks it up at its own _PG_init
- * (which runs second).  An ereport(ERROR) at startup tells the
- * operator to fix the preload order if it's wrong.
+ * Load order: otel_postgres_tracing may appear anywhere in
+ * shared_preload_libraries (or session_preload_libraries, or be
+ * LOADed at session start).  The provider rendezvous is resolved
+ * lazily at first hot-path use via otel_api_get() so preload order
+ * is irrelevant.  If the provider is absent, tracing degrades to a
+ * silent zero-cost no-op.
  *
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -35,11 +36,10 @@
 #include "postgres.h"
 
 #include "fmgr.h"
-#include "miscadmin.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
 
-#include <otel_api/otel.h>
+#include <otel_api/otel_api.h>
 
 #include "otel_postgres_tracing.h"
 
@@ -48,18 +48,18 @@ PG_MODULE_MAGIC;
 
 
 /*
- * The OtelTracingApi pointer cached at _PG_init time.  Used by
- * otel_trace.c and otel_log.c to reach into contrib/otel without
- * direct extern-symbol linkage.  Declared in
- * otel_postgres_tracing.h.
+ * The OtelTracingApi pointer.  Lazily resolved on first hot-path call
+ * via otel_pg_ensure(); written here so otel_trace.c and otel_log.c
+ * can read it without calling through the getter every time.
+ * NULL until the provider is first seen.
+ * Declared in otel_postgres_tracing.h.
  */
 const OtelTracingApi *otel_api = NULL;
 
 /*
- * InstrumentationScope handle for this module's spans.  Registered
- * at _PG_init via otel_api->tracer_register; cached forever in
- * TopMemoryContext.  Used by otel_trace.c to tag every span it
- * produces.  Declared in otel_postgres_tracing.h.
+ * InstrumentationScope handle for this module's spans.  Populated
+ * lazily the first time otel_pg_ensure() succeeds.
+ * Declared in otel_postgres_tracing.h.
  */
 const OtelInstrumentationScope *otel_pg_tracer = NULL;
 
@@ -74,35 +74,52 @@ bool otel_trace_all_queries = false;
 void		_PG_init(void);
 
 
+/*
+ * otel_pg_ensure() — lazy provider resolution.
+ *
+ * Called from every hot-path site that needs the API.  On first
+ * successful resolution it also registers the InstrumentationScope
+ * handle.  Returns the cached OtelTracingApi pointer, or NULL when
+ * the provider is absent/incompatible.
+ *
+ * Defined here (not in a header) so otel_trace.c and otel_log.c can
+ * call it; it is declared in otel_postgres_tracing.h.
+ */
+const OtelTracingApi *
+otel_pg_ensure(void)
+{
+	const OtelTracingApi *api = otel_api_get();
+
+	if (api == NULL)
+		return NULL;
+
+	/* Cache the pointer in the module global for other TUs. */
+	otel_api = api;
+
+	/* Register the tracer scope once (idempotent: otel_pg_tracer stays
+	 * non-NULL after the first successful call). */
+	if (otel_pg_tracer == NULL)
+		otel_pg_tracer = api->tracer_register("contrib/otel_postgres_tracing",
+											  PG_VERSION,
+											  NULL);
+	return api;
+}
+
+
 void
 _PG_init(void)
 {
-	void	  **slot;
-
-	if (!process_shared_preload_libraries_in_progress)
-	{
-		ereport(ERROR,
-				(errmsg("otel_postgres_tracing must be loaded via shared_preload_libraries"),
-				 errhint("Add 'otel,otel_postgres_tracing' to shared_preload_libraries.")));
-	}
-
-	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
-	otel_api = (const OtelTracingApi *) *slot;
-	if (otel_api == NULL)
-		ereport(ERROR,
-				(errmsg("otel_postgres_tracing requires contrib/otel to be loaded first"),
-				 errhint("In shared_preload_libraries, 'otel' must come before 'otel_postgres_tracing'.")));
-	if (OTEL_API_MAJOR(otel_api->version) != OTEL_TRACING_API_MAJOR ||
-		otel_api->struct_size < sizeof(*otel_api))
-		ereport(ERROR,
-				(errmsg("OtelTracingApi compatibility check failed"),
-				 errdetail("Loaded otel_api exposes api version %u.%u (struct_size %u); otel_postgres_tracing was built against version %u.%u (struct_size %zu).",
-						   OTEL_API_MAJOR(otel_api->version),
-						   OTEL_API_MINOR(otel_api->version),
-						   otel_api->struct_size,
-						   OTEL_TRACING_API_MAJOR,
-						   OTEL_TRACING_API_MINOR,
-						   sizeof(*otel_api))));
+	/*
+	 * No load-time guard: this module may be loaded via
+	 * shared_preload_libraries, session_preload_libraries,
+	 * local_preload_libraries, or a direct LOAD command.  All
+	 * preload mechanisms run _PG_init before any query; a LOAD at
+	 * session time gives best-effort, current-backend-only tracing
+	 * from registration onward.  No ERROR for any of these paths.
+	 *
+	 * The provider (otel_api) is resolved lazily at first hot-path
+	 * use via otel_pg_ensure(), so no rendezvous lookup here.
+	 */
 
 	/*
 	 * trace_all_queries is owned by this module post-split: it's a
@@ -136,10 +153,12 @@ _PG_init(void)
 	MarkGUCPrefixReserved("otel");
 	MarkGUCPrefixReserved("otel_postgres_tracing");
 
-	otel_pg_tracer = otel_api->tracer_register("contrib/otel_postgres_tracing",
-											   PG_VERSION,
-											   NULL);
-
+	/*
+	 * Install executor and log hooks unconditionally.  The hooks
+	 * call otel_pg_ensure() on every invocation and no-op when the
+	 * provider is absent.  The tracer handle (otel_pg_tracer) is
+	 * registered on the first successful otel_pg_ensure() call.
+	 */
 	otel_trace_install_hooks();
 	otel_log_install_hooks();
 }

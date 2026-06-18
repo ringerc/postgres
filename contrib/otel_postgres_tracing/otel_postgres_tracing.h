@@ -19,14 +19,26 @@
 #include <otel_api/otel.h>
 
 
-/* Cached pointer to the OtelTracingApi rendezvous struct,
- * resolved once at _PG_init time.  Never NULL after _PG_init
- * returns successfully (the lookup ereport(ERROR)s on failure). */
+/*
+ * Cached pointer to the OtelTracingApi, lazily populated by
+ * otel_pg_ensure().  NULL until the provider is first seen.
+ * otel_trace.c / otel_log.c use otel_pg_ensure() on hot paths
+ * rather than reading this directly.
+ */
 extern const OtelTracingApi *otel_api;
 
-/* InstrumentationScope handle for this module, registered at
- * _PG_init.  Tagged onto every OtelSpan produced by otel_trace.c. */
+/*
+ * InstrumentationScope handle for this module.  Populated lazily
+ * on the first otel_pg_ensure() success.
+ */
 extern const OtelInstrumentationScope *otel_pg_tracer;
+
+/*
+ * Lazy provider resolution.  Returns the OtelTracingApi pointer
+ * (or NULL when absent/incompatible).  Also registers the tracer
+ * scope on first success.  Safe to call on every hot-path invocation.
+ */
+extern const OtelTracingApi *otel_pg_ensure(void);
 
 /* Behaviour GUCs owned by this module. */
 extern bool otel_trace_all_queries;

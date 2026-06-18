@@ -65,13 +65,27 @@ otel_log_install_hooks(void)
  *	   otel_trace.c; it handles the active-span check, the elevel
  *	   gate, and the ERROR-status update internally.
  *	3. Chain.
+ *
+ *	When the provider is absent (otel_pg_ensure returns NULL) the
+ *	trace-context annotation is skipped; the span event capture and
+ *	hook chain are still exercised.
  */
 static void
 otel_emit_log_hook(ErrorData *edata)
 {
+	const OtelTracingApi *api = otel_pg_ensure();
 	OtelRootContextSnapshot rc;
 
-	otel_api->get_root_context_snapshot(&rc);
+	if (api == NULL)
+	{
+		/* No provider: skip trace-context annotation; chain only. */
+		otel_span_record_log_event(edata);
+		if (prev_emit_log_hook)
+			prev_emit_log_hook(edata);
+		return;
+	}
+
+	api->get_root_context_snapshot(&rc);
 
 	if (rc.is_set)
 	{

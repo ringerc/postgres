@@ -426,13 +426,14 @@ finalize_span(OtelSpanStatus status)
  *
  * Decision order, expressed as gates:
  *
- *	  1. No consumer (no exporter hook AND log emission disabled)
+ *	  1. No provider (otel_api absent) -> DROP (silent no-op).
+ *	  2. No consumer (no exporter hook AND log emission disabled)
  *		 -> DROP.  Backends not actively tracing pay only the two
  *		 pointer/bool reads at this gate.
- *	  2. otel.trace_all_queries -> RECORD_AND_SAMPLE.  Always-on
+ *	  3. otel.trace_all_queries -> RECORD_AND_SAMPLE.  Always-on
  *		 mode bypasses propagated state.
- *	  3. No propagated context (otel_ctx.is_set == false) -> DROP.
- *	  4-6. Policy-dependent.  See OtelSamplerHookPolicy in otel.h
+ *	  4. No propagated context (otel_ctx.is_set == false) -> DROP.
+ *	  5-7. Policy-dependent.  See OtelSamplerHookPolicy in otel.h
  *		 for the four regimes; the dispatch below applies them.
  *
  * Per W3C TraceContext Level 1 §3.2.2.1 the unset sampled bit is
@@ -443,22 +444,28 @@ finalize_span(OtelSpanStatus status)
 static OtelSamplerDecision
 decide_whether_to_record(const char *name_hint)
 {
+	const OtelTracingApi *api;
 	OtelRootContextSnapshot rc;
 
-	/* Gate 1: no consumer */
-	if (!otel_api->any_emit_consumer_present())
+	/* Gate 1: no provider */
+	api = otel_pg_ensure();
+	if (api == NULL)
 		return OTEL_SAMPLE_DROP;
 
-	/* Gate 2: force-on overrides propagation entirely */
+	/* Gate 2: no consumer */
+	if (!api->any_emit_consumer_present())
+		return OTEL_SAMPLE_DROP;
+
+	/* Gate 3: force-on overrides propagation entirely */
 	if (otel_trace_all_queries)
 		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
 
-	/* Gate 3: no propagated context */
-	otel_api->get_root_context_snapshot(&rc);
+	/* Gate 4: no propagated context */
+	api->get_root_context_snapshot(&rc);
 	if (!rc.is_set)
 		return OTEL_SAMPLE_DROP;
 
-	/* Gates 4-6: policy-driven dispatch handled inside the api. */
+	/* Gates 5-7: policy-driven dispatch handled inside the api. */
 	{
 		OtelSamplerInput in;
 
@@ -469,7 +476,7 @@ decide_whether_to_record(const char *name_hint)
 		in.name = name_hint;
 		in.kind = OTEL_SPAN_KIND_SERVER;
 
-		return otel_api->compute_sampler_decision(&in, rc.sampled_flag_set);
+		return api->compute_sampler_decision(&in, rc.sampled_flag_set);
 	}
 }
 
@@ -481,17 +488,21 @@ static void
 otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	OtelSamplerDecision decision;
+	const OtelTracingApi *api;
 
 	/*
 	 * If no in-memory context yet (no 'M' header, no SET) AND
 	 * sqlcommenter parsing is enabled (checked inside the api),
-	 * try the SQL text.  No-op when sqlcommenter is disabled.
+	 * try the SQL text.  No-op when sqlcommenter is disabled or
+	 * the provider is absent.
 	 */
+	api = otel_pg_ensure();
+	if (api != NULL)
 	{
 		OtelRootContextSnapshot rc_pre;
-		otel_api->get_root_context_snapshot(&rc_pre);
+		api->get_root_context_snapshot(&rc_pre);
 		if (!rc_pre.is_set && queryDesc != NULL)
-			(void) otel_api->try_apply_sqlcommenter_context(queryDesc->sourceText);
+			(void) api->try_apply_sqlcommenter_context(queryDesc->sourceText);
 	}
 
 	decision = decide_whether_to_record("pgsql.execute");
@@ -662,12 +673,17 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	if (context == PROCESS_UTILITY_TOPLEVEL && !span_active)
 	{
 		/* sqlcommenter fallback --- see equivalent block in
-		 * otel_ExecutorStart for rationale. */
+		 * otel_ExecutorStart for rationale.  No-op when provider absent. */
 		{
-			OtelRootContextSnapshot rc_pre;
-			otel_api->get_root_context_snapshot(&rc_pre);
-			if (!rc_pre.is_set)
-				(void) otel_api->try_apply_sqlcommenter_context(queryString);
+			const OtelTracingApi *api2 = otel_pg_ensure();
+
+			if (api2 != NULL)
+			{
+				OtelRootContextSnapshot rc_pre;
+				api2->get_root_context_snapshot(&rc_pre);
+				if (!rc_pre.is_set)
+					(void) api2->try_apply_sqlcommenter_context(queryString);
+			}
 		}
 
 		decision = decide_whether_to_record("pgsql.utility");
