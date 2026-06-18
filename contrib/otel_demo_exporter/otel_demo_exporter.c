@@ -31,6 +31,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -42,7 +43,7 @@
 #include "utils/guc.h"
 #include "utils/json.h"
 
-#include <otel_api/otel.h>
+#include <otel_api/otel_api.h>
 
 PG_MODULE_MAGIC;
 
@@ -217,33 +218,34 @@ otel_demo_exporter_emit(const OtelSpan *span)
 
 void		_PG_init(void);
 
+/*
+ * Pending-registration node for the two-phase deferred registration
+ * path (when this module loads before otel_api).  Allocated once in
+ * TopMemoryContext at _PG_init time and held for the backend's
+ * lifetime; the provider drains it at its own _PG_init.
+ */
+static OtelPendingRegistration pending_reg;
+
 void
 _PG_init(void)
 {
-	void	  **slot;
-	const OtelTracingApi *api;
-
-	if (!process_shared_preload_libraries_in_progress)
-		ereport(ERROR,
-				(errmsg("otel_demo_exporter must be loaded via shared_preload_libraries")));
-
-	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
-	api = (const OtelTracingApi *) *slot;
-	if (api == NULL)
-		ereport(ERROR,
-				(errmsg("otel_demo_exporter requires contrib/otel to be loaded first"),
-				 errhint("Add 'otel' before 'otel_demo_exporter' in shared_preload_libraries.")));
-	if (OTEL_API_MAJOR(api->version) != OTEL_TRACING_API_MAJOR ||
-		api->struct_size < sizeof(*api))
-		ereport(ERROR,
-				(errmsg("OtelTracingApi compatibility check failed"),
-				 errdetail("Loaded otel_api exposes api version %u.%u (struct_size %u); otel_demo_exporter was built against version %u.%u (struct_size %zu).",
-						   OTEL_API_MAJOR(api->version),
-						   OTEL_API_MINOR(api->version),
-						   api->struct_size,
-						   OTEL_TRACING_API_MAJOR,
-						   OTEL_TRACING_API_MINOR,
-						   sizeof(*api))));
+	/*
+	 * No load-time guard.  This module may be loaded via any preload
+	 * mechanism (shared, session, local) or via a direct LOAD command.
+	 *
+	 *  - shared_preload_libraries: cluster-wide, covers every backend
+	 *    (recommended for production).
+	 *  - session_preload_libraries / local_preload_libraries: per-role
+	 *    or per-database, no cluster restart required.  All three
+	 *    preload mechanisms run _PG_init before any query, so no spans
+	 *    are missed.
+	 *  - LOAD / function-triggered: best-effort — captures spans from
+	 *    registration onward in the current backend only.  No ERROR.
+	 *
+	 * The provider (otel_api) must still be loaded at backend start via
+	 * some preload mechanism; the guard loosening here applies to this
+	 * consumer only.
+	 */
 
 	DefineCustomStringVariable("otel_demo_exporter.output_file",
 							   "Path of the JSON-lines file to write spans to.",
@@ -256,6 +258,15 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("otel_demo_exporter");
 
-	api->register_emit_hook(otel_demo_exporter_emit, &prev_emit_hook);
+	/*
+	 * Register via the order-independent helper.  If the provider is
+	 * already present, this registers immediately.  If not, the request
+	 * is queued and the provider drains it when it publishes its slot.
+	 */
+	memset(&pending_reg, 0, sizeof(pending_reg));
+	pending_reg.emit_hook = otel_demo_exporter_emit;
+	pending_reg.emit_prev_out = &prev_emit_hook;
+	otel_api_register_when_ready(&pending_reg);
+
 	on_proc_exit(close_output, (Datum) 0);
 }
