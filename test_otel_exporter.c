@@ -35,7 +35,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
-#include <otel_api/otel.h>
+#include <otel_api/otel_api.h>
 
 PG_MODULE_MAGIC;
 
@@ -297,39 +297,23 @@ otel_test_sampler_hook(const OtelSamplerInput *in)
 
 void		_PG_init(void);
 
+/*
+ * Pending-registration node for the two-phase deferred registration
+ * path (when this module loads before otel_api).  Allocated in the
+ * global BSS; filled and registered at _PG_init.  The provider drains
+ * it when it publishes its slot.
+ */
+static OtelPendingRegistration pending_reg;
+
 void
 _PG_init(void)
 {
-	void	  **slot;
-
-	if (!process_shared_preload_libraries_in_progress)
-		ereport(ERROR,
-				(errmsg("test_otel_exporter must be loaded via shared_preload_libraries")));
-
 	/*
-	 * Locate contrib/otel's API table via its rendezvous variable.
-	 * If the slot is NULL the operator has misordered
-	 * shared_preload_libraries: contrib/otel must come BEFORE this
-	 * module so that its _PG_init has populated the slot.
+	 * No load-time guard.  See otel_demo_exporter._PG_init for the
+	 * rationale.  All preload mechanisms (shared, session, local) and
+	 * a direct LOAD are accepted; the provider is resolved via
+	 * otel_api_register_when_ready() below.
 	 */
-	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
-	cached_api = (const OtelTracingApi *) *slot;
-	if (cached_api == NULL)
-		ereport(ERROR,
-				(errmsg("test_otel_exporter requires contrib/otel to be loaded first"),
-				 errhint("Add 'otel' before '%s' in shared_preload_libraries.",
-						 "test_otel_exporter")));
-	if (OTEL_API_MAJOR(cached_api->version) != OTEL_TRACING_API_MAJOR ||
-		cached_api->struct_size < sizeof(*cached_api))
-		ereport(ERROR,
-				(errmsg("OtelTracingApi compatibility check failed"),
-				 errdetail("Loaded otel_api exposes api version %u.%u (struct_size %u); this module was built against version %u.%u (struct_size %zu).",
-						   OTEL_API_MAJOR(cached_api->version),
-						   OTEL_API_MINOR(cached_api->version),
-						   cached_api->struct_size,
-						   OTEL_TRACING_API_MAJOR,
-						   OTEL_TRACING_API_MINOR,
-						   sizeof(*cached_api))));
 
 	otel_test_cxt = AllocSetContextCreate(TopMemoryContext,
 										  "test_otel_exporter",
@@ -352,10 +336,33 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("test_otel_exporter");
 
-	cached_api->register_emit_hook(otel_test_emit_hook, &prev_emit_hook);
-	cached_api->register_sampler_hook(otel_test_sampler_hook, &prev_sampler_hook);
+	/*
+	 * Two-phase deferred registration.  If otel_api is already present
+	 * (provider loads first), register immediately.  Otherwise the
+	 * request is queued and the provider drains it when it publishes.
+	 *
+	 * The tracer handle (test_tracer) is registered here too; it will
+	 * be populated either immediately or when the provider drains.
+	 * SQL surface functions that need cached_api use otel_api_get()
+	 * at call time rather than relying on it being non-NULL here.
+	 */
+	memset(&pending_reg, 0, sizeof(pending_reg));
+	pending_reg.emit_hook = otel_test_emit_hook;
+	pending_reg.emit_prev_out = &prev_emit_hook;
+	pending_reg.sampler_hook = otel_test_sampler_hook;
+	pending_reg.sampler_prev_out = &prev_sampler_hook;
+	pending_reg.tracer_name = "test_otel_exporter";
+	pending_reg.tracer_version = "1.0";
+	pending_reg.tracer_schema_url = NULL;
+	pending_reg.tracer_out = (const OtelInstrumentationScope **) &test_tracer;
+	otel_api_register_when_ready(&pending_reg);
 
-	test_tracer = cached_api->tracer_register("test_otel_exporter", "1.0", NULL);
+	/*
+	 * Populate cached_api so the SQL surface functions work.  If the
+	 * provider loaded after us (deferred path), cached_api is still
+	 * NULL here; the SQL functions call otel_api_get() themselves.
+	 */
+	cached_api = otel_api_get();
 }
 
 /* ----- SQL surface ----- */
@@ -485,6 +492,7 @@ test_otel_set_policy(PG_FUNCTION_ARGS)
 	text	   *t = PG_GETARG_TEXT_PP(0);
 	const char *s = text_to_cstring(t);
 	OtelSamplerHookPolicy policy;
+	const OtelTracingApi *api;
 
 	if (strcmp(s, "hook_on_unsampled_bit") == 0)
 		policy = OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT;
@@ -500,7 +508,12 @@ test_otel_set_policy(PG_FUNCTION_ARGS)
 				 errmsg("invalid sampler-hook policy: %s", s),
 				 errhint("Valid: hook_on_unsampled_bit, hook_always, never_respect_bit, never_always_sample.")));
 
-	cached_api->set_sampler_policy(policy);
+	api = cached_api ? cached_api : otel_api_get();
+	if (api == NULL)
+		ereport(ERROR,
+				(errmsg("test_otel_set_policy: otel_api provider is not available")));
+	cached_api = api;
+	api->set_sampler_policy(policy);
 	PG_RETURN_VOID();
 }
 
@@ -526,6 +539,17 @@ test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
 	int			depth_during;
 	int			depth_after;
 	const OtelSpanContext *ctx;
+	const OtelTracingApi *api;
+
+	/*
+	 * Lazy resolution: if the provider loaded after us, cached_api may
+	 * still be NULL at _PG_init time; resolve it here.
+	 */
+	api = cached_api ? cached_api : otel_api_get();
+	if (api == NULL)
+		ereport(ERROR,
+				(errmsg("test_otel_producer_roundtrip: otel_api provider is not available")));
+	cached_api = api;
 
 	/*
 	 * Copy the name into long-lived storage so it stays valid through
@@ -534,32 +558,32 @@ test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
 	 */
 	name = text_to_cstring(name_arg);
 
-	depth_before = cached_api->span_stack_depth();
+	depth_before = api->span_stack_depth();
 
-	cached_api->span_init(&span, test_tracer, name, OTEL_SPAN_KIND_INTERNAL);
+	api->span_init(&span, test_tracer, name, OTEL_SPAN_KIND_INTERNAL);
 	otel_span_set_unwind_policy(&span, OTEL_UNWIND_DROP);
 
-	cached_api->span_link_to_active_and_push(&span);
+	api->span_link_to_active_and_push(&span);
 
-	depth_during = cached_api->span_stack_depth();
+	depth_during = api->span_stack_depth();
 	if (depth_during != depth_before + 1)
 		elog(ERROR, "producer roundtrip: stack depth did not increase (before=%d during=%d)",
 			 depth_before, depth_during);
 
 	/* Verify span_current_context returns this span. */
-	ctx = cached_api->span_current_context();
+	ctx = api->span_current_context();
 	if (ctx == NULL || strcmp(ctx->span_id, span.span_id) != 0)
 		elog(ERROR, "producer roundtrip: span_current_context did not return the pushed span (ctx=%s pushed=%s)",
 			 ctx ? ctx->span_id : "(null)", span.span_id);
 
-	cached_api->span_add_attribute_string(&span, "test.case", "roundtrip");
-	cached_api->span_add_attribute_string(&span, "test.name", name);
+	api->span_add_attribute_string(&span, "test.case", "roundtrip");
+	api->span_add_attribute_string(&span, "test.name", name);
 	otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
 	otel_span_finalize(&span);
 
-	cached_api->span_emit(&span);
+	api->span_emit(&span);
 
-	depth_after = cached_api->span_stack_depth();
+	depth_after = api->span_stack_depth();
 	if (depth_after != depth_before)
 		elog(ERROR, "producer roundtrip: stack depth did not return to baseline (before=%d after=%d)",
 			 depth_before, depth_after);
@@ -582,8 +606,15 @@ test_otel_resource_attributes(PG_FUNCTION_ARGS)
 	const OtelResourceAttribute *attrs;
 	int			n_attrs = 0;
 	StringInfoData buf;
+	const OtelTracingApi *api;
 
-	attrs = cached_api->get_resource_attributes(&n_attrs);
+	api = cached_api ? cached_api : otel_api_get();
+	if (api == NULL)
+		ereport(ERROR,
+				(errmsg("test_otel_resource_attributes: otel_api provider is not available")));
+	cached_api = api;
+
+	attrs = api->get_resource_attributes(&n_attrs);
 
 	initStringInfo(&buf);
 	for (int i = 0; i < n_attrs; i++)
