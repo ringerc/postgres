@@ -2286,6 +2286,28 @@ ProcessRepliesIfAny(void)
 			case PqMsg_Terminate:
 				maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
 				break;
+			case PqMsg_TraceContext:
+				/*
+				 * TraceContext ('M') is only valid at top-level command
+				 * state, not mid-streaming.  Consume the message body first
+				 * (so PqCommReadingMsg is cleared and the session can
+				 * recover via the sigsetjmp in PostgresMain), then reject
+				 * with ERROR (not FATAL).  Trace context is advisory; a
+				 * misbehaving client sending 'M' here must not kill the
+				 * walsender.
+				 */
+				resetStringInfo(&reply_message);
+				if (pq_getmessage(&reply_message, PQ_SMALL_MESSAGE_LIMIT))
+				{
+					ereport(COMMERROR,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+							 errmsg("unexpected EOF on standby connection")));
+					proc_exit(0);
+				}
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("TraceContext message not allowed during streaming replication")));
+				break;	/* not reached */
 			default:
 				ereport(FATAL,
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),

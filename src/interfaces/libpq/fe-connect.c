@@ -714,6 +714,13 @@ pqDropServerData(PGconn *conn)
 		}
 		conn->be_cancel_key_len = 0;
 	}
+
+	/*
+	 * Drop any pending trace context.  A fresh handshake may negotiate a
+	 * different protocol version; carrying armed state across a reset could
+	 * send stale trace context on a connection that no longer supports it.
+	 */
+	pqReleaseTraceContext(conn);
 }
 
 
@@ -5123,6 +5130,10 @@ freePGconn(PGconn *conn)
 	free(conn->inBuffer);
 	free(conn->outBuffer);
 	free(conn->rowBuf);
+
+	/* Drop any pending trace context. */
+	pqReleaseTraceContext(conn);
+
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 

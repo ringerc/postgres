@@ -6224,6 +6224,51 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
     </listitem>
    </varlistentry>
 
+   <varlistentry id="protocol-message-formats-TraceContext">
+    <term>TraceContext (F)</term>
+    <listitem>
+     <variablelist>
+      <varlistentry>
+       <term>Byte1('M')</term>
+       <listitem>
+        <para>
+         Identifies the message as a trace context message.
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term>Int32</term>
+       <listitem>
+        <para>
+         Length of message contents in bytes, including self.
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term>String</term>
+       <listitem>
+        <para>
+         The traceparent string, in W3C Trace Context format
+         (<literal>version-traceid-parentid-flags</literal>).
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term>String</term>
+       <listitem>
+        <para>
+         The tracestate string, in W3C Trace Context format.
+         May be empty.
+        </para>
+       </listitem>
+      </varlistentry>
+     </variablelist>
+    </listitem>
+   </varlistentry>
+
    <varlistentry id="protocol-message-formats-Terminate">
     <term>Terminate (F)</term>
     <listitem>

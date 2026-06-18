@@ -5244,6 +5244,156 @@ unsigned char *PQunescapeBytea(const unsigned char *from, size_t *to_length);
 
  </sect1>
 
+ <sect1 id="libpq-trace-context">
+  <title>Trace Context Propagation</title>
+
+  <indexterm zone="libpq-trace-context">
+   <primary>trace context</primary>
+  </indexterm>
+  <indexterm zone="libpq-trace-context">
+   <primary>TraceContext message</primary>
+  </indexterm>
+
+  <para>
+   Applications can attach a W3C Trace Context (traceparent and
+   tracestate strings) to the next operation sent to the server.  The
+   strings travel in a single <literal>TraceContext</literal>
+   (<literal>'M'</literal>) protocol message that precedes the
+   operation.  On the server side, a loadable extension may register
+   a handler via <function>RegisterTraceContextHandler</function> to
+   receive the values and, for example, record them in OpenTelemetry
+   spans.
+  </para>
+
+  <para>
+   Trace context is advisory only.  It is intended to carry
+   observability metadata and <emphasis>must not</emphasis> be used
+   for authorization decisions or as the basis of row-level security
+   predicates.  Authentication is handled by the connection's
+   authentication exchange, not by these messages.
+  </para>
+
+  <para>
+   The feature is available on protocol 3.3 connections.
+   <application>libpq</application> uses protocol 3.3 by default when
+   connecting to a server that supports it.  Use
+   <xref linkend="libpq-PQtraceContextAvailable"/> to check whether
+   the current connection supports trace-context messages.
+  </para>
+
+  <variablelist>
+   <varlistentry id="libpq-PQsetTraceContext">
+    <term><function>PQsetTraceContext</function><indexterm><primary>PQsetTraceContext</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Arms the connection to send a
+      <literal>TraceContext</literal> message before every subsequent
+      operation, until the context is replaced or released.
+
+<synopsis>
+int PQsetTraceContext(PGconn *conn, const char *traceparent, const char *tracestate);
+</synopsis>
+     </para>
+
+     <para>
+      Sets a persistent trace context on the connection.  After a
+      successful call, a <literal>TraceContext</literal> message
+      carrying the given <parameter>traceparent</parameter> and
+      <parameter>tracestate</parameter> values is sent immediately
+      before each of
+      <xref linkend="libpq-PQexec"/>,
+      <xref linkend="libpq-PQexecParams"/>,
+      <xref linkend="libpq-PQprepare"/>,
+      <xref linkend="libpq-PQexecPrepared"/>,
+      <xref linkend="libpq-PQsendQuery"/>,
+      <xref linkend="libpq-PQsendQueryParams"/>,
+      <xref linkend="libpq-PQsendPrepare"/>, and
+      <xref linkend="libpq-PQsendQueryPrepared"/>.
+      The context persists across pipeline re-arm cycles until
+      explicitly replaced by another call to
+      <function>PQsetTraceContext</function> or released by calling
+      <xref linkend="libpq-PQattachTraceContext"/> with
+      <symbol>NULL</symbol> arguments or
+      <xref linkend="libpq-PQtraceContextAvailable"/> returning
+      <literal>0</literal>.
+     </para>
+
+     <para>
+      <parameter>tracestate</parameter> may be <symbol>NULL</symbol>
+      or an empty string if there is no tracestate to propagate.
+      Returns <literal>1</literal> on success, <literal>0</literal>
+      on failure (out-of-memory or protocol version too old).
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="libpq-PQattachTraceContext">
+    <term><function>PQattachTraceContext</function><indexterm><primary>PQattachTraceContext</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Sends a <literal>TraceContext</literal> message once, before
+      the next operation, then clears the stored context.
+
+<synopsis>
+int PQattachTraceContext(PGconn *conn, const char *traceparent, const char *tracestate);
+</synopsis>
+     </para>
+
+     <para>
+      Unlike <xref linkend="libpq-PQsetTraceContext"/>, the context
+      set by this function is consumed by the next operation and is
+      not re-sent for subsequent operations.  This is useful when
+      each query carries a distinct trace context (for example, when
+      the application issues queries on behalf of multiple
+      independent client requests over the same connection).
+     </para>
+
+     <para>
+      <parameter>tracestate</parameter> may be <symbol>NULL</symbol>
+      or an empty string.  Returns <literal>1</literal> on success,
+      <literal>0</literal> on failure.  Passing <symbol>NULL</symbol>
+      for both arguments releases any pending one-shot context without
+      sending it.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="libpq-PQtraceContextAvailable">
+    <term><function>PQtraceContextAvailable</function><indexterm><primary>PQtraceContextAvailable</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Reports whether the connection supports
+      <literal>TraceContext</literal> messages.
+
+<synopsis>
+int PQtraceContextAvailable(const PGconn *conn);
+</synopsis>
+     </para>
+
+     <para>
+      Returns <literal>1</literal> if the negotiated protocol version
+      is 3.3 or later, and <literal>0</literal> otherwise.  The result
+      is meaningful only after the connection has reached
+      <literal>CONNECTION_OK</literal>.
+     </para>
+
+     <para>
+      <xref linkend="libpq-PQattachTraceContext"/> and
+      <xref linkend="libpq-PQsetTraceContext"/> also return
+      <literal>0</literal> when this function would return
+      <literal>0</literal>, so applications that do not need to
+      distinguish version-capable from non-capable connections can
+      simply react to the return value of those functions instead.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+
+ </sect1>
+
  <sect1 id="libpq-async">
   <title>Asynchronous Command Processing</title>
 

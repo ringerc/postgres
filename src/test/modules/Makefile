@@ -10,8 +10,10 @@ SUBDIRS = \
 		  delay_execution \
 		  dummy_index_am \
 		  dummy_seclabel \
+		  libpq_trace_context \
 		  libpq_pipeline \
 		  oauth_validator \
+		  otel_test_exporter \
 		  plsample \
 		  spgist_name_ops \
 		  test_aio \
@@ -23,6 +25,7 @@ SUBDIRS = \
 		  test_ddl_deparse \
 		  test_dsa \
 		  test_dsm_registry \
+		  test_elog_annotations \
 		  test_escape \
 		  test_extensions \
 		  test_ginpostinglist \
@@ -34,6 +37,7 @@ SUBDIRS = \
 		  test_parser \
 		  test_pg_dump \
 		  test_predtest \
+		  test_trace_context \
 		  test_radixtree \
 		  test_rbtree \
 		  test_regex \

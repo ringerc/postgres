@@ -91,6 +91,11 @@
 					# disconnection while running queries;
 					# 0 for never
 
+# - Trace context -
+
+#trace_context_enabled = on		# accept TraceContext ('M') messages
+					# from protocol 3.3 clients
+
 # - Authentication -
 
 #authentication_timeout = 1min		# 1s-600s

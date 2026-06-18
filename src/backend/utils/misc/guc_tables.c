@@ -54,6 +54,7 @@
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
 #include "libpq/oauth.h"
+#include "libpq/trace_context.h"
 #include "libpq/scram.h"
 #include "nodes/queryjumble.h"
 #include "optimizer/cost.h"
@@ -1094,6 +1095,18 @@ struct config_bool ConfigureNamesBool[] =
 		&enable_bonjour,
 		false,
 		check_bonjour, NULL, NULL
+	},
+	{
+		{"trace_context_enabled", PGC_SIGHUP, CONN_AUTH_SETTINGS,
+			gettext_noop("Accept trace-context ('M') protocol messages from clients."),
+			gettext_noop("Runtime kill-switch for the trace-context protocol message. "
+						 "When off, any incoming TraceContext message is a protocol "
+						 "violation even from a 3.3 client. Clients at protocol 3.3 "
+						 "still connect normally.")
+		},
+		&trace_context_enabled,
+		true,
+		NULL, NULL, NULL
 	},
 	{
 		{"track_commit_timestamp", PGC_POSTMASTER, REPLICATION_SENDING,

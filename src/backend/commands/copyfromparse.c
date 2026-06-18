@@ -288,6 +288,26 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 						case PqMsg_Sync:
 							maxmsglen = PQ_SMALL_MESSAGE_LIMIT;
 							break;
+						case PqMsg_TraceContext:
+							/*
+							 * TraceContext ('M') is only valid at top-level
+							 * command state, not mid-COPY-in.  Consume the
+							 * message body first (so the socket stays in sync
+							 * and the session can survive the ERROR) then
+							 * reject with ERRCODE_PROTOCOL_VIOLATION.
+							 * ERROR not FATAL: trace context is advisory and
+							 * a misbehaving client must not kill the session.
+							 */
+							if (pq_getmessage(cstate->fe_msgbuf,
+											  PQ_SMALL_MESSAGE_LIMIT))
+								ereport(ERROR,
+										(errcode(ERRCODE_CONNECTION_FAILURE),
+										 errmsg("unexpected EOF on client connection with an open transaction")));
+							RESUME_CANCEL_INTERRUPTS();
+							ereport(ERROR,
+									(errcode(ERRCODE_PROTOCOL_VIOLATION),
+									 errmsg("TraceContext message not allowed during COPY from stdin")));
+							break;	/* not reached */
 						default:
 							ereport(ERROR,
 									(errcode(ERRCODE_PROTOCOL_VIOLATION),

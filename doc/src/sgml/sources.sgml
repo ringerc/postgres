@@ -391,6 +391,56 @@ ereport(ERROR,
      too much.
     </para>
    </listitem>
+   <listitem>
+    <para>
+     <function>errannot(const char *key, const char *value)</function> attaches
+     a structured key/value annotation to the current error report.  The
+     companion <function>errannotf(const char *key, const char *fmt, ...)</function>
+     accepts a <function>printf</function>-style format string.  Annotations
+     are surfaced in JSON log output as top-level keys, in CSV log output
+     as a single trailing JSON-encoded column, and via the
+     <literal>%A</literal> and <literal>%{key}A</literal> escapes in
+     <xref linkend="guc-log-line-prefix"/>.  They are not propagated over the
+     v3 error/notice wire protocol.  Setting the same key more than once on
+     a single error replaces the earlier value, so context callbacks can
+     override outer values predictably.
+    </para>
+    <para>
+     Keys must match the regular expression
+     <literal>[A-Za-z_][A-Za-z0-9_.:-]*</literal>.  Malformed keys are
+     silently ignored.  A fixed set of keys is reserved by the server for
+     the top-level JSON log fields it emits; the reserved set at the time of
+     this writing is
+     <literal>application_name</literal>, <literal>backend_type</literal>,
+     <literal>context</literal>, <literal>cursor_position</literal>,
+     <literal>dbname</literal>, <literal>detail</literal>,
+     <literal>error_severity</literal>, <literal>file_line_num</literal>,
+     <literal>file_name</literal>, <literal>func_name</literal>,
+     <literal>hint</literal>, <literal>internal_position</literal>,
+     <literal>internal_query</literal>, <literal>leader_pid</literal>,
+     <literal>line_num</literal>, <literal>message</literal>,
+     <literal>pg_rejected_annotations</literal>, <literal>pid</literal>,
+     <literal>ps</literal>, <literal>query_id</literal>,
+     <literal>remote_host</literal>, <literal>remote_port</literal>,
+     <literal>session_id</literal>, <literal>session_start</literal>,
+     <literal>state_code</literal>, <literal>statement</literal>,
+     <literal>timestamp</literal>, <literal>txid</literal>,
+     <literal>user</literal>, and <literal>vxid</literal>.
+     The set of reserved keys may grow in any future
+     <productname>PostgreSQL</productname> release, including minor
+     releases, whenever a new built-in field is added to the JSON log
+     record.  Extensions should namespace their keys (for example, by
+     prefixing the extension name as in <literal>myext.session_uuid</literal>
+     or following OpenTelemetry conventions such as <literal>db.system</literal>)
+     to minimize the risk of future collisions.  When
+     <function>errannot</function> is called with a reserved key, the
+     annotation is not attached and the rejected key name (but not its
+     value) is appended to a reserved aggregator annotation named
+     <literal>pg_rejected_annotations</literal>, which is visible through
+     all of the annotation output paths so that the rejection is
+     diagnosable from the log record.
+    </para>
+   </listitem>
   </itemizedlist>
    </para>
 

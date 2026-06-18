@@ -1,0 +1,4 @@
+comment = 'Test harness for errannot() / errannotf() plumbing'
+default_version = '1.0'
+module_pathname = '$libdir/test_elog_annotations'
+relocatable = true
