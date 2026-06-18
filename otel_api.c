@@ -35,6 +35,7 @@
 #include "fmgr.h"
 
 #include "otel.h"
+#include "otel_api.h"
 #include "otel_internal.h"
 
 /*
@@ -225,15 +226,59 @@ static const OtelTracingApi otel_tracing_api = {
  * out-of-tree exporter / SDK modules can register callbacks without
  * taking a direct symbol-level link dependency on contrib/otel.
  * Called once from _PG_init.
+ *
+ * After publishing the main slot, drain the pending-registration list
+ * (OTEL_TRACING_API_PENDING_NAME) accumulated by exporters and
+ * producers that loaded before us.  This handles the
+ * "exporter first, provider second" ordering without requiring any
+ * particular position in shared_preload_libraries.
  */
 void
 otel_api_publish_rendezvous(void)
 {
 	void	  **slot;
+	void	  **pending_slot;
+	OtelPendingRegistration *req;
 
 	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
 	Assert(slot != NULL);		/* HASH_ENTER ereports on OOM, never returns NULL */
 	*slot = (void *) &otel_tracing_api;
+
+	/*
+	 * Drain the pending list.  Each node was pushed by an exporter or
+	 * producer whose _PG_init ran before ours.  Process in push order
+	 * (which is LIFO from the list head): this matches the "last
+	 * registered wins" semantic already established by the hook chain.
+	 */
+	pending_slot = find_rendezvous_variable(OTEL_TRACING_API_PENDING_NAME);
+	Assert(pending_slot != NULL);
+	req = (OtelPendingRegistration *) *pending_slot;
+	/* Clear the slot so any late-loading modules that check it see NULL. */
+	*pending_slot = NULL;
+
+	while (req != NULL)
+	{
+		OtelPendingRegistration *next = req->next;
+
+		if (req->emit_hook)
+			otel_tracing_api.register_emit_hook(req->emit_hook,
+												req->emit_prev_out);
+		if (req->sampler_hook)
+			otel_tracing_api.register_sampler_hook(req->sampler_hook,
+												   req->sampler_prev_out);
+		if (req->tracer_name)
+		{
+			const OtelInstrumentationScope *scope =
+				otel_tracing_api.tracer_register(req->tracer_name,
+												 req->tracer_version,
+												 req->tracer_schema_url);
+
+			if (req->tracer_out)
+				*req->tracer_out = scope;
+		}
+
+		req = next;
+	}
 }
 
 

@@ -98,16 +98,15 @@
  * Rendezvous variable name (subject to NAMEDATALEN, currently 64).
  * The variable's value is a `OtelTracingApi *` installed by
  * contrib/otel's _PG_init.  External consumers retrieve it via
+ * otel_api_get() (see below) rather than directly.
  *
- *	 void **slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
- *	 const OtelTracingApi *api = (const OtelTracingApi *) *slot;
- *
- * The slot is NULL until contrib/otel has been preloaded.  An
- * exporter loaded WITHOUT contrib/otel in shared_preload_libraries
- * MUST ereport(ERROR) on a NULL api pointer and tell the user to
- * add 'otel' before this module in the preload list.
+ * A second rendezvous variable (OTEL_TRACING_API_PENDING_NAME) holds
+ * the head of a linked list of OtelPendingRegistration nodes enqueued
+ * by exporters/producers that load before otel_api.  The provider
+ * drains this list when it publishes the API slot.
  */
 #define OTEL_TRACING_API_RENDEZVOUS_NAME	"OtelTracingApi"
+#define OTEL_TRACING_API_PENDING_NAME		"OtelTracingApiPending"
 
 /*
  * The api table itself.  All function pointers are populated by
@@ -409,5 +408,205 @@ typedef struct OtelTracingApi
 												  const char *version,
 												  const char *schema_url);
 } OtelTracingApi;
+
+
+/* -----------------------------------------------------------------------
+ * Order-independent rendezvous helpers (T8)
+ * -----------------------------------------------------------------------
+ *
+ * These are header-only so every consumer TU gets them without adding
+ * link-time dependencies on otel_api's internal symbols.
+ *
+ * otel_api_get() — static-first lazy getter
+ * -----------------------------------------
+ * Returns the cached OtelTracingApi pointer, or NULL when the provider
+ * is absent or incompatible.  Safe to call at any time after _PG_init
+ * completes (i.e., on any hot path).
+ *
+ * Design:
+ *   - First call (cache == NULL) walks the rendezvous variable, validates
+ *     the version + struct_size, and caches the result — either the real
+ *     pointer or the OTEL_API_MISSING sentinel.
+ *   - Subsequent calls cost one pointer-compare (the branch predictor
+ *     learns the common value almost immediately).
+ *   - Correct because all _PG_init callbacks finish before the first
+ *     query executes; by the time any hot-path code calls this function
+ *     every preloaded extension has already published its rendezvous slot.
+ *   - A function-local static avoids the file-scope unused-variable
+ *     warning in TUs that include the header but never call the getter.
+ *
+ * OTEL_API_MISSING sentinel
+ * -------------------------
+ * A non-NULL sentinel stored in the per-TU cache when the provider is
+ * absent or incompatible.  Subsequent calls short-circuit and return NULL
+ * without touching the rendezvous table again.  The macro is a cast
+ * expression (no storage) so it never triggers an unused-variable warning.
+ *
+ * OtelPendingRegistration / otel_api_register_when_ready()
+ * ---------------------------------------------------------
+ * Exporters call otel_api_register_when_ready() from _PG_init instead
+ * of reaching directly into find_rendezvous_variable.  If the provider
+ * is already present, registration happens immediately; otherwise the
+ * request is pushed onto a pending list stored in the
+ * OTEL_TRACING_API_PENDING_NAME rendezvous slot.  The provider drains
+ * that list when it publishes its own slot in otel_api_publish_rendezvous().
+ *
+ * This supports both orderings:
+ *   Provider first  → immediate registration on the exporter's _PG_init.
+ *   Exporter first  → deferred registration, drained at provider _PG_init.
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Sentinel for "looked up once; provider absent or incompatible."
+ * Cast to const OtelTracingApi * so it is assignment-compatible with
+ * the cache variable, but it is never a real pointer.
+ */
+#define OTEL_API_MISSING  ((const OtelTracingApi *) (uintptr_t) -1)
+
+/*
+ * otel_api_get() — header-only lazy getter.
+ *
+ * Returns a valid OtelTracingApi pointer, or NULL when the provider is
+ * absent or incompatible.  A WARNING is emitted once (per TU's cache
+ * slot) on the incompatible case; the absent case is silent.
+ *
+ * Callers MUST include "fmgr.h" (declares find_rendezvous_variable) and
+ * "utils/elog.h" (declares ereport / errmsg / errdetail) before this
+ * header, OR simply include "postgres.h" which pulls both transitively.
+ * In practice every .c file that uses PostgreSQL APIs already includes
+ * "postgres.h", so no additional include is needed.
+ */
+static inline const OtelTracingApi *
+otel_api_get(void)
+{
+	/*
+	 * Per-TU static cache.  NULL = not yet resolved; OTEL_API_MISSING =
+	 * resolved and absent/incompatible; anything else = the real pointer.
+	 *
+	 * Function-local rather than file-scope to suppress -Wunused-variable
+	 * in TUs that include the header but never call this function.
+	 */
+	static const OtelTracingApi *cache = NULL;
+
+	if (cache != NULL)
+		return (cache == OTEL_API_MISSING) ? NULL : cache;
+
+	{
+		void	  **slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
+		const OtelTracingApi *api = slot ? (const OtelTracingApi *) *slot : NULL;
+
+		if (api == NULL)
+		{
+			/* Provider absent — silent no-op; cache sentinel. */
+			cache = OTEL_API_MISSING;
+			return NULL;
+		}
+		if (OTEL_API_MAJOR(api->version) != OTEL_TRACING_API_MAJOR ||
+			api->struct_size < sizeof(OtelTracingApi))
+		{
+			/* Present but incompatible — warn ONCE, then no-op. */
+			ereport(WARNING,
+					(errmsg("OtelTracingApi compatibility check failed"),
+					 errdetail("Loaded otel_api exposes api version %u.%u"
+							   " (struct_size %u);"
+							   " this module was built against version %u.%u"
+							   " (struct_size %zu).",
+							   OTEL_API_MAJOR(api->version),
+							   OTEL_API_MINOR(api->version),
+							   api->struct_size,
+							   OTEL_TRACING_API_MAJOR,
+							   OTEL_TRACING_API_MINOR,
+							   sizeof(OtelTracingApi))));
+			cache = OTEL_API_MISSING;
+			return NULL;
+		}
+		cache = api;
+		return cache;
+	}
+}
+
+
+/*
+ * Pending-registration node.  Exporters (and producers, if they want to
+ * use this path) allocate one in TopMemoryContext and push it onto the
+ * pending list before the provider drains it.
+ *
+ * Only the fields relevant to each caller need to be non-NULL.  The
+ * provider calls the non-NULL ones in push order.
+ */
+typedef struct OtelPendingRegistration
+{
+	/* Emit hook to register, or NULL. */
+	otel_span_emit_hook_type emit_hook;
+	otel_span_emit_hook_type *emit_prev_out;
+
+	/* Sampler hook to register, or NULL. */
+	otel_sampler_hook_type sampler_hook;
+	otel_sampler_hook_type *sampler_prev_out;
+
+	/* tracer_register() arguments, or NULL name to skip. */
+	const char *tracer_name;
+	const char *tracer_version;
+	const char *tracer_schema_url;
+	/* Output slot for the returned tracer handle; NULL to discard. */
+	const OtelInstrumentationScope **tracer_out;
+
+	struct OtelPendingRegistration *next;
+} OtelPendingRegistration;
+
+
+/*
+ * otel_api_register_when_ready() — order-independent registration helper.
+ *
+ * If the provider is already present (otel_api_get() non-NULL), register
+ * immediately via the real API entry points.  Otherwise push the request
+ * onto the pending list; the provider drains it when it publishes its
+ * rendezvous slot.
+ *
+ * *req must have process/static lifetime: either a file-static node (BSS)
+ * or one allocated in TopMemoryContext.  Both are correct because the
+ * provider may drain the pending list long after the caller's _PG_init
+ * stack frame has returned; the node must remain valid until then.
+ * All pointer fields in *req that the caller does not use must be NULL.
+ */
+static inline void
+otel_api_register_when_ready(OtelPendingRegistration *req)
+{
+	const OtelTracingApi *api = otel_api_get();
+
+	if (api != NULL)
+	{
+		/* Provider already present: register immediately. */
+		if (req->emit_hook)
+			api->register_emit_hook(req->emit_hook, req->emit_prev_out);
+		if (req->sampler_hook)
+			api->register_sampler_hook(req->sampler_hook, req->sampler_prev_out);
+		if (req->tracer_name)
+		{
+			const OtelInstrumentationScope *scope =
+				api->tracer_register(req->tracer_name,
+									 req->tracer_version,
+									 req->tracer_schema_url);
+
+			if (req->tracer_out)
+				*req->tracer_out = scope;
+		}
+		return;
+	}
+
+	/*
+	 * Provider not yet present: push onto the pending list stored in the
+	 * second rendezvous variable.  The provider drains it at its own
+	 * _PG_init (otel_api_publish_rendezvous).
+	 */
+	{
+		void	  **pending_slot =
+			find_rendezvous_variable(OTEL_TRACING_API_PENDING_NAME);
+
+		/* find_rendezvous_variable never returns NULL (OOM = ereport). */
+		req->next = (OtelPendingRegistration *) *pending_slot;
+		*pending_slot = (void *) req;
+	}
+}
 
 #endif							/* CONTRIB_OTEL_API_H */
