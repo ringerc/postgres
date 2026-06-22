@@ -33,9 +33,11 @@
  */
 #include "postgres.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "access/xact.h"
+#include "commands/dbcommands.h"
 #include "executor/executor.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"

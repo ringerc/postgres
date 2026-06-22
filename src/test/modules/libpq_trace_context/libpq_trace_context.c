@@ -219,13 +219,29 @@ main(int argc, char **argv)
 	const char *conninfo;
 	const char *mode;
 	PGconn	   *conn;
+	char	   *conninfo_with_proto;
 
 	if (argc < 3)
 		usage(argv[0]);
 	conninfo = argv[1];
 	mode = argv[2];
 
-	conn = PQconnectdb(conninfo);
+	/*
+	 * Explicitly request the latest protocol so that PQtraceContextAvailable
+	 * returns 1 when connecting to a 3.3-capable server.  Without this, libpq
+	 * defaults to negotiating protocol 3.0 for backward compatibility with
+	 * older servers and pgbouncers.
+	 */
+	conninfo_with_proto = malloc(strlen(conninfo) + 32);
+	if (conninfo_with_proto == NULL)
+	{
+		fprintf(stderr, "libpq_trace_context: out of memory\n");
+		exit(1);
+	}
+	sprintf(conninfo_with_proto, "%s max_protocol_version=latest", conninfo);
+
+	conn = PQconnectdb(conninfo_with_proto);
+	free(conninfo_with_proto);
 	if (PQstatus(conn) != CONNECTION_OK)
 		die_connerr(conn, "connection failed");
 
