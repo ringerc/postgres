@@ -2,6 +2,7 @@
 
 otel_postgres_tracing_sources = files(
   'otel_log.c',
+  'otel_sdt_bridge.c',
   'otel_postgres_tracing.c',
   'otel_trace.c',
 )

@@ -4,6 +4,7 @@ MODULE_big = otel_postgres_tracing
 OBJS = \
 	$(WIN32RES) \
 	otel_log.o \
+	otel_sdt_bridge.o \
 	otel_postgres_tracing.o \
 	otel_trace.o
 
