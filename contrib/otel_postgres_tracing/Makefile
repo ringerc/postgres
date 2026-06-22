@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	otel_log.o \
 	otel_postgres_tracing.o \
+	otel_sdt_bridge.o \
 	otel_trace.o
 
 EXTENSION = otel_postgres_tracing
@@ -47,6 +48,12 @@ endif
 ifeq ($(ENABLE_ERRANNOT),1)
   PG_CPPFLAGS += -DOTEL_HAVE_ERRANNOT
 endif
+
+# The SDT-probe -> span bridge (otel_sdt_bridge.c) needs no build-system
+# feature detection: it is gated on PG_HAVE_SDT_PROBE_HOOK, which the core
+# patch advertises in <pg_config_manual.h>.  On a stock server that macro is
+# absent and the bridge compiles to a no-op stub, so the module builds and
+# loads with no unresolved pg_sdt_probe_hook symbol.
 
 ifdef USE_PGXS
 PGXS := $(shell $(PG_CONFIG) --pgxs)

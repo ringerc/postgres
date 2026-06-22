@@ -161,4 +161,5 @@ _PG_init(void)
 	 */
 	otel_trace_install_hooks();
 	otel_log_install_hooks();
+	otel_sdt_install();
 }
