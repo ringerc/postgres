@@ -135,6 +135,14 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 
 		data += sizeof(xl_xact_origin);
 	}
+
+	if (parsed->xinfo & XACT_XINFO_HAS_TRACE_CONTEXT)
+	{
+		/* no alignment is guaranteed, so copy onto the parsed struct */
+		memcpy(&parsed->trace_context, data, SizeOfXactTraceContext);
+		parsed->has_trace_context = true;
+		data += SizeOfXactTraceContext;
+	}
 }
 
 void
@@ -363,6 +371,14 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, ReplOriginId
 						 origin_id,
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));
+	}
+
+	if (parsed.has_trace_context)
+	{
+		char		traceparent[56];
+
+		format_traceparent(&parsed.trace_context, traceparent);
+		appendStringInfo(buf, "; trace_context: %s", traceparent);
 	}
 }
 

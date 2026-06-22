@@ -377,3 +377,4 @@
  * option --- do not comment it out.
  */
 #define PG_HAVE_SDT_PROBE_HOOK 1
+#define PG_HAVE_XACT_TRACE_CONTEXT 1

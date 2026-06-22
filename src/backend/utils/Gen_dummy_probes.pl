@@ -31,6 +31,9 @@ my %curated = (
 	'smgr__md__read__done'    => ['PG_SDT_SMGR_MD_READ_DONE',   ['i','i','i','i','i','i','i','i']],
 	'smgr__md__write__start'  => ['PG_SDT_SMGR_MD_WRITE_START', ['i','i','i','i','i','i']],
 	'smgr__md__write__done'   => ['PG_SDT_SMGR_MD_WRITE_DONE',  ['i','i','i','i','i','i','i','i']],
+	'syncrep__wait__start'    => ['PG_SDT_SYNCREP_WAIT_START',  ['i']],
+	'syncrep__wait__done'     => ['PG_SDT_SYNCREP_WAIT_DONE',   ['i']],
+	'recovery__xact__commit'  => ['PG_SDT_RECOVERY_XACT_COMMIT',['s','i']],
 );
 
 BEGIN { print "#include \"utils/pg_sdt_probe.h\"\n"; }

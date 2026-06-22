@@ -86,6 +86,7 @@
 #include "utils/guc_hooks.h"
 #include "utils/ps_status.h"
 #include "utils/wait_event.h"
+#include "pg_trace.h"
 
 /* User-settable parameters for sync rep */
 char	   *SyncRepStandbyNames;
@@ -263,6 +264,8 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 		set_ps_display_suffix(buffer);
 	}
 
+	TRACE_POSTGRESQL_SYNCREP_WAIT_START((long) lsn);
+
 	/*
 	 * Wait for specified LSN to be confirmed.
 	 *
@@ -362,6 +365,7 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 	 * changes to the queue link (this might be unnecessary without
 	 * assertions, but better safe than sorry).
 	 */
+	TRACE_POSTGRESQL_SYNCREP_WAIT_DONE((long) lsn);
 	pg_read_barrier();
 	Assert(dlist_node_is_detached(&MyProc->syncRepLinks));
 	MyProc->syncRepState = SYNC_REP_NOT_WAITING;
