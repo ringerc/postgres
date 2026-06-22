@@ -305,6 +305,14 @@ typedef struct OtelSpanEvent
 #define OTEL_INLINE_ATTRS 12
 
 /*
+ * Max span links stored inline.  A link associates this span with a
+ * related span in another trace (e.g. a transaction span <-> the query
+ * traces that ran within it).  Demo: fixed inline storage, no overflow;
+ * links past OTEL_INLINE_LINKS are dropped.
+ */
+#define OTEL_INLINE_LINKS 16
+
+/*
  * Sampler decision returned by the sampler hook, mirroring the
  * categories of OTel's SDK Sampler interface.
  *
@@ -398,6 +406,14 @@ typedef struct OtelSpan
 	OtelSpanEvent inline_event;
 	int			n_overflow_events;
 	OtelSpanEvent *overflow_events; /* NULL if not used or alloc failed */
+
+	/* Span links: associate this span with related spans in OTHER
+	 * traces.  Used by the SDT bridge to tie a transaction-lifetime
+	 * span (its own trace) to the per-statement query traces that ran
+	 * within it.  Demo: fixed inline storage (OtelSpanContext reused as
+	 * the link target); links past OTEL_INLINE_LINKS are dropped. */
+	int			n_links;
+	OtelSpanContext links[OTEL_INLINE_LINKS];
 } OtelSpan;
 
 /*
@@ -609,6 +625,35 @@ static inline void
 otel_span_set_unwind_policy(OtelSpan *span, OtelSpanUnwindPolicy policy)
 {
 	span->unwind_policy = policy;
+}
+
+/*
+ * Add a span link associating this span with a related span in another
+ * trace (e.g. a transaction span <-> a query trace that ran within it).
+ * trace_flags may be NULL (defaults to "00").  Demo: inline storage
+ * only --- links past OTEL_INLINE_LINKS are silently dropped.  Inline;
+ * copies the ids into the span (caller's buffers need not outlive this
+ * call).
+ */
+static inline void
+otel_span_add_link(OtelSpan *span,
+				   const char *trace_id,
+				   const char *span_id,
+				   const char *trace_flags)
+{
+	OtelSpanContext *l;
+
+	if (span == NULL || trace_id == NULL || span_id == NULL ||
+		span->n_links >= OTEL_INLINE_LINKS)
+		return;
+
+	l = &span->links[span->n_links];
+	strlcpy(l->trace_id, trace_id, sizeof(l->trace_id));
+	strlcpy(l->span_id, span_id, sizeof(l->span_id));
+	strlcpy(l->trace_flags, trace_flags ? trace_flags : "00",
+			sizeof(l->trace_flags));
+	l->tracestate = NULL;
+	span->n_links++;
 }
 
 #endif							/* CONTRIB_OTEL_H */
