@@ -3,6 +3,7 @@
 otel_postgres_tracing_sources = files(
   'otel_log.c',
   'otel_postgres_tracing.c',
+  'otel_sdt_bridge.c',
   'otel_trace.c',
 )
 
@@ -26,6 +27,11 @@ if otel_pgt_fs.exists(otel_pgt_elog_h)
     otel_pgt_cppflags += '-DOTEL_HAVE_ERRANNOT'
   endif
 endif
+
+# The SDT-probe -> span bridge needs no build-system detection: it is gated on
+# PG_HAVE_SDT_PROBE_HOOK, advertised by the core patch in <pg_config_manual.h>.
+# On a stock server the macro is absent and otel_sdt_bridge.c compiles to a
+# no-op stub.
 
 otel_postgres_tracing = shared_module('otel_postgres_tracing',
   otel_postgres_tracing_sources,
