@@ -37,6 +37,9 @@
 #include "otel.h"
 #include "otel_api.h"
 #include "otel_internal.h"
+#ifdef PG_HAVE_XACT_TRACE_CONTEXT
+#include "access/xact.h"
+#endif
 
 /*
  * Internal storage for the registered hooks.  External modules do
@@ -176,6 +179,54 @@ api_any_emit_consumer_present(void)
 	return otel_span_emit_hook != NULL || otel_emit_spans_to_log;
 }
 
+#ifdef PG_HAVE_XACT_TRACE_CONTEXT
+
+/*
+ * Decode exactly two hex characters at src into a byte.  Both uppercase
+ * (A-F) and lowercase (a-f) digits are accepted.
+ */
+static inline uint8
+hex2byte(const char *src)
+{
+	uint8		hi,
+				lo;
+
+	hi = src[0] <= '9' ? src[0] - '0' : (src[0] | 0x20) - 'a' + 10;
+	lo = src[1] <= '9' ? src[1] - '0' : (src[1] | 0x20) - 'a' + 10;
+	return (hi << 4) | lo;
+}
+
+/*
+ * commit_trace_context_hook callback: fills *tc from the current root
+ * context and returns true iff a sampled context is active.  Called
+ * from XactLogCommitRecord() before the WAL record is built; core
+ * never interprets the bytes --- it just appends them if we return true.
+ */
+static bool
+otel_commit_trace_context_cb(xl_xact_trace_context *tc)
+{
+	int			i;
+
+	if (!otel_ctx.is_set || !otel_ctx.sampled_flag_set)
+		return false;
+
+	/* Decode 32 hex chars -> 16 bytes for trace_id */
+	for (i = 0; i < 16; i++)
+		tc->trace_id[i] = hex2byte(otel_ctx.trace_id + i * 2);
+
+	/* Decode 16 hex chars -> 8 bytes for span_id */
+	for (i = 0; i < 8; i++)
+		tc->span_id[i] = hex2byte(otel_ctx.span_id + i * 2);
+
+	/* Decode 2 hex chars -> 1 byte for trace_flags */
+	tc->trace_flags = hex2byte(otel_ctx.trace_flags);
+
+	memset(tc->pad, 0, sizeof(tc->pad));
+	return true;
+}
+
+#endif							/* PG_HAVE_XACT_TRACE_CONTEXT */
+
 /*
  * The api table installed into the rendezvous slot.  Static storage
  * duration means it lives forever and external consumers can cache
@@ -279,6 +330,11 @@ otel_api_publish_rendezvous(void)
 
 		req = next;
 	}
+
+#ifdef PG_HAVE_XACT_TRACE_CONTEXT
+	/* Register the commit trace-context hook. */
+	commit_trace_context_hook = otel_commit_trace_context_cb;
+#endif
 }
 
 
