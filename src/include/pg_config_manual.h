@@ -366,3 +366,14 @@
  * Enable tracing of syncscan operations (see also the trace_syncscan GUC var).
  */
 /* #define TRACE_SYNCSCAN */
+
+/*
+ * Capability advertised by the SDT-probe bridge patch: this server exposes the
+ * pg_sdt_probe_hook function pointer and the utils/pg_sdt_probe.h header (a
+ * curated subset of the TRACE_POSTGRESQL_* SystemTap probes calls the hook in
+ * addition to their normal probe).  Out-of-tree extensions test this macro at
+ * compile time to build against both patched and stock servers with no build-
+ * system feature detection.  This is a build capability flag, not a tunable
+ * option --- do not comment it out.
+ */
+#define PG_HAVE_SDT_PROBE_HOOK 1
