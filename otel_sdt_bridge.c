@@ -120,6 +120,12 @@ static bool				otel_trace_sdt_probes = false;
  * high-volume. */
 static bool				otel_trace_sdt_smgr = false;
 
+/* GUC: enable syncrep wait spans (primary side). */
+static bool				otel_trace_syncrep = false;
+
+/* GUC: enable replica apply spans (standby side). */
+static bool				otel_trace_replica = false;
+
 
 /* -----------------------------------------------------------------------
  * Forward declarations
@@ -181,6 +187,29 @@ otel_sdt_install(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("otel.trace_syncrep",
+							 "Emit OTel span for synchronous-replication wait (primary side).",
+							 "When on, a pg.syncrep.wait span is emitted for each "
+							 "SyncRepWaitForLSN call that actually waits. "
+							 "Requires otel_postgres_tracing and a sampled root context.",
+							 &otel_trace_syncrep,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("otel.trace_replica",
+							 "Emit OTel span on the standby when a commit with trace context is replayed.",
+							 "When on, a pg.replica.apply span is emitted in the same trace as "
+							 "the primary commit, with SpanKind CONSUMER. "
+							 "Requires otel_postgres_tracing to be loaded on the standby "
+							 "via shared_preload_libraries.",
+							 &otel_trace_replica,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	RegisterXactCallback(otel_sdt_xact_cb, NULL);
 
 	/* Install the hook last so all state is ready. */
@@ -204,13 +233,13 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	bool		is_smgr;
 
 	/* ---- Cheapest gates first ---- */
-	if (!otel_trace_sdt_probes)
+	if (!otel_trace_sdt_probes && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
 		return;
 
-	/* Only trace client-connected backends.  Autovacuum, checkpointer,
-	 * etc. have MyProcPort == NULL and generally don't belong in a
-	 * client-facing trace. */
-	if (MyProcPort == NULL)
+	/* Only trace client-connected backends — UNLESS this is the replica
+	 * apply probe, which fires in the startup/recovery process where
+	 * MyProcPort is always NULL. */
+	if (MyProcPort == NULL && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
 		return;
 
 	api = otel_pg_ensure();
@@ -362,6 +391,92 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			span_name = "pg.smgr.write";
 			break;
 
+		/* --- Syncrep wait (primary side) --- */
+		case PG_SDT_SYNCREP_WAIT_START:
+			if (!otel_trace_syncrep)
+				return;
+			span_name = "pg.syncrep.wait";
+			is_start = true;
+			break;
+		case PG_SDT_SYNCREP_WAIT_DONE:
+			if (!otel_trace_syncrep)
+				return;
+			span_name = "pg.syncrep.wait";
+			break;
+
+		/* --- Replica apply (standby side) ---
+		 *
+		 * This probe fires in the startup/recovery process when it replays
+		 * a commit record that carries a W3C trace context embedded by the
+		 * primary.  There is NO active span stack here (recovery runs in a
+		 * single long-lived backend with no statement context), so we build
+		 * a self-contained span directly, set its trace identity from the
+		 * parsed traceparent arg, and emit it immediately.
+		 */
+		case PG_SDT_RECOVERY_XACT_COMMIT:
+		{
+			OtelSpan	replica_span;
+			const char *traceparent;
+			long		commit_lsn_long;
+			char		lsn_str[32];
+
+			if (!otel_trace_replica)
+				return;
+			if (nargs < 2 || args[0].tag != 's' || args[1].tag != 'i')
+				return;
+
+			traceparent = args[0].v.s;
+			commit_lsn_long = (long) args[1].v.i;
+
+			/*
+			 * Validate traceparent format: "00-<32hex>-<16hex>-<2hex>".
+			 * Check minimum length and the mandatory hyphen positions.
+			 */
+			if (traceparent == NULL ||
+				strlen(traceparent) < 55 ||
+				traceparent[2] != '-' ||
+				traceparent[35] != '-' ||
+				traceparent[52] != '-')
+				return;
+
+			if (sdt_scope == NULL && otel_pg_tracer != NULL)
+				sdt_scope = otel_pg_tracer;
+
+			/*
+			 * span_init zeroes the struct, generates a fresh span_id, and
+			 * sets start_time.  We then overwrite trace_id, parent_span_id,
+			 * and trace_flags from the propagated traceparent.
+			 */
+			api->span_init(&replica_span, sdt_scope, "pg.replica.apply",
+						   OTEL_SPAN_KIND_CONSUMER);
+
+			/* trace_id: 32 hex chars at offset 3 */
+			memcpy(replica_span.trace_id, traceparent + 3, 32);
+			replica_span.trace_id[32] = '\0';
+
+			/* parent_span_id: the primary's span_id at offset 36, 16 hex chars */
+			memcpy(replica_span.parent_span_id, traceparent + 36, 16);
+			replica_span.parent_span_id[16] = '\0';
+
+			/* trace_flags: 2 hex chars at offset 53 */
+			memcpy(replica_span.trace_flags, traceparent + 53, 2);
+			replica_span.trace_flags[2] = '\0';
+
+			/* Point-in-time span: end == start (apply is instantaneous here). */
+			replica_span.end_time = replica_span.start_time;
+			replica_span.status = OTEL_STATUS_UNSET;
+
+			/* Attribute: commit LSN formatted as %X/%08X */
+			snprintf(lsn_str, sizeof(lsn_str), "%lX/%08lX",
+					 (unsigned long) ((unsigned long long) commit_lsn_long >> 32),
+					 (unsigned long) ((unsigned long long) commit_lsn_long & 0xFFFFFFFF));
+			api->span_add_attribute_string(&replica_span, "pg.commit_lsn", lsn_str);
+
+			/* Emit directly — no stack push; recovery has no active span stack. */
+			api->span_emit(&replica_span);
+			return;
+		}
+
 		default:
 			return;				/* unknown probe — ignore */
 	}
@@ -432,6 +547,21 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			/* First arg is the query string ('s') for these probes. */
 			if (nargs >= 1 && args[0].tag == 's' && args[0].v.s != NULL)
 				api->span_add_attribute_string(s, "db.statement", args[0].v.s);
+		}
+
+		if ((PgSdtProbeId) id == PG_SDT_SYNCREP_WAIT_START)
+		{
+			/* First arg is the commit LSN ('i') for this probe. */
+			if (nargs >= 1 && args[0].tag == 'i')
+			{
+				char		lsn_str[32];
+				long		lsn_long = (long) args[0].v.i;
+
+				snprintf(lsn_str, sizeof(lsn_str), "%lX/%08lX",
+						 (unsigned long) ((unsigned long long) lsn_long >> 32),
+						 (unsigned long) ((unsigned long long) lsn_long & 0xFFFFFFFF));
+				api->span_add_attribute_string(s, "pg.commit_lsn", lsn_str);
+			}
 		}
 
 		/*

@@ -137,29 +137,38 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
-	 * "otel.trace_all_queries" is the lone surviving GUC in the
-	 * legacy "otel." namespace --- it predates the otel -> otel_api
-	 * extension rename and is kept here for continuity with existing
-	 * user configurations (a "SET otel.trace_all_queries = on" line
-	 * in postgresql.conf shouldn't break on upgrade).  Other otel_api
-	 * GUCs all moved to "otel_api.*" when extension naming was
-	 * aligned to the package directory, so this module is now the
-	 * sole owner of the "otel." prefix and the reservation is
-	 * conflict-free.
+	 * Install executor and log hooks unconditionally.  The hooks
+	 * call otel_pg_ensure() on every invocation and no-op when the
+	 * provider is absent.  The tracer handle (otel_pg_tracer) is
+	 * registered on the first successful otel_pg_ensure() call.
+	 *
+	 * otel_sdt_install() defines additional otel.* GUCs
+	 * (otel.trace_sdt_probes, otel.trace_sdt_smgr, otel.trace_syncrep,
+	 * otel.trace_replica).  These must all be registered BEFORE we call
+	 * MarkGUCPrefixReserved("otel") below; reserving the prefix first
+	 * would cause postgresql.conf values for those GUCs to be treated as
+	 * unrecognised placeholders under a reserved prefix and silently
+	 * dropped at load time.
+	 */
+	otel_trace_install_hooks();
+	otel_log_install_hooks();
+	otel_sdt_install();
+
+	/*
+	 * Reserve the "otel." and "otel_postgres_tracing." GUC prefixes now
+	 * that every otel.* GUC owned by this module has been registered.
+	 * The reservation must come AFTER all DefineCustom*Variable calls for
+	 * these prefixes (including those inside otel_sdt_install()) so that
+	 * values set in postgresql.conf are not discarded as unrecognised
+	 * placeholders under a reserved prefix.
+	 *
+	 * "otel." covers: otel.trace_all_queries (above), otel.trace_sdt_probes,
+	 * otel.trace_sdt_smgr, otel.trace_syncrep, otel.trace_replica
+	 * (all registered by otel_sdt_install()).
 	 *
 	 * Also reserve "otel_postgres_tracing.*" for any future module-
 	 * specific GUCs (none today).
 	 */
 	MarkGUCPrefixReserved("otel");
 	MarkGUCPrefixReserved("otel_postgres_tracing");
-
-	/*
-	 * Install executor and log hooks unconditionally.  The hooks
-	 * call otel_pg_ensure() on every invocation and no-op when the
-	 * provider is absent.  The tracer handle (otel_pg_tracer) is
-	 * registered on the first successful otel_pg_ensure() call.
-	 */
-	otel_trace_install_hooks();
-	otel_log_install_hooks();
-	otel_sdt_install();
 }
