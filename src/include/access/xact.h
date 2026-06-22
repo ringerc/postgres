@@ -194,6 +194,7 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_AE_LOCKS			(1U << 6)
 #define XACT_XINFO_HAS_GID				(1U << 7)
 #define XACT_XINFO_HAS_DROPPED_STATS	(1U << 8)
+#define XACT_XINFO_HAS_TRACE_CONTEXT	(1U << 9)
 
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
@@ -317,6 +318,39 @@ typedef struct xl_xact_origin
 	TimestampTz origin_timestamp;
 } xl_xact_origin;
 
+/*
+ * Optional W3C trace context (OpenTelemetry) attached to a commit record so
+ * that a standby can join the primary's trace when it replays the commit.
+ *
+ * IMPORTANT: this sub-struct must always be serialized *last* (after
+ * xl_xact_origin) in XactLogCommitRecord().  Older/unpatched servers do not
+ * recognize XACT_XINFO_HAS_TRACE_CONTEXT and stop parsing after the last
+ * sub-struct they understand; keeping this one last means those trailing bytes
+ * are simply ignored, so a patched primary's WAL replays cleanly on an
+ * unpatched standby of the same major version.  Like xl_xact_origin it is
+ * stored unaligned, so readers must copy it onto the stack.  Sized to a
+ * multiple of sizeof(int) per the NB above.
+ */
+typedef struct xl_xact_trace_context
+{
+	uint8		trace_id[16];	/* W3C trace-id (raw bytes) */
+	uint8		span_id[8];		/* W3C parent span-id (raw bytes) */
+	uint8		trace_flags;	/* W3C trace-flags (e.g. sampled bit) */
+	uint8		pad[3];			/* keep size a multiple of sizeof(int) */
+} xl_xact_trace_context;
+#define SizeOfXactTraceContext sizeof(xl_xact_trace_context)
+
+extern void format_traceparent(const xl_xact_trace_context *tc, char *buf);
+
+/*
+ * Optional hook letting an extension supply the trace context to embed in a
+ * commit record.  Default NULL (no trace context written).  When set, it is
+ * called from XactLogCommitRecord(); it should fill *tc and return true when a
+ * sampled trace context is active, or return false to omit it.  Core never
+ * interprets the bytes.
+ */
+extern PGDLLIMPORT bool (*commit_trace_context_hook) (xl_xact_trace_context *tc);
+
 typedef struct xl_xact_commit
 {
 	TimestampTz xact_time;		/* time of commit */
@@ -330,6 +364,7 @@ typedef struct xl_xact_commit
 	/* xl_xact_twophase follows if XINFO_HAS_TWOPHASE */
 	/* twophase_gid follows if XINFO_HAS_GID. As a null-terminated string. */
 	/* xl_xact_origin follows if XINFO_HAS_ORIGIN, stored unaligned! */
+	/* xl_xact_trace_context follows if XINFO_HAS_TRACE_CONTEXT; MUST be last */
 } xl_xact_commit;
 #define MinSizeOfXactCommit (offsetof(xl_xact_commit, xact_time) + sizeof(TimestampTz))
 
@@ -403,6 +438,9 @@ typedef struct xl_xact_parsed_commit
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
+
+	bool		has_trace_context;	/* XACT_XINFO_HAS_TRACE_CONTEXT was set */
+	xl_xact_trace_context trace_context;
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
