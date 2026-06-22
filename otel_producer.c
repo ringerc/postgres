@@ -361,6 +361,25 @@ otel_emit_span_as_log_line(const OtelSpan *span)
 	}
 	appendStringInfoChar(&buf, ']');
 
+	/* Span links (associations with spans in other traces). */
+	if (span->n_links > 0)
+	{
+		appendStringInfoString(&buf, ",\"links\":[");
+		for (i = 0; i < span->n_links; i++)
+		{
+			if (i > 0)
+				appendStringInfoChar(&buf, ',');
+			appendStringInfoString(&buf, "{\"trace_id\":");
+			escape_json(&buf, span->links[i].trace_id);
+			appendStringInfoString(&buf, ",\"span_id\":");
+			escape_json(&buf, span->links[i].span_id);
+			appendStringInfoString(&buf, ",\"trace_flags\":");
+			escape_json(&buf, span->links[i].trace_flags);
+			appendStringInfoChar(&buf, '}');
+		}
+		appendStringInfoChar(&buf, ']');
+	}
+
 	if (span->scope)
 	{
 		appendStringInfoString(&buf, ",\"scope\":{\"name\":");
