@@ -31,6 +31,36 @@
  * duplication would be bothersome.
  */
 
+/*
+ * Format an xl_xact_trace_context as a W3C traceparent string:
+ * "00-<32 hex trace_id>-<16 hex span_id>-<2 hex flags>".  buf must be >= 56
+ * bytes.
+ */
+void
+format_traceparent(const xl_xact_trace_context *tc, char *buf)
+{
+	static const char hex[] = "0123456789abcdef";
+	char	   *p = buf;
+	int			i;
+
+	*p++ = '0'; *p++ = '0'; *p++ = '-';
+	for (i = 0; i < 16; i++)
+	{
+		*p++ = hex[tc->trace_id[i] >> 4];
+		*p++ = hex[tc->trace_id[i] & 0xf];
+	}
+	*p++ = '-';
+	for (i = 0; i < 8; i++)
+	{
+		*p++ = hex[tc->span_id[i] >> 4];
+		*p++ = hex[tc->span_id[i] & 0xf];
+	}
+	*p++ = '-';
+	*p++ = hex[tc->trace_flags >> 4];
+	*p++ = hex[tc->trace_flags & 0xf];
+	*p = '\0';
+}
+
 void
 ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *parsed)
 {
