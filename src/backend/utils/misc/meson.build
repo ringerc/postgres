@@ -10,6 +10,7 @@ backend_sources += files(
   'pg_config.c',
   'pg_controldata.c',
   'pg_rusage.c',
+  'pg_sdt_probe.c',
   'ps_status.c',
   'queryenvironment.c',
   'rls.c',

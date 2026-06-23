@@ -53,5 +53,8 @@ extern void otel_log_install_hooks(void);
  * span event when a span is active.  No-op otherwise. */
 extern void otel_span_record_log_event(ErrorData *edata);
 
+/* Defined in otel_sdt_bridge.c.  Called once from _PG_init. */
+extern void otel_sdt_install(void);
+
 
 #endif							/* CONTRIB_OTEL_POSTGRES_TRACING_H */

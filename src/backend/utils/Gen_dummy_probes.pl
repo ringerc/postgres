@@ -1,7 +1,7 @@
 #-------------------------------------------------------------------------
 # Perl script to create dummy probes.h file when dtrace is not available
 #
-# Copyright (c) 2008-2025, PostgreSQL Global Development Group
+# Copyright (c) 2008-2026, PostgreSQL Global Development Group
 #
 # src/backend/utils/Gen_dummy_probes.pl
 #-------------------------------------------------------------------------
@@ -38,8 +38,60 @@ my %curated = (
 
 BEGIN { print "#include \"utils/pg_sdt_probe.h\"\n"; }
 
-
 m/^\s*probe / || next;
+
+# Extract the probe name (double-underscore form, e.g. "query__parse__start")
+(my $probe_name) = /^\s*probe ([^(]+)/;
+
+if (exists $curated{$probe_name})
+{
+	my ($enum_id, $tags) = @{$curated{$probe_name}};
+	my $nargs = scalar @$tags;
+
+	# Build the uppercase single-underscore macro name
+	(my $macro_name = $probe_name) =~ s/__/_/g;
+	$macro_name =~ y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/;
+	$macro_name = "TRACE_POSTGRESQL_$macro_name";
+
+	# Build the parameter list: INT1, INT2, ...
+	my @params = map { "INT$_" } 1 .. $nargs;
+	my $param_list = join(', ', @params);
+
+	# Build the PgSdtArg array initializer elements
+	my @elems;
+	for my $k (1 .. $nargs)
+	{
+		my $tag  = $tags->[$k - 1];
+		my $parm = "INT$k";
+		if ($tag eq 's')
+		{
+			push @elems, "{ 's', { .s = (const char *) ($parm) } }";
+		}
+		else
+		{
+			push @elems, "{ 'i', { .i = (int64) ($parm) } }";
+		}
+	}
+
+	# Emit the macro definition
+	my $macro_params = $nargs > 0 ? "($param_list)" : "()";
+	my $hook_call;
+	if ($nargs == 0)
+	{
+		$hook_call = "pg_sdt_probe_hook($enum_id, ((void *) 0), 0)";
+		print "#define ${macro_name}${macro_params} do { if (pg_sdt_probe_hook) $hook_call; } while (0)\n";
+	}
+	else
+	{
+		my $elems_str = join(', ', @elems);
+		$hook_call = "pg_sdt_probe_hook($enum_id, _pg_sdt_a, $nargs)";
+		print "#define ${macro_name}${macro_params} do { if (pg_sdt_probe_hook) { PgSdtArg _pg_sdt_a[] = { $elems_str }; $hook_call; } } while (0)\n";
+	}
+	print "#define ${macro_name}_ENABLED() (0)\n";
+	next;
+}
+
+# Non-curated probe: emit the existing dummy no-op macros.
 s/^\s*probe ([^(]*)(.*);/$1$2/;
 s/__/_/g;
 y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/;
