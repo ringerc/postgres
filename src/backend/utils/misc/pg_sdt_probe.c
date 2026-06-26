@@ -21,3 +21,9 @@
 /* Hook pointer; NULL (disabled) by default. */
 void		(*pg_sdt_probe_hook) (int probe_id,
 								  const PgSdtArg *args, int nargs) = NULL;
+
+/*
+ * Bitmask of enabled PgSdtProbeId values; set by an extension's GUC.
+ * Default 0 (all probes off).
+ */
+uint64		pg_sdt_probe_enabled_mask = 0;

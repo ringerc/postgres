@@ -53,7 +53,9 @@ typedef enum PgSdtProbeId
 	PG_SDT_SMGR_MD_WRITE_DONE,
 	PG_SDT_SYNCREP_WAIT_START,
 	PG_SDT_SYNCREP_WAIT_DONE,
-	PG_SDT_RECOVERY_XACT_COMMIT
+	PG_SDT_RECOVERY_XACT_COMMIT,
+	PG_SDT_LOCK_WAIT_START,
+	PG_SDT_LOCK_WAIT_DONE
 } PgSdtProbeId;
 
 /*
@@ -62,5 +64,11 @@ typedef enum PgSdtProbeId
  */
 extern PGDLLIMPORT void (*pg_sdt_probe_hook) (int probe_id,
 											  const PgSdtArg *args, int nargs);
+
+/*
+ * Bitmask of enabled PgSdtProbeId values (bit N = (1<<N) for probe id N).
+ * Set by an extension's GUC; default 0 (all probes off).
+ */
+extern PGDLLIMPORT uint64 pg_sdt_probe_enabled_mask;
 
 #endif							/* PG_SDT_PROBE_H */
