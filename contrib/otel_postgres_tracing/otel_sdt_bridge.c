@@ -76,8 +76,9 @@
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "port.h"				/* pg_strong_random */
-#include "storage/lock.h"		/* LOCKTAG_* / lock mode names */
-#include "storage/locktag.h"
+#include "storage/lock.h"		/* LOCKTAG_* / LockTagType / lock modes (pulls
+								 * storage/locktag.h on PG19 where it was split
+								 * out; PG18 keeps them in lock.h directly) */
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 #include "utils/pg_sdt_probe.h"
