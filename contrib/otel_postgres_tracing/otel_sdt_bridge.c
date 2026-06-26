@@ -76,9 +76,12 @@
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "port.h"				/* pg_strong_random */
+#include "storage/lock.h"		/* LOCKTAG_* / lock mode names */
+#include "storage/locktag.h"
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 #include "utils/pg_sdt_probe.h"
+#include "utils/varlena.h"		/* SplitIdentifierString */
 
 #include <otel_api/otel.h>
 
@@ -97,7 +100,32 @@
 static OtelSpan			sdt_pool[SDT_POOL_SIZE];
 static int				sdt_top = 0;	/* next free slot; 0 == empty */
 
+/*
+ * Per-slot scratch storage for integer-valued attributes.
+ *
+ * span_add_attribute_string does NOT copy its value: the pointer must stay
+ * valid until the span is emitted at the matching DONE probe, which happens
+ * after the START call frame has returned.  A stack-local format buffer would
+ * therefore dangle.  Each pool slot gets a fixed set of small buffers here
+ * (lifetime == the slab's), one per integer attribute a START might add.
+ * SDT_ATTR_BUFS bounds the number of formatted-int attributes per span (the
+ * lock-wait span uses at most 6: type-fallback, mode-fallback, plus up to 4
+ * field/target values).
+ */
+#define SDT_ATTR_BUFS	6
+#define SDT_ATTR_BUFLEN	32
+static char				sdt_attr_scratch[SDT_POOL_SIZE][SDT_ATTR_BUFS][SDT_ATTR_BUFLEN];
+
 /* InstrumentationScope for this bridge's spans. */
+/*
+ * TODO: tag every span this bridge emits with an explicit
+ * pg.otel.span_source = "sdt_probe" attribute so consumers can cleanly
+ * separate these intercepted-tracepoint spans (pg.*) from the hook-based
+ * spans in otel_trace.c (pgsql.execute / command-tag utility spans). The
+ * sdt_scope below is meant to distinguish them, but the Rust exporter
+ * collapses ScopeName to the crate name on export, so scope can't be used
+ * downstream. See the fuller TODO in otel_trace.c.
+ */
 static const OtelInstrumentationScope *sdt_scope = NULL;
 
 /*
@@ -112,19 +140,105 @@ static const OtelInstrumentationScope *sdt_scope = NULL;
 static OtelSpan			txn_span;
 static bool				txn_active = false;
 
-/* GUC: master enable for all SDT spans. */
-static bool				otel_trace_sdt_probes = false;
+/*
+ * GUC: which SDT probe FAMILIES are enabled.  This is a GUC_LIST_INPUT
+ * string GUC (otel.trace_sdt_probes); its check/assign hooks translate the
+ * token list into the core symbol pg_sdt_probe_enabled_mask, which is what
+ * actually gates each TRACE_POSTGRESQL_* macro at the call site.  Until the
+ * mask is set, NOTHING calls this hook.  The backing string only exists so
+ * SHOW / pg_settings can echo the configured value.
+ */
+static char			   *otel_trace_sdt_probes_str = NULL;
 
-/* GUC: separate enable for smgr (storage manager) spans; off by default
- * because smgr probes fire on every buffer read/write and can be very
- * high-volume. */
-static bool				otel_trace_sdt_smgr = false;
+/* smgr (storage manager) spans are off by default because smgr probes fire
+ * on every buffer read/write and can be very high-volume; they are enabled
+ * by including the smgr / smgr_read / smgr_write token in the list GUC. */
+/*
+ * TODO: investigate collapsing rapid sequences of similar spans (e.g. the
+ * thousands of per-block pg.smgr.write spans a single CTAS emits -- one trace
+ * was observed with 5770 of them) into a single aggregated span carrying a
+ * count (and perhaps min/max/total duration, block range). This would make
+ * smgr/buffer-level tracing affordable enough to leave on. Evaluate where to do
+ * it and the trade-offs:
+ *   - span producer (here): cheapest, keeps the exported volume down at source;
+ *     coalesce consecutive same-kind probe pairs within a parent into one span
+ *     with an attribute like pg.smgr.write.count. Loses per-op timing detail.
+ *   - exporter (postgres_otel_tracing_demo): could batch/fold before OTLP send;
+ *     more context than the collector but still per-process.
+ *   - otel-collector: a transform/groupby or a custom processor downstream;
+ *     keeps producers simple and is reconfigurable without a Postgres restart,
+ *     but the full span volume still crosses the wire to the collector.
+ * Note tracing semantics: an aggregated "span" with a count is closer to a
+ * metric/event than a true span -- consider whether a span event or a counter
+ * metric is the better representation.
+ * Prior art: Elastic APM / EDOT (Elastic Distribution of OpenTelemetry) has
+ * "span compression", which folds repeated similar/exact-match spans into one
+ * composite span with a count + aggregate duration. Study its model (exact-match
+ * vs same-kind compression, the configurable duration threshold) before designing.
+ */
 
-/* GUC: enable syncrep wait spans (primary side). */
-static bool				otel_trace_syncrep = false;
 
-/* GUC: enable replica apply spans (standby side). */
-static bool				otel_trace_replica = false;
+/* -----------------------------------------------------------------------
+ * GUC list -> probe-mask mapping
+ *
+ * Tokens name probe FAMILIES.  Each family sets BOTH the START and DONE bits
+ * together so a push can never be left without its matching pop (and the
+ * span stack can never be corrupted by a half-enabled pair).  "all" / "none"
+ * are convenience aliases.
+ * ----------------------------------------------------------------------- */
+
+#define SDT_BIT(id)		(UINT64CONST(1) << (id))
+
+typedef struct SdtFamilyMap
+{
+	const char *name;
+	uint64		bits;
+} SdtFamilyMap;
+
+#define SDT_BITS_SMGR_READ \
+	(SDT_BIT(PG_SDT_SMGR_MD_READ_START) | SDT_BIT(PG_SDT_SMGR_MD_READ_DONE))
+#define SDT_BITS_SMGR_WRITE \
+	(SDT_BIT(PG_SDT_SMGR_MD_WRITE_START) | SDT_BIT(PG_SDT_SMGR_MD_WRITE_DONE))
+
+#define SDT_BITS_ALL \
+	(SDT_BIT(PG_SDT_TRANSACTION_START) | SDT_BIT(PG_SDT_TRANSACTION_COMMIT) | \
+	 SDT_BIT(PG_SDT_TRANSACTION_ABORT) | \
+	 SDT_BIT(PG_SDT_QUERY_START) | SDT_BIT(PG_SDT_QUERY_DONE) | \
+	 SDT_BIT(PG_SDT_QUERY_PARSE_START) | SDT_BIT(PG_SDT_QUERY_PARSE_DONE) | \
+	 SDT_BIT(PG_SDT_QUERY_REWRITE_START) | SDT_BIT(PG_SDT_QUERY_REWRITE_DONE) | \
+	 SDT_BIT(PG_SDT_QUERY_PLAN_START) | SDT_BIT(PG_SDT_QUERY_PLAN_DONE) | \
+	 SDT_BIT(PG_SDT_QUERY_EXECUTE_START) | SDT_BIT(PG_SDT_QUERY_EXECUTE_DONE) | \
+	 SDT_BIT(PG_SDT_SORT_START) | SDT_BIT(PG_SDT_SORT_DONE) | \
+	 SDT_BITS_SMGR_READ | SDT_BITS_SMGR_WRITE | \
+	 SDT_BIT(PG_SDT_SYNCREP_WAIT_START) | SDT_BIT(PG_SDT_SYNCREP_WAIT_DONE) | \
+	 SDT_BIT(PG_SDT_RECOVERY_XACT_COMMIT) | \
+	 SDT_BIT(PG_SDT_LOCK_WAIT_START) | SDT_BIT(PG_SDT_LOCK_WAIT_DONE))
+
+static const SdtFamilyMap sdt_family_map[] = {
+	{"txn",		   SDT_BIT(PG_SDT_TRANSACTION_START) |
+				   SDT_BIT(PG_SDT_TRANSACTION_COMMIT) |
+				   SDT_BIT(PG_SDT_TRANSACTION_ABORT)},
+	{"query",	   SDT_BIT(PG_SDT_QUERY_START) | SDT_BIT(PG_SDT_QUERY_DONE)},
+	{"parse",	   SDT_BIT(PG_SDT_QUERY_PARSE_START) |
+				   SDT_BIT(PG_SDT_QUERY_PARSE_DONE)},
+	{"rewrite",	   SDT_BIT(PG_SDT_QUERY_REWRITE_START) |
+				   SDT_BIT(PG_SDT_QUERY_REWRITE_DONE)},
+	{"plan",	   SDT_BIT(PG_SDT_QUERY_PLAN_START) |
+				   SDT_BIT(PG_SDT_QUERY_PLAN_DONE)},
+	{"execute",	   SDT_BIT(PG_SDT_QUERY_EXECUTE_START) |
+				   SDT_BIT(PG_SDT_QUERY_EXECUTE_DONE)},
+	{"sort",	   SDT_BIT(PG_SDT_SORT_START) | SDT_BIT(PG_SDT_SORT_DONE)},
+	{"smgr_read",  SDT_BITS_SMGR_READ},
+	{"smgr_write", SDT_BITS_SMGR_WRITE},
+	{"smgr",	   SDT_BITS_SMGR_READ | SDT_BITS_SMGR_WRITE},
+	{"syncrep",	   SDT_BIT(PG_SDT_SYNCREP_WAIT_START) |
+				   SDT_BIT(PG_SDT_SYNCREP_WAIT_DONE)},
+	{"replica",	   SDT_BIT(PG_SDT_RECOVERY_XACT_COMMIT)},
+	{"lock_wait",  SDT_BIT(PG_SDT_LOCK_WAIT_START) |
+				   SDT_BIT(PG_SDT_LOCK_WAIT_DONE)},
+	{"all",		   SDT_BITS_ALL},
+	{"none",	   0},
+};
 
 
 /* -----------------------------------------------------------------------
@@ -134,6 +248,9 @@ static bool				otel_trace_replica = false;
 static void otel_sdt_hook(int id, const PgSdtArg *args, int nargs);
 static void otel_sdt_xact_cb(XactEvent event, void *arg);
 static void sdt_bytes_to_hex(const unsigned char *src, size_t n, char *dst);
+static bool sdt_probes_parse(const char *value, uint64 *mask_out);
+static bool sdt_probes_check_hook(char **newval, void **extra, GucSource source);
+static void sdt_probes_assign_hook(const char *newval, void *extra);
 
 
 /* -----------------------------------------------------------------------
@@ -156,6 +273,104 @@ sdt_bytes_to_hex(const unsigned char *src, size_t n, char *dst)
 
 
 /* -----------------------------------------------------------------------
+ * GUC list parsing: token list -> probe-enable bitmask
+ *
+ * Parses a comma-separated family-token list into a uint64 bitmask.  Used by
+ * both the check hook (to validate + precompute the mask) at runtime.  The
+ * input is duplicated before SplitIdentifierString because that routine
+ * modifies its argument in place.  Returns true on success; on an unknown
+ * token it reports via GUC_check_errdetail and returns false.
+ * ----------------------------------------------------------------------- */
+
+static bool
+sdt_probes_parse(const char *value, uint64 *mask_out)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *lc;
+	uint64		mask = 0;
+
+	/* SplitIdentifierString scribbles on its input; work on a copy. */
+	rawstring = pstrdup(value);
+
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(lc, elemlist)
+	{
+		const char *tok = (const char *) lfirst(lc);
+		bool		found = false;
+		size_t		i;
+
+		for (i = 0; i < lengthof(sdt_family_map); i++)
+		{
+			if (pg_strcasecmp(tok, sdt_family_map[i].name) == 0)
+			{
+				mask |= sdt_family_map[i].bits;
+				found = true;
+				break;
+			}
+		}
+
+		if (!found)
+		{
+			GUC_check_errdetail("Unrecognized SDT probe family \"%s\".", tok);
+			pfree(rawstring);
+			list_free(elemlist);
+			return false;
+		}
+	}
+
+	pfree(rawstring);
+	list_free(elemlist);
+	*mask_out = mask;
+	return true;
+}
+
+/*
+ * check_hook for otel.trace_sdt_probes.  Validates the token list and stashes
+ * the precomputed mask in *extra so the assign hook need not re-parse.
+ */
+static bool
+sdt_probes_check_hook(char **newval, void **extra, GucSource source)
+{
+	uint64		mask = 0;
+	uint64	   *extra_mask;
+
+	/* An empty / NULL value means "none". */
+	if (*newval != NULL && (*newval)[0] != '\0')
+	{
+		if (!sdt_probes_parse(*newval, &mask))
+			return false;
+	}
+
+	extra_mask = (uint64 *) guc_malloc(LOG, sizeof(uint64));
+	if (extra_mask == NULL)
+		return false;
+	*extra_mask = mask;
+	*extra = (void *) extra_mask;
+	return true;
+}
+
+/*
+ * assign_hook for otel.trace_sdt_probes.  Writes the precomputed mask from
+ * *extra into the core symbol that gates the TRACE_POSTGRESQL_* macros.
+ */
+static void
+sdt_probes_assign_hook(const char *newval, void *extra)
+{
+	uint64	   *extra_mask = (uint64 *) extra;
+
+	pg_sdt_probe_enabled_mask = extra_mask ? *extra_mask : 0;
+}
+
+
+/* -----------------------------------------------------------------------
  * otel_sdt_install
  *
  * Called once from _PG_init in otel_postgres_tracing.c.  Registers
@@ -165,55 +380,81 @@ sdt_bytes_to_hex(const unsigned char *src, size_t n, char *dst)
 void
 otel_sdt_install(void)
 {
-	DefineCustomBoolVariable("otel.trace_sdt_probes",
-							 "Emit OTel spans for PostgreSQL SDT probe pairs.",
-							 "When on, each matched START/DONE SDT probe pair "
-							 "produces a child span in the active trace. "
-							 "Requires otel_postgres_tracing to be loaded.",
-							 &otel_trace_sdt_probes,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("otel.trace_sdt_smgr",
-							 "Include storage-manager (smgr) SDT spans.",
-							 "When on (and otel.trace_sdt_probes is also on), "
-							 "smgr read/write probe pairs produce spans. "
-							 "These can be very high-volume; disabled by default.",
-							 &otel_trace_sdt_smgr,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("otel.trace_syncrep",
-							 "Emit OTel span for synchronous-replication wait (primary side).",
-							 "When on, a pg.syncrep.wait span is emitted for each "
-							 "SyncRepWaitForLSN call that actually waits. "
-							 "Requires otel_postgres_tracing and a sampled root context.",
-							 &otel_trace_syncrep,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("otel.trace_replica",
-							 "Emit OTel span on the standby when a commit with trace context is replayed.",
-							 "When on, a pg.replica.apply span is emitted in the same trace as "
-							 "the primary commit, with SpanKind CONSUMER. "
-							 "Requires otel_postgres_tracing to be loaded on the standby "
-							 "via shared_preload_libraries.",
-							 &otel_trace_replica,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
+	DefineCustomStringVariable("otel.trace_sdt_probes",
+							   "SDT probe families to emit OTel spans for.",
+							   "Comma-separated list of probe families; each "
+							   "family enables a matched START/DONE probe pair "
+							   "(or the standby replica-apply probe).  Recognized "
+							   "tokens: txn, query, parse, rewrite, plan, execute, "
+							   "sort, smgr_read, smgr_write, smgr, syncrep, "
+							   "replica, lock_wait, plus all and none.  smgr "
+							   "families are high-volume and off by default.  "
+							   "This list drives pg_sdt_probe_enabled_mask, which "
+							   "gates the probes at the call site; families not "
+							   "listed never call into this extension.",
+							   &otel_trace_sdt_probes_str,
+							   "query,parse,rewrite,plan,execute,sort,syncrep,replica,lock_wait",
+							   PGC_USERSET,
+							   GUC_LIST_INPUT,
+							   sdt_probes_check_hook,
+							   sdt_probes_assign_hook,
+							   NULL);
 
 	RegisterXactCallback(otel_sdt_xact_cb, NULL);
 
 	/* Install the hook last so all state is ready. */
 	pg_sdt_probe_hook = otel_sdt_hook;
+}
+
+
+/* -----------------------------------------------------------------------
+ * Lock decode helpers (for the pg.lock.wait span)
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Heavyweight lock mode names, indexed by lock mode 1..8.  Index 0 (NoLock)
+ * is unused by the lock-wait probe but kept for natural indexing.  Out-of-
+ * range modes fall back to the integer in the caller.
+ */
+static const char *const sdt_lockmode_names[] = {
+	"NoLock",					/* 0 */
+	"AccessShareLock",			/* 1 */
+	"RowShareLock",				/* 2 */
+	"RowExclusiveLock",			/* 3 */
+	"ShareUpdateExclusiveLock", /* 4 */
+	"ShareLock",				/* 5 */
+	"ShareRowExclusiveLock",	/* 6 */
+	"ExclusiveLock",			/* 7 */
+	"AccessExclusiveLock",		/* 8 */
+};
+
+/*
+ * LockTagType name decode.  Returns a static string for in-range types, or
+ * NULL when out of range (caller emits the integer instead).  The core
+ * LockTagTypeNames[] array carries these strings, but we keep a private copy
+ * so the bridge does not depend on that symbol's exact element count.
+ */
+static const char *
+sdt_locktag_type_name(int t)
+{
+	static const char *const names[] = {
+		"relation",				/* LOCKTAG_RELATION */
+		"extend",				/* LOCKTAG_RELATION_EXTEND */
+		"frozenid",				/* LOCKTAG_DATABASE_FROZEN_IDS */
+		"page",					/* LOCKTAG_PAGE */
+		"tuple",				/* LOCKTAG_TUPLE */
+		"transactionid",		/* LOCKTAG_TRANSACTION */
+		"virtualxid",			/* LOCKTAG_VIRTUALTRANSACTION */
+		"spectoken",			/* LOCKTAG_SPECULATIVE_TOKEN */
+		"object",				/* LOCKTAG_OBJECT */
+		"userlock",				/* LOCKTAG_USERLOCK */
+		"advisory",				/* LOCKTAG_ADVISORY */
+		"applytransaction",		/* LOCKTAG_APPLY_TRANSACTION */
+	};
+
+	if (t >= 0 && t < (int) lengthof(names))
+		return names[t];
+	return NULL;
 }
 
 
@@ -230,11 +471,13 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	OtelSpan   *s;
 	const char *span_name;
 	bool		is_start;
-	bool		is_smgr;
 
-	/* ---- Cheapest gates first ---- */
-	if (!otel_trace_sdt_probes && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
-		return;
+	/*
+	 * No master enable gate here any more: pg_sdt_probe_enabled_mask gates
+	 * each TRACE_POSTGRESQL_* macro at the call site, so this hook is only
+	 * reached for probe families that the otel.trace_sdt_probes GUC turned
+	 * on.  The per-family in-hook gates below are likewise gone.
+	 */
 
 	/* Only trace client-connected backends — UNLESS this is the replica
 	 * apply probe, which fires in the startup/recovery process where
@@ -250,7 +493,6 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		return;
 
 	/* ---- Classify the probe ---- */
-	is_smgr = false;
 	is_start = false;
 	span_name = NULL;
 
@@ -314,6 +556,25 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				api->span_emit(&txn_span);
 				txn_active = false;
 			}
+			/*
+			 * TODO: on abort, emit the still-open per-statement spans on the
+			 * stack (sdt_top > 0) with ERROR status instead of discarding them
+			 * via the reset below. When a statement errors mid-execution the
+			 * QUERY_EXECUTE_DONE / QUERY_DONE (and on a plan-time error,
+			 * QUERY_PLAN_DONE) probes never fire, so pg.execute / pg.query /
+			 * pg.plan stay open and are dropped here -- an error trace then
+			 * shows only the completed-pair spans plus the executor-hook
+			 * pgsql.execute (which captures the error via the elog hook).
+			 * Observed: trace 2cfc6415... (runtime 1/(i-i)) lost its
+			 * pg.execute/pg.query subtree; trace 01da50ab... (plan-time 1/0)
+			 * captured no server-side error at all because no executor span
+			 * opened and the open pg.plan was discarded. Fix: unwind the stack
+			 * top-down, set each span's end_time + ERROR status, and span_emit
+			 * in LIFO order so the producer's stack contract holds (otherwise
+			 * otel_producer.c logs "span emitted out of stack order; N span(s)
+			 * above will be unwound"). This would also make plan/parse-phase
+			 * errors visible, not just execute-phase ones.
+			 */
 			sdt_top = 0;
 			return;
 
@@ -373,35 +634,36 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 
 		/* --- Storage manager (smgr) --- */
 		case PG_SDT_SMGR_MD_READ_START:
-			is_smgr = true;
 			span_name = "pg.smgr.read";
 			is_start = true;
 			break;
 		case PG_SDT_SMGR_MD_READ_DONE:
-			is_smgr = true;
 			span_name = "pg.smgr.read";
 			break;
 		case PG_SDT_SMGR_MD_WRITE_START:
-			is_smgr = true;
 			span_name = "pg.smgr.write";
 			is_start = true;
 			break;
 		case PG_SDT_SMGR_MD_WRITE_DONE:
-			is_smgr = true;
 			span_name = "pg.smgr.write";
 			break;
 
 		/* --- Syncrep wait (primary side) --- */
 		case PG_SDT_SYNCREP_WAIT_START:
-			if (!otel_trace_syncrep)
-				return;
 			span_name = "pg.syncrep.wait";
 			is_start = true;
 			break;
 		case PG_SDT_SYNCREP_WAIT_DONE:
-			if (!otel_trace_syncrep)
-				return;
 			span_name = "pg.syncrep.wait";
+			break;
+
+		/* --- Lock wait (heavyweight lock manager) --- */
+		case PG_SDT_LOCK_WAIT_START:
+			span_name = "pg.lock.wait";
+			is_start = true;
+			break;
+		case PG_SDT_LOCK_WAIT_DONE:
+			span_name = "pg.lock.wait";
 			break;
 
 		/* --- Replica apply (standby side) ---
@@ -420,8 +682,6 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			long		commit_lsn_long;
 			char		lsn_str[32];
 
-			if (!otel_trace_replica)
-				return;
 			if (nargs < 2 || args[0].tag != 's' || args[1].tag != 'i')
 				return;
 
@@ -480,10 +740,6 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		default:
 			return;				/* unknown probe — ignore */
 	}
-
-	/* smgr gate (checked after classification) */
-	if (is_smgr && !otel_trace_sdt_smgr)
-		return;
 
 	/* ---- START path ---- */
 	if (is_start)
@@ -554,13 +810,161 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			/* First arg is the commit LSN ('i') for this probe. */
 			if (nargs >= 1 && args[0].tag == 'i')
 			{
-				char		lsn_str[32];
+				/*
+				 * Format into this slot's persistent scratch (NOT a stack
+				 * local): span_add_attribute_string stores the pointer, and the
+				 * span is not emitted until the matching DONE after this frame
+				 * returns.
+				 */
+				char	   *lsn_str = sdt_attr_scratch[sdt_top][0];
 				long		lsn_long = (long) args[0].v.i;
 
-				snprintf(lsn_str, sizeof(lsn_str), "%lX/%08lX",
+				snprintf(lsn_str, SDT_ATTR_BUFLEN, "%lX/%08lX",
 						 (unsigned long) ((unsigned long long) lsn_long >> 32),
 						 (unsigned long) ((unsigned long long) lsn_long & 0xFFFFFFFF));
 				api->span_add_attribute_string(s, "pg.commit_lsn", lsn_str);
+			}
+		}
+
+		if ((PgSdtProbeId) id == PG_SDT_LOCK_WAIT_START)
+		{
+			/*
+			 * Six int64 args: locktag field1..4, locktag_type, lock mode.
+			 * Decode the type/mode to human-readable names and emit the
+			 * type-specific lock target.  Integer values are formatted into
+			 * this slot's persistent scratch buffers (NOT stack locals):
+			 * span_add_attribute_string stores the pointer, and the span is
+			 * not emitted until the matching DONE after this frame returns.
+			 */
+			if (nargs >= 6 &&
+				args[0].tag == 'i' && args[1].tag == 'i' &&
+				args[2].tag == 'i' && args[3].tag == 'i' &&
+				args[4].tag == 'i' && args[5].tag == 'i')
+			{
+				char	  (*buf)[SDT_ATTR_BUFLEN] = sdt_attr_scratch[sdt_top];
+				int			nb = 0;		/* next free scratch buffer */
+				int64		field1 = args[0].v.i;
+				int64		field2 = args[1].v.i;
+				int64		field3 = args[2].v.i;
+				int64		field4 = args[3].v.i;
+				int			locktag_type = (int) args[4].v.i;
+				int			mode = (int) args[5].v.i;
+				const char *tname = sdt_locktag_type_name(locktag_type);
+
+				/* pg.lock.type */
+				if (tname != NULL)
+					api->span_add_attribute_string(s, "pg.lock.type", tname);
+				else if (nb < SDT_ATTR_BUFS)
+				{
+					snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT,
+							 (int64) locktag_type);
+					api->span_add_attribute_string(s, "pg.lock.type", buf[nb]);
+					nb++;
+				}
+
+				/* pg.lock.mode */
+				if (mode >= 1 && mode < (int) lengthof(sdt_lockmode_names))
+					api->span_add_attribute_string(s, "pg.lock.mode",
+												   sdt_lockmode_names[mode]);
+				else if (nb < SDT_ATTR_BUFS)
+				{
+					snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, (int64) mode);
+					api->span_add_attribute_string(s, "pg.lock.mode", buf[nb]);
+					nb++;
+				}
+
+				/* Type-specific targets. */
+				switch (locktag_type)
+				{
+					case LOCKTAG_RELATION:
+					case LOCKTAG_RELATION_EXTEND:
+					case LOCKTAG_PAGE:
+					case LOCKTAG_TUPLE:
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
+							api->span_add_attribute_string(s, "pg.lock.dboid", buf[nb]);
+							nb++;
+						}
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field2);
+							api->span_add_attribute_string(s, "pg.lock.relid", buf[nb]);
+							nb++;
+						}
+						if (locktag_type == LOCKTAG_PAGE ||
+							locktag_type == LOCKTAG_TUPLE)
+						{
+							if (nb < SDT_ATTR_BUFS)
+							{
+								snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field3);
+								api->span_add_attribute_string(s, "pg.lock.block", buf[nb]);
+								nb++;
+							}
+						}
+						if (locktag_type == LOCKTAG_TUPLE)
+						{
+							if (nb < SDT_ATTR_BUFS)
+							{
+								snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field4);
+								api->span_add_attribute_string(s, "pg.lock.offset", buf[nb]);
+								nb++;
+							}
+						}
+						break;
+
+					case LOCKTAG_TRANSACTION:
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
+							api->span_add_attribute_string(s, "pg.lock.xid", buf[nb]);
+							nb++;
+						}
+						break;
+
+					case LOCKTAG_VIRTUALTRANSACTION:
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
+							api->span_add_attribute_string(s, "pg.lock.procno", buf[nb]);
+							nb++;
+						}
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field2);
+							api->span_add_attribute_string(s, "pg.lock.localxid", buf[nb]);
+							nb++;
+						}
+						break;
+
+					default:
+						/* Generic: emit field1..4 as-is. */
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
+							api->span_add_attribute_string(s, "pg.lock.field1", buf[nb]);
+							nb++;
+						}
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field2);
+							api->span_add_attribute_string(s, "pg.lock.field2", buf[nb]);
+							nb++;
+						}
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field3);
+							api->span_add_attribute_string(s, "pg.lock.field3", buf[nb]);
+							nb++;
+						}
+						if (nb < SDT_ATTR_BUFS)
+						{
+							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field4);
+							api->span_add_attribute_string(s, "pg.lock.field4", buf[nb]);
+							nb++;
+						}
+						break;
+				}
 			}
 		}
 
@@ -660,9 +1064,8 @@ otel_sdt_xact_cb(XactEvent event, void *arg)
  * global).  The probe -> span bridge is compiled out entirely so the
  * shared library has no unresolved reference to pg_sdt_probe_hook and
  * loads cleanly.  otel_sdt_install() is a no-op; the otel.trace_sdt_probes
- * / otel.trace_sdt_smgr GUCs are simply not defined (SET on them reports
- * "unrecognized configuration parameter", as expected when the feature is
- * unavailable).
+ * GUC is simply not defined (SET on it reports "unrecognized configuration
+ * parameter", as expected when the feature is unavailable).
  */
 void
 otel_sdt_install(void)
