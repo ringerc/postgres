@@ -34,6 +34,8 @@ my %curated = (
 	'syncrep__wait__start'    => ['PG_SDT_SYNCREP_WAIT_START',  ['i']],
 	'syncrep__wait__done'     => ['PG_SDT_SYNCREP_WAIT_DONE',   ['i']],
 	'recovery__xact__commit'  => ['PG_SDT_RECOVERY_XACT_COMMIT',['s','i']],
+	'lock__wait__start'       => ['PG_SDT_LOCK_WAIT_START',     ['i','i','i','i','i','i']],
+	'lock__wait__done'        => ['PG_SDT_LOCK_WAIT_DONE',      ['i','i','i','i','i','i']],
 );
 
 BEGIN { print "#include \"utils/pg_sdt_probe.h\"\n"; }
@@ -75,19 +77,20 @@ if (exists $curated{$probe_name})
 
 	# Emit the macro definition
 	my $macro_params = $nargs > 0 ? "($param_list)" : "()";
+	my $gate = "pg_sdt_probe_hook && (pg_sdt_probe_enabled_mask & (UINT64CONST(1) << $enum_id))";
 	my $hook_call;
 	if ($nargs == 0)
 	{
 		$hook_call = "pg_sdt_probe_hook($enum_id, ((void *) 0), 0)";
-		print "#define ${macro_name}${macro_params} do { if (pg_sdt_probe_hook) $hook_call; } while (0)\n";
+		print "#define ${macro_name}${macro_params} do { if ($gate) $hook_call; } while (0)\n";
 	}
 	else
 	{
 		my $elems_str = join(', ', @elems);
 		$hook_call = "pg_sdt_probe_hook($enum_id, _pg_sdt_a, $nargs)";
-		print "#define ${macro_name}${macro_params} do { if (pg_sdt_probe_hook) { PgSdtArg _pg_sdt_a[] = { $elems_str }; $hook_call; } } while (0)\n";
+		print "#define ${macro_name}${macro_params} do { if ($gate) { PgSdtArg _pg_sdt_a[] = { $elems_str }; $hook_call; } } while (0)\n";
 	}
-	print "#define ${macro_name}_ENABLED() (0)\n";
+	print "#define ${macro_name}_ENABLED() ((pg_sdt_probe_enabled_mask & (UINT64CONST(1) << $enum_id)) != 0)\n";
 	next;
 }
 
