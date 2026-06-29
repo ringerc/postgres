@@ -419,6 +419,28 @@ start_span(QueryDesc *queryDesc)
 	 * read this span as their parent via api->span_current_context. */
 	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
 	otel_api->span_push(&span_storage);
+
+#ifdef PG_HAVE_SDT_PROBE_HOOK
+	/*
+	 * Bidirectionally link this statement span to the enclosing pg.txn span
+	 * (emitted by the SDT bridge in its own trace).  Unlike the bridge's
+	 * pg.query linking, this fires even with no propagated traceparent, so
+	 * statements run by clients that don't inject trace context (e.g.
+	 * cnp_metrics_exporter) are still associated with their transaction.
+	 */
+	{
+		OtelSpanContext txn_ctx;
+
+		if (otel_sdt_get_txn_context(&txn_ctx))
+		{
+			otel_span_add_link(&span_storage, txn_ctx.trace_id,
+							   txn_ctx.span_id, txn_ctx.trace_flags);
+			otel_sdt_link_stmt_to_txn(span_storage.trace_id,
+									  span_storage.span_id,
+									  span_storage.trace_flags);
+		}
+	}
+#endif							/* PG_HAVE_SDT_PROBE_HOOK */
 }
 
 static void
@@ -792,6 +814,27 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 	/* Phase 2 migration: see start_span() above. */
 	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
 	otel_api->span_push(&span_storage);
+
+#ifdef PG_HAVE_SDT_PROBE_HOOK
+	/* Link this utility span to the enclosing pg.txn span; see start_span().
+	 * A utility span is linked when a transaction span is active as its span
+	 * starts -- which includes BEGIN, since the SDT TRANSACTION_START probe
+	 * fires before this ProcessUtility span starts.  A standalone SET/SHOW
+	 * outside any transaction has no active pg.txn and is therefore not
+	 * linked. */
+	{
+		OtelSpanContext txn_ctx;
+
+		if (otel_sdt_get_txn_context(&txn_ctx))
+		{
+			otel_span_add_link(&span_storage, txn_ctx.trace_id,
+							   txn_ctx.span_id, txn_ctx.trace_flags);
+			otel_sdt_link_stmt_to_txn(span_storage.trace_id,
+									  span_storage.span_id,
+									  span_storage.trace_flags);
+		}
+	}
+#endif							/* PG_HAVE_SDT_PROBE_HOOK */
 }
 
 /*
