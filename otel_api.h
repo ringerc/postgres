@@ -90,7 +90,7 @@
 #define OTEL_API_MINOR(v)			((v) & OTEL_API_MINOR_MASK)
 
 #define OTEL_TRACING_API_MAJOR		2
-#define OTEL_TRACING_API_MINOR		1
+#define OTEL_TRACING_API_MINOR		2
 #define OTEL_TRACING_API_VERSION	OTEL_MAKE_VERSION(OTEL_TRACING_API_MAJOR, \
 													  OTEL_TRACING_API_MINOR)
 
@@ -325,6 +325,21 @@ typedef struct OtelTracingApi
 	bool	  (*span_add_attribute_string) (OtelSpan *span,
 											const char *key,
 											const char *value);
+
+	/*
+	 * Attach a string attribute to the top-of-stack span without requiring
+	 * a pointer to it.  Intended for contrib modules (e.g. auto_explain)
+	 * that hook ExecutorEnd and want to enrich the active statement span.
+	 *
+	 * Returns true on success; false when no suitable active span is present
+	 * (empty stack, or the top entry is OTEL_UNWIND_DROP and stores no
+	 * pointer).
+	 *
+	 * The key and value pointers must remain valid until the active span is
+	 * emitted --- the same lifetime requirement as span_add_attribute_string.
+	 */
+	bool	  (*span_add_attribute_string_to_active) (const char *key,
+													  const char *value);
 
 	/*
 	 * --------------------------------------------------------------
