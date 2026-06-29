@@ -39,6 +39,7 @@
 #include "access/xact.h"
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
+#include "executor/nodeForeignscan.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -52,6 +53,7 @@
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/timestamp.h"
 
 #include <otel_api/otel.h>
@@ -95,9 +97,26 @@ static MemoryContext span_cxt = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
+static ForeignScanBegin_hook_type prev_ForeignScanBegin_hook = NULL;
+static ForeignScanEnd_hook_type prev_ForeignScanEnd_hook = NULL;
+
+/*
+ * Stack of in-flight pg.fdw.scan spans; fdw_scan_depth tracks how many
+ * are active.  Multiple ForeignScan nodes can be open simultaneously
+ * (nested-loop join over a foreign table, async FDW, etc.).
+ */
+#define OTEL_FDW_SCAN_STACK_MAX 16
+static struct
+{
+	ForeignScanState *node;		/* key: the ForeignScanState pointer */
+	OtelSpan		  span;		/* OTEL_UNWIND_DROP → static storage ok */
+} fdw_scan_stack[OTEL_FDW_SCAN_STACK_MAX];
+static int	fdw_scan_depth = 0;
 
 static void otel_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void otel_ExecutorEnd(QueryDesc *queryDesc);
+static void otel_ForeignScanBegin(ForeignScanState *node, int eflags);
+static void otel_ForeignScanEnd(ForeignScanState *node);
 static void otel_ProcessUtility(PlannedStmt *pstmt,
 								const char *queryString,
 								bool readOnlyTree,
@@ -138,6 +157,12 @@ otel_trace_install_hooks(void)
 	/* Utility-statement spans (step 4). */
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = otel_ProcessUtility;
+
+	/* FDW scan spans. */
+	prev_ForeignScanBegin_hook = ForeignScanBegin_hook;
+	ForeignScanBegin_hook = otel_ForeignScanBegin;
+	prev_ForeignScanEnd_hook = ForeignScanEnd_hook;
+	ForeignScanEnd_hook = otel_ForeignScanEnd;
 
 	RegisterXactCallback(otel_pgtracing_xact_callback, NULL);
 	on_proc_exit(otel_proc_exit_cb, (Datum) 0);
@@ -326,6 +351,27 @@ start_span(QueryDesc *queryDesc)
 	span_storage.kind = OTEL_SPAN_KIND_SERVER;
 	span_storage.status = OTEL_STATUS_UNSET;
 	span_storage.start_time = GetCurrentTimestamp();
+
+	/*
+	 * TODO: provide a clear, queryable way to distinguish HOOK-based spans
+	 * (this file: ExecutorStart/End -> "pgsql.execute", ProcessUtility ->
+	 * command-tag/"pgsql.utility") from INTERCEPTED-tracepoint spans
+	 * (otel_sdt_bridge.c: pg.query/parse/rewrite/plan/execute/sort/smgr/txn).
+	 * Today the only discriminator is the span-name convention, which is
+	 * fragile and inconsistent:
+	 *   - "pgsql.*" is meant to mean hook-based, but ProcessUtility spans are
+	 *     named by raw command tag ("SET", "BEGIN", "CREATE TABLE AS", ...),
+	 *     so they carry no "pgsql." prefix at all;
+	 *   - the InstrumentationScope is supposed to separate them (otel_pg_tracer
+	 *     here vs sdt_scope in the bridge) but the Rust exporter collapses every
+	 *     span's ScopeName to the crate name ("postgres_otel_tracing_demo"), so
+	 *     scope is useless for filtering downstream (verified in ClickHouse).
+	 * Proposed fix: set an explicit span attribute on every span at creation,
+	 * e.g. pg.otel.span_source = "executor_hook" | "process_utility_hook" |
+	 * "sdt_probe", in BOTH producers; and/or fix the exporter so distinct
+	 * InstrumentationScope names survive export, then document the
+	 * scope->producer mapping. See the companion TODO in otel_sdt_bridge.c.
+	 */
 
 	/* Flip the active flag BEFORE populating attributes --- the
 	 * attribute helpers check span_active and would silently no-op
@@ -535,6 +581,18 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
+	/*
+	 * Run cleanup first so that FDW-scan and other child spans (pushed
+	 * during ExecInitForeignScan / ExecEndForeignScan) are finalized
+	 * before we emit the enclosing pgsql.execute span.  Emitting the
+	 * parent while children are still on the producer stack would
+	 * trigger an out-of-order-emit warning and silently drop the children.
+	 */
+	if (prev_ExecutorEnd_hook)
+		prev_ExecutorEnd_hook(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+
 	/* Only finalize if this hook started the active span.  If a
 	 * utility command started the span (CTAS, etc.) and the
 	 * executor is running underneath it, the utility's hook owns
@@ -542,11 +600,83 @@ otel_ExecutorEnd(QueryDesc *queryDesc)
 	 * for the span. */
 	if (span_originator == SPAN_ORIGIN_EXECUTOR)
 		finalize_span(OTEL_STATUS_UNSET);
+}
 
-	if (prev_ExecutorEnd_hook)
-		prev_ExecutorEnd_hook(queryDesc);
-	else
-		standard_ExecutorEnd(queryDesc);
+/*
+ * ForeignScanBegin hook --- open a pg.fdw.scan span for each ForeignScan
+ * node that enters execution.  Multiple nodes can be active at the same
+ * time (nested-loop join probing a foreign table, async FDW, etc.), so
+ * we maintain a fixed-depth stack keyed by the ForeignScanState pointer.
+ *
+ * The span is a child of whatever span is currently on the producer
+ * active stack (typically the enclosing pgsql.execute or pg.execute SDT
+ * span).  We use OTEL_SPAN_KIND_CLIENT because the backend is acting as
+ * a client to an external data source.
+ */
+static void
+otel_ForeignScanBegin(ForeignScanState *node, int eflags)
+{
+	const OtelTracingApi *api = otel_pg_ensure();
+	OtelSpan   *span;
+
+	if (api == NULL || fdw_scan_depth >= OTEL_FDW_SCAN_STACK_MAX)
+	{
+		if (prev_ForeignScanBegin_hook)
+			prev_ForeignScanBegin_hook(node, eflags);
+		return;
+	}
+
+	span = &fdw_scan_stack[fdw_scan_depth].span;
+	fdw_scan_stack[fdw_scan_depth].node = node;
+
+	api->span_init(span, otel_pg_tracer, "pg.fdw.scan", OTEL_SPAN_KIND_CLIENT);
+	api->span_add_attribute_string(span, "db.system", "postgresql");
+
+	if (node->ss.ss_currentRelation != NULL)
+		api->span_add_attribute_string(span, "db.collection.name",
+									   RelationGetRelationName(node->ss.ss_currentRelation));
+
+	api->span_link_to_active_and_push(span);
+	fdw_scan_depth++;
+
+	if (prev_ForeignScanBegin_hook)
+		prev_ForeignScanBegin_hook(node, eflags);
+}
+
+/*
+ * ForeignScanEnd hook --- locate the matching entry on the stack (end
+ * may be non-LIFO with async FDW), emit its span, then compact the stack.
+ *
+ * Uses otel_api_get() rather than otel_pg_ensure() because we are only
+ * emitting an already-initialised span, not registering a new tracer scope.
+ */
+static void
+otel_ForeignScanEnd(ForeignScanState *node)
+{
+	const OtelTracingApi *api = otel_api_get();
+	int			i;
+
+	if (prev_ForeignScanEnd_hook)
+		prev_ForeignScanEnd_hook(node);
+
+	for (i = fdw_scan_depth - 1; i >= 0; i--)
+	{
+		if (fdw_scan_stack[i].node == node)
+		{
+			if (api != NULL)
+			{
+				fdw_scan_stack[i].span.end_time = GetCurrentTimestamp();
+				api->span_emit(&fdw_scan_stack[i].span);
+			}
+
+			/* Shift remaining entries down to fill the gap. */
+			for (; i < fdw_scan_depth - 1; i++)
+				fdw_scan_stack[i] = fdw_scan_stack[i + 1];
+			fdw_scan_depth--;
+			return;
+		}
+	}
+	/* Not found: already unwound via MemoryContext callback on error. */
 }
 
 /*
@@ -608,6 +738,21 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 		span_storage.tracestate = rc.tracestate;
 	}
 
+	/*
+	 * TODO: fix span nesting for utility statements that internally run a
+	 * query (e.g. CREATE TABLE AS, EXPLAIN ANALYZE, DECLARE CURSOR). The SDT
+	 * QUERY_* probes for the inner query fire and grab the propagated root as
+	 * their parent BEFORE this ProcessUtility span is pushed onto the active
+	 * span stack, so the probe span (pg.execute) and this hook span end up as
+	 * overlapping SIBLINGS under the root instead of probe-nested-under-hook.
+	 * Observed: trace 30c5b7fd... -- "CREATE TABLE AS" and "pg.execute" both
+	 * parent to the injected root and span the same ~264ms range. Contrast a
+	 * plain SELECT, which nests correctly (ExecutorStart_hook pushes
+	 * pgsql.execute before the executor runs). Fix: push this utility span
+	 * onto the producer active-span stack before calling prev_ProcessUtility
+	 * (which runs the inner query / fires the probes). See the span-stack
+	 * contract in otel_api/otel_producer.c.
+	 */
 	/* Use the utility statement's command tag as the span name.
 	 * GetCommandTagName returns a pointer into rodata --- safe to
 	 * borrow without copying. */
@@ -746,6 +891,9 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			finalize_span(OTEL_STATUS_ERROR);
+			/* FDW scan spans are dropped by the otel_api MemoryContext
+			 * callbacks on error unwind; reset our depth counter here. */
+			fdw_scan_depth = 0;
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -857,6 +1005,22 @@ capture_event_extended(OtelSpanEvent *event, ErrorData *edata)
 		event->detail = pstrdup(edata->detail);
 	if (edata->hint)
 		event->hint = pstrdup(edata->hint);
+
+	/*
+	 * TODO: full log event capture — add the remaining ErrorData fields that
+	 * the OTel log semantic conventions expect but we currently drop:
+	 *   edata->context       (PL/pgSQL and other call-context chain)
+	 *   edata->internalquery (internal query text, e.g. SPI calls)
+	 *   edata->cursorpos / edata->internalpos  (byte offsets in those queries)
+	 *   edata->schema_name, edata->table_name, edata->column_name,
+	 *   edata->datatype_name, edata->constraint_name  (catalog-object detail)
+	 * These should be stored in event->attrs (OtelKeyValue) using the standard
+	 * OTel log attribute names (exception.stacktrace for context, db.sql.table,
+	 * etc.) and gated on a GUC (otel.log_event_detail_level or similar) so
+	 * operators can cap memory use for high-volume error workloads.
+	 * Also consider: capturing events below WARNING when a trace is active and
+	 * the user has opted in (e.g. otel.log_event_min_level = notice).
+	 */
 
 	MemoryContextSwitchTo(oldcxt);
 }
