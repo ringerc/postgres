@@ -104,12 +104,17 @@ static ForeignScanEnd_hook_type prev_ForeignScanEnd_hook = NULL;
  * Stack of in-flight pg.fdw.scan spans; fdw_scan_depth tracks how many
  * are active.  Multiple ForeignScan nodes can be open simultaneously
  * (nested-loop join over a foreign table, async FDW, etc.).
+ *
+ * subxact_level records the transaction nesting level at push time so the
+ * SubXactCallback can drop entries belonging to an aborting subtransaction
+ * without touching entries from outer (still-live) subtransactions.
  */
 #define OTEL_FDW_SCAN_STACK_MAX 16
 static struct
 {
 	ForeignScanState *node;		/* key: the ForeignScanState pointer */
 	OtelSpan		  span;		/* OTEL_UNWIND_DROP → static storage ok */
+	int				  subxact_level;	/* GetCurrentTransactionNestLevel() at push */
 } fdw_scan_stack[OTEL_FDW_SCAN_STACK_MAX];
 static int	fdw_scan_depth = 0;
 
@@ -126,6 +131,10 @@ static void otel_ProcessUtility(PlannedStmt *pstmt,
 								DestReceiver *dest,
 								QueryCompletion *qc);
 static void otel_pgtracing_xact_callback(XactEvent event, void *arg);
+static void otel_pgtracing_subxact_callback(SubXactEvent event,
+											SubTransactionId mySubid,
+											SubTransactionId parentSubid,
+											void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
 static OtelSamplerDecision decide_whether_to_record(const char *name_hint);
 static void start_span(QueryDesc *queryDesc);
@@ -165,6 +174,7 @@ otel_trace_install_hooks(void)
 	ForeignScanEnd_hook = otel_ForeignScanEnd;
 
 	RegisterXactCallback(otel_pgtracing_xact_callback, NULL);
+	RegisterSubXactCallback(otel_pgtracing_subxact_callback, NULL);
 	on_proc_exit(otel_proc_exit_cb, (Datum) 0);
 }
 
@@ -650,6 +660,7 @@ otel_ForeignScanBegin(ForeignScanState *node, int eflags)
 
 	span = &fdw_scan_stack[fdw_scan_depth].span;
 	fdw_scan_stack[fdw_scan_depth].node = node;
+	fdw_scan_stack[fdw_scan_depth].subxact_level = GetCurrentTransactionNestLevel();
 
 	api->span_init(span, otel_pg_tracer, "pg.fdw.scan", OTEL_SPAN_KIND_CLIENT);
 	api->span_add_attribute_string(span, "db.system", "postgresql");
@@ -946,6 +957,60 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PRE_PREPARE:
 			break;
 	}
+}
+
+/*
+ * SubXactCallback --- clean up fdw_scan_stack[] when a subtransaction aborts.
+ *
+ * ExecEndForeignScan is NOT called on subtransaction abort; the executor
+ * tears down resources via MemoryContext reset instead.  The producer's
+ * span_stack[] is correctly maintained by on_memory_context_reset callbacks
+ * in otel_producer.c, but fdw_scan_stack[] has no such mechanism.  Without
+ * this callback, repeated ROLLBACK TO SAVEPOINT cycles over foreign scans
+ * would ratchet fdw_scan_depth toward OTEL_FDW_SCAN_STACK_MAX, after which
+ * otel_ForeignScanBegin silently stops creating new pg.fdw.scan spans.
+ * Stale node pointers also risk an ABA false-match in otel_ForeignScanEnd.
+ *
+ * On SUBXACT_EVENT_ABORT_SUB we drop all fdw_scan_stack[] entries that were
+ * pushed at the aborting nesting level or deeper.  Entries from enclosing
+ * subtransactions / the top-level transaction are preserved intact because
+ * their ForeignScan nodes are still alive and will be closed normally.
+ */
+static void
+otel_pgtracing_subxact_callback(SubXactEvent event,
+								SubTransactionId mySubid,
+								SubTransactionId parentSubid,
+								void *arg)
+{
+	int			current_level;
+	int			new_depth;
+	int			i;
+
+	if (event != SUBXACT_EVENT_ABORT_SUB || fdw_scan_depth == 0)
+		return;
+
+	/*
+	 * During SUBXACT_EVENT_ABORT_SUB, GetCurrentTransactionNestLevel()
+	 * returns the level of the subtransaction that is aborting.  Any
+	 * entry pushed at that level (or deeper, for savepoints nested within
+	 * it) belongs to code that is being rolled back and must be discarded.
+	 * The producer has already popped those spans via on_memory_context_reset.
+	 */
+	current_level = GetCurrentTransactionNestLevel();
+	new_depth = 0;
+
+	for (i = 0; i < fdw_scan_depth; i++)
+	{
+		if (fdw_scan_stack[i].subxact_level < current_level)
+		{
+			/* Pushed in an enclosing subxact; still live. */
+			if (new_depth != i)
+				fdw_scan_stack[new_depth] = fdw_scan_stack[i];
+			new_depth++;
+		}
+		/* else: belongs to the aborting subxact; producer already dropped it. */
+	}
+	fdw_scan_depth = new_depth;
 }
 
 /*
