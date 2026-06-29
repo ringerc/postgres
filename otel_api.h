@@ -327,21 +327,6 @@ typedef struct OtelTracingApi
 											const char *value);
 
 	/*
-	 * Attach a string attribute to the top-of-stack span without requiring
-	 * a pointer to it.  Intended for contrib modules (e.g. auto_explain)
-	 * that hook ExecutorEnd and want to enrich the active statement span.
-	 *
-	 * Returns true on success; false when no suitable active span is present
-	 * (empty stack, or the top entry is OTEL_UNWIND_DROP and stores no
-	 * pointer).
-	 *
-	 * The key and value pointers must remain valid until the active span is
-	 * emitted --- the same lifetime requirement as span_add_attribute_string.
-	 */
-	bool	  (*span_add_attribute_string_to_active) (const char *key,
-													  const char *value);
-
-	/*
 	 * --------------------------------------------------------------
 	 * Phase 4: surface needed by the split-out query-tracing module
 	 * (contrib/otel_postgres_tracing).  Other consumers won't
@@ -422,6 +407,23 @@ typedef struct OtelTracingApi
 	OtelInstrumentationScope *(*tracer_register) (const char *name,
 												  const char *version,
 												  const char *schema_url);
+
+	/*
+	 * Attach a string attribute to the top-of-stack span without requiring
+	 * a pointer to it.  Intended for contrib modules (e.g. auto_explain)
+	 * that hook ExecutorEnd and want to enrich the active statement span.
+	 *
+	 * Returns true on success; false when no suitable active span is present
+	 * (empty stack, or the top entry is OTEL_UNWIND_DROP and stores no
+	 * pointer).
+	 *
+	 * The key and value pointers must remain valid until the active span is
+	 * emitted --- the same lifetime requirement as span_add_attribute_string.
+	 *
+	 * Added in MINOR 2 (appended at end of struct per additive-extension rules).
+	 */
+	bool	  (*span_add_attribute_string_to_active) (const char *key,
+													  const char *value);
 } OtelTracingApi;
 
 
