@@ -1057,6 +1057,47 @@ otel_sdt_xact_cb(XactEvent event, void *arg)
 	}
 }
 
+/*
+ * otel_sdt_get_txn_context
+ *		Snapshot the identity of the currently-active pg.txn span.
+ *
+ * Returns false when no transaction span is active (txn_active == false),
+ * in which case *out is left untouched.  On success *out carries copies of
+ * the trace/span ids and flags so the caller's use need not outlive this
+ * call.  Used by otel_trace.c to link a statement span to the enclosing
+ * transaction even when no traceparent was propagated (the SDT pg.query
+ * path is gated on a propagated root context, but pg.txn is always live).
+ */
+bool
+otel_sdt_get_txn_context(OtelSpanContext *out)
+{
+	if (!txn_active)
+		return false;
+	strlcpy(out->trace_id, txn_span.trace_id, sizeof(out->trace_id));
+	strlcpy(out->span_id, txn_span.span_id, sizeof(out->span_id));
+	strlcpy(out->trace_flags, txn_span.trace_flags, sizeof(out->trace_flags));
+	out->tracestate = NULL;
+	return true;
+}
+
+/*
+ * otel_sdt_link_stmt_to_txn
+ *		Add a link from the active pg.txn span back to a statement span.
+ *
+ * No-op when no transaction span is active.  Completes the bidirectional
+ * link begun by otel_sdt_get_txn_context (the statement span links to the
+ * txn; this links the txn back to the statement).  Links past
+ * OTEL_INLINE_LINKS are silently dropped (see otel_span_add_link).
+ */
+void
+otel_sdt_link_stmt_to_txn(const char *trace_id, const char *span_id,
+						  const char *trace_flags)
+{
+	if (!txn_active)
+		return;
+	otel_span_add_link(&txn_span, trace_id, span_id, trace_flags);
+}
+
 #else							/* !PG_HAVE_SDT_PROBE_HOOK */
 
 /*

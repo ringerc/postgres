@@ -56,5 +56,20 @@ extern void otel_span_record_log_event(ErrorData *edata);
 /* Defined in otel_sdt_bridge.c.  Called once from _PG_init. */
 extern void otel_sdt_install(void);
 
+#ifdef PG_HAVE_SDT_PROBE_HOOK
+/*
+ * Cross-module link wiring between the SDT-bridge transaction span (pg.txn)
+ * and the hook-based statement spans in otel_trace.c.  Defined in
+ * otel_sdt_bridge.c; only available when the core advertises the SDT probe
+ * hook.  otel_sdt_get_txn_context() snapshots the live pg.txn identity (false
+ * if no transaction span is active); otel_sdt_link_stmt_to_txn() adds a link
+ * from the active pg.txn span back to a statement span.
+ */
+extern bool otel_sdt_get_txn_context(OtelSpanContext *out);
+extern void otel_sdt_link_stmt_to_txn(const char *trace_id,
+									  const char *span_id,
+									  const char *trace_flags);
+#endif							/* PG_HAVE_SDT_PROBE_HOOK */
+
 
 #endif							/* CONTRIB_OTEL_POSTGRES_TRACING_H */
