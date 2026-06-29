@@ -12,6 +12,8 @@ endif
 
 auto_explain = shared_module('auto_explain',
   auto_explain_sources,
+  # otel_api/otel_api.h resolves from contrib/otel_api/ via -I.../contrib.
+  c_args: ['-I' + meson.project_source_root() / 'contrib'],
   kwargs: contrib_mod_args,
 )
 contrib_targets += auto_explain
