@@ -16,6 +16,8 @@ endif
 
 postgres_fdw = shared_module('postgres_fdw',
   postgres_fdw_sources,
+  # otel_api/otel_api.h resolves from contrib/otel_api/ via -I.../contrib.
+  c_args: ['-I' + meson.project_source_root() / 'contrib'],
   kwargs: contrib_mod_args + {
     'dependencies': contrib_mod_args['dependencies'] + [libpq],
   },

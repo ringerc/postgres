@@ -21,12 +21,16 @@ ISOLATION = eval_plan_qual
 ISOLATION_OPTS = --load-extension=postgres_fdw
 TAP_TESTS = 1
 
+# Add otel_api header path (optional OTel instrumentation).  PG_CPPFLAGS
+# additions MUST precede include $(PGXS) / Makefile.global.
 ifdef USE_PGXS
-PG_CONFIG = pg_config
+PG_CONFIG ?= pg_config
+PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir-server)/extension
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
 SHLIB_PREREQS = submake-libpq
+PG_CPPFLAGS += -I$(top_srcdir)/contrib
 subdir = contrib/postgres_fdw
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global

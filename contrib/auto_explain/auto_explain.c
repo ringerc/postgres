@@ -27,6 +27,17 @@
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
+/*
+ * Optional OTel span enrichment.  When otel_api is present in the build tree
+ * (patched PostgreSQL), include its header so explain_ExecutorEnd can attach
+ * the plan text to the active statement span.  otel_api_get() returns NULL
+ * when the provider is absent at runtime, making this a safe no-op.
+ */
+#ifdef PG_HAVE_SDT_PROBE_HOOK		/* defined in pg_config_manual.h by our patch */
+#include "otel_api/otel_api.h"
+#define HAVE_OTEL_API 1
+#endif
+
 PG_MODULE_MAGIC_EXT(
 					.name = "auto_explain",
 					.version = PG_VERSION
@@ -477,6 +488,23 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				es->str->data[0] = '{';
 				es->str->data[es->str->len - 1] = '}';
 			}
+
+			/*
+			 * Enrich the active OTel statement span with the plan text.
+			 * otel_api_get() returns NULL when the provider is absent, making
+			 * this a no-op without otel_api loaded.  The plan text pointer is
+			 * valid until standard_ExecutorEnd frees es_query_cxt, which
+			 * happens after the otel hook finalizes and dispatches the span.
+			 */
+#ifdef HAVE_OTEL_API
+			{
+				const OtelTracingApi *otel = otel_api_get();
+
+				if (otel != NULL)
+					otel->span_add_attribute_string_to_active(
+						"db.postgresql.explain_plan", es->str->data);
+			}
+#endif
 
 			/*
 			 * Note: we rely on the existing logging of context or
