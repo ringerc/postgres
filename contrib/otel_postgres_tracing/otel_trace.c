@@ -412,6 +412,15 @@ start_span(QueryDesc *queryDesc)
 	if (application_name && application_name[0])
 		span_add_attr("application_name", application_name);
 
+	if (queryDesc->plannedstmt->queryId != INT64CONST(0))
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
+		char	   *qid_str = psprintf(INT64_FORMAT, queryDesc->plannedstmt->queryId);
+
+		MemoryContextSwitchTo(oldcxt);
+		span_add_attr("db.postgresql.query_id", qid_str);
+	}
+
 	/* Update the GUC for parallel-worker propagation. */
 	/* Phase 3: publish our span's identity to the per-backend
 	 * shared-memory slot so any parallel workers we spawn during
@@ -815,6 +824,15 @@ start_utility_span(PlannedStmt *pstmt, const char *queryString)
 		span_add_attr("net.peer.addr", MyProcPort->remote_host);
 	if (application_name && application_name[0])
 		span_add_attr("application_name", application_name);
+
+	if (pstmt->queryId != INT64CONST(0))
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
+		char	   *qid_str = psprintf(INT64_FORMAT, pstmt->queryId);
+
+		MemoryContextSwitchTo(oldcxt);
+		span_add_attr("db.postgresql.query_id", qid_str);
+	}
 
 	/* Phase 3: publish to per-backend slot for parallel workers
 	 * (see start_span() for the equivalent call). */
