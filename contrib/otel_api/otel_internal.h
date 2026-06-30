@@ -118,6 +118,8 @@ extern bool otel_span_add_attribute_string(OtelSpan *span,
  * consumers use api->span_link_to_active_and_push instead, which
  * fetches the parent from the active stack / root context. */
 extern void otel_producer_span_push(OtelSpan *span);
+extern bool otel_producer_span_add_attribute_string_to_active(const char *key,
+															   const char *value);
 
 /* JSON-log fallback emitter; lives in otel_trace.c for now.  Phase
  * 2 exposes it so otel_producer.c's dispatch can call it too,

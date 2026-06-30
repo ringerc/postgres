@@ -98,6 +98,21 @@ otel_resource_init(void)
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
 	/* service.name: GUC, default "postgres". */
+	/*
+	 * TODO: do not let a blank otel_api.service_name override the standard
+	 * OTEL_SERVICE_NAME environment variable. Precedence should be:
+	 *   1. otel_api.service_name GUC if explicitly set (non-empty)
+	 *   2. else OTEL_SERVICE_NAME env (and service.name in
+	 *      OTEL_RESOURCE_ATTRIBUTES) if set
+	 *   3. else "postgres"
+	 * Today the GUC always wins because its default is the literal
+	 * "postgres" (see DefineCustomStringVariable in otel.c), so the env var
+	 * is silently ignored even when the GUC was never set by the operator.
+	 * Implementing this requires changing the GUC default to NULL/"" so a
+	 * blank value is distinguishable from an explicit "postgres", then
+	 * reading getenv("OTEL_SERVICE_NAME") here as the middle fallback.
+	 * Same reasoning applies to service.instance.id / OTEL_RESOURCE_ATTRIBUTES.
+	 */
 	service_name = (otel_service_name_guc && otel_service_name_guc[0])
 		? otel_service_name_guc : "postgres";
 	push_resource_attr("service.name", pstrdup(service_name));
