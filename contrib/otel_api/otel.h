@@ -309,6 +309,10 @@ typedef struct OtelSpanEvent
  * related span in another trace (e.g. a transaction span <-> the query
  * traces that ran within it).  Demo: fixed inline storage, no overflow;
  * links past OTEL_INLINE_LINKS are dropped.
+ *
+ * TODO: add an overflow path (palloc'd extension array) or an early-flush
+ * mechanism so high-link-count spans (e.g. a long-running transaction with
+ * many query children) don't silently lose links beyond this limit.
  */
 #define OTEL_INLINE_LINKS 16
 
@@ -643,8 +647,10 @@ otel_span_add_link(OtelSpan *span,
 {
 	OtelSpanContext *l;
 
-	if (span == NULL || trace_id == NULL || span_id == NULL ||
-		span->n_links >= OTEL_INLINE_LINKS)
+	if (span == NULL || trace_id == NULL || span_id == NULL)
+		return;
+	/* TODO: overflow path or early flush instead of silently dropping */
+	if (span->n_links >= OTEL_INLINE_LINKS)
 		return;
 
 	l = &span->links[span->n_links];

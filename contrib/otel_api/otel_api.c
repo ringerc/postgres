@@ -252,6 +252,7 @@ static const OtelTracingApi otel_tracing_api = {
 	 * cross-extension symbol-resolution boundary. */
 	.span_init = otel_span_init,
 	.span_add_attribute_string = otel_span_add_attribute_string,
+	.span_add_attribute_string_to_active = otel_producer_span_add_attribute_string_to_active,
 
 	/* Phase 4: surface needed by the split-out query-tracing
 	 * module. */

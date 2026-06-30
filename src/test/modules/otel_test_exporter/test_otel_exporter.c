@@ -22,7 +22,6 @@
  */
 #include "postgres.h"
 
-#include <stddef.h>
 #include <string.h>
 
 #include "access/htup_details.h"

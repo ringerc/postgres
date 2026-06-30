@@ -1044,6 +1044,37 @@ otel_span_add_attribute_string(OtelSpan *span, const char *key, const char *valu
 
 
 /*
+ * otel_producer_span_add_attribute_string_to_active --- add a string attribute
+ * to the top-of-stack span without requiring a pointer to it.  Intended for
+ * contrib modules that hook ExecutorEnd (e.g. auto_explain) and want to
+ * enrich the active statement span without managing the span themselves.
+ *
+ * Returns true when the attribute was attached, false when there is no active
+ * span with a stored pointer (no stack entry, or top entry is OTEL_UNWIND_DROP).
+ */
+bool
+otel_producer_span_add_attribute_string_to_active(const char *key,
+												   const char *value)
+{
+	OtelSpanStackEntry *top;
+
+	if (span_stack_top < 0)
+		return false;
+
+	top = &span_stack[span_stack_top];
+
+	/*
+	 * The span pointer is stored only for OTEL_UNWIND_ERROR entries; for
+	 * OTEL_UNWIND_DROP the slot holds NULL by design (see otel_producer_span_push).
+	 */
+	if (top->span == NULL)
+		return false;
+
+	return otel_span_add_attribute_string(top->span, key, value);
+}
+
+
+/*
  * otel_producer_init --- called from contrib/otel's _PG_init.
  * Currently a no-op placeholder; Commit C will populate this with
  * MemoryContextCallback registration setup and the stack-overflow
