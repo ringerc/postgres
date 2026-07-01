@@ -38,6 +38,22 @@
 bool		otel_trace_plan_node_stats = false;
 
 /*
+ * GUC: otel.trace_plan_node_events (group-A feature gate).
+ *
+ * SEPARATE GUC from otel.trace_plan_node_stats deliberately: the compact
+ * rollup (stats) folds a bounded set of aggregate attributes onto the single
+ * pgsql.execute span, whereas the "rich" per-node events emit ONE span event
+ * per PlanState node -- far higher volume.  Operators need independent control
+ * to enable the cheap rollup without opting into the per-node event firehose,
+ * so we do not reuse trace_plan_node_stats (the TODO text suggested reuse; we
+ * diverge for this reason).  Both gates OR into instrument_options identically.
+ *
+ * Registered in otel_postgres_tracing.c _PG_init before MarkGUCPrefixReserved.
+ * Backing variable defined here; declared extern in otel_planwalk.h.
+ */
+bool		otel_trace_plan_node_events = false;
+
+/*
  * Static registry of collectors.  Fixed size — the set of collectors is
  * compile-time known (one per feature in steps 1-5).  Overflow is caught
  * at registration time with a clear error.
@@ -215,5 +231,5 @@ otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpan *stmt_span,
 bool
 otel_planwalk_want_instrumentation(void)
 {
-	return otel_trace_plan_node_stats;
+	return otel_trace_plan_node_stats || otel_trace_plan_node_events;
 }

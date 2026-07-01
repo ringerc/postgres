@@ -121,4 +121,11 @@ extern bool otel_planwalk_want_instrumentation(void);
 /* Backing variable for otel.trace_plan_node_stats GUC. */
 extern bool otel_trace_plan_node_stats;
 
+/*
+ * Backing variable for otel.trace_plan_node_events GUC ("rich" per-node span
+ * events).  Separate from trace_plan_node_stats on purpose (per-node events are
+ * far higher volume than the compact rollup); see otel_planwalk.c for rationale.
+ */
+extern bool otel_trace_plan_node_events;
+
 #endif							/* CONTRIB_OTEL_POSTGRES_TRACING_PLANWALK_H */
