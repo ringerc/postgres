@@ -3,6 +3,9 @@
 otel_postgres_tracing_sources = files(
   'otel_fdw.c',
   'otel_log.c',
+  'otel_planpath.c',
+  'otel_planspans.c',
+  'otel_planwalk.c',
   'otel_postgres_tracing.c',
   'otel_sdt_bridge.c',
   'otel_trace.c',

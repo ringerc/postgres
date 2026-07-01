@@ -87,6 +87,7 @@
 #include "executor/nodeForeignscan.h"
 #else
 #include "nodes/nodeFuncs.h"		/* planstate_tree_walker */
+#include "otel_planwalk.h"
 #endif
 
 /*
@@ -220,56 +221,62 @@ otel_fdw_executor_end(QueryDesc *queryDesc)
 
 #else							/* !OTEL_FDW_USE_CORE_HOOKS */
 
-/* ---- PG18 : planstate tree walk driven from the executor hooks ----- */
+/* ---- PG18 : planstate tree walk via the otel_planwalk dispatcher ------ */
 
+/*
+ * Collector callbacks: visit each PlanState node and open/close a
+ * pg.fdw.scan span if it is a ForeignScanState.  The walk is driven by
+ * the central otel_planwalk dispatcher (otel_planwalk.c) which performs
+ * a single planstate_tree_walker pass per ExecutorStart / ExecutorEnd.
+ */
 static bool
-otel_fdw_start_walker(PlanState *planstate, void *context)
+otel_fdw_collector_enabled(void)
 {
-	if (planstate == NULL)
-		return false;
-
-	if (IsA(planstate, ForeignScanState))
-		otel_fdw_scan_begin((ForeignScanState *) planstate);
-
-	return planstate_tree_walker(planstate, otel_fdw_start_walker, context);
+	/*
+	 * FDW tracing on PG18 is unconditional once a recording span is active.
+	 * The dispatcher is only invoked when span_active, so always return true
+	 * here.
+	 */
+	return true;
 }
 
-static bool
-otel_fdw_end_walker(PlanState *planstate, void *context)
+static void
+otel_fdw_collector_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 {
-	if (planstate == NULL)
-		return false;
-
-	if (IsA(planstate, ForeignScanState))
-		otel_fdw_scan_end((ForeignScanState *) planstate);
-
-	return planstate_tree_walker(planstate, otel_fdw_end_walker, context);
+	if (IsA(ps, ForeignScanState))
+		otel_fdw_scan_begin((ForeignScanState *) ps);
 }
+
+static void
+otel_fdw_collector_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
+{
+	if (IsA(ps, ForeignScanState))
+		otel_fdw_scan_end((ForeignScanState *) ps);
+}
+
+static const OtelPlanwalkCollector fdw_collector = {
+	otel_fdw_collector_enabled,
+	otel_fdw_collector_node_begin,
+	otel_fdw_collector_node_end,
+};
 
 void
 otel_fdw_install_hooks(void)
 {
-	/* Nothing to install: driven from otel_trace.c's executor hooks. */
+	/* Register this collector with the central dispatcher. */
+	otel_planwalk_register_collector(&fdw_collector);
 }
 
 void
 otel_fdw_executor_start(QueryDesc *queryDesc)
 {
-	if (queryDesc == NULL || queryDesc->planstate == NULL)
-		return;
-
-	/* Process the root too, hence walk from the root node itself. */
-	(void) otel_fdw_start_walker(queryDesc->planstate, NULL);
+	/* Walk is now driven by otel_planwalk_executor_start in otel_trace.c. */
 }
 
 void
 otel_fdw_executor_end(QueryDesc *queryDesc)
 {
-	/* Cheap gate: nothing open means no foreign scans this execution. */
-	if (fdw_scan_depth == 0 || queryDesc == NULL || queryDesc->planstate == NULL)
-		return;
-
-	(void) otel_fdw_end_walker(queryDesc->planstate, NULL);
+	/* Walk is now driven by otel_planwalk_executor_end in otel_trace.c. */
 }
 
 #endif							/* OTEL_FDW_USE_CORE_HOOKS */

@@ -42,6 +42,9 @@
 #include <otel_api/otel_api.h>
 
 #include "otel_postgres_tracing.h"
+#include "otel_planwalk.h"
+#include "otel_planpath.h"
+#include "otel_planspans.h"
 
 
 PG_MODULE_MAGIC;
@@ -150,9 +153,37 @@ _PG_init(void)
 	 * unrecognised placeholders under a reserved prefix and silently
 	 * dropped at load time.
 	 */
+	/*
+	 * otel.trace_plan_node_stats: group-A gate for per-node Instrumentation.
+	 * When on (and a span is active), INSTRUMENT_TIMER | INSTRUMENT_ROWS |
+	 * INSTRUMENT_BUFFERS | INSTRUMENT_WAL are ORed into
+	 * queryDesc->instrument_options before standard_ExecutorStart so the
+	 * executor allocates per-node Instrumentation for sampled queries.
+	 * Must be registered BEFORE MarkGUCPrefixReserved("otel") below.
+	 */
+	DefineCustomBoolVariable("otel.trace_plan_node_stats",
+							 "Collect per-node execution statistics for sampled queries.",
+							 "When on, enables per-node Instrumentation (timing, rows, buffers) "
+							 "for queries that are being traced. Has no effect when no span is "
+							 "active for a given query. Off by default.",
+							 &otel_trace_plan_node_stats,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	otel_trace_install_hooks();
 	otel_log_install_hooks();
 	otel_sdt_install();
+
+	/*
+	 * Register the planstate-walker collectors.  otel_planpath_install only
+	 * registers a collector (its otel.trace_plan_node_stats GUC is defined
+	 * above); otel_planspans_install also defines otel.trace_plan_child_spans,
+	 * so it MUST run before MarkGUCPrefixReserved("otel") below.
+	 */
+	otel_planpath_install();
+	otel_planspans_install();
 
 	/*
 	 * Reserve the "otel." and "otel_postgres_tracing." GUC prefixes now

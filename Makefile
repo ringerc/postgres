@@ -5,6 +5,9 @@ OBJS = \
 	$(WIN32RES) \
 	otel_fdw.o \
 	otel_log.o \
+	otel_planpath.o \
+	otel_planspans.o \
+	otel_planwalk.o \
 	otel_postgres_tracing.o \
 	otel_sdt_bridge.o \
 	otel_trace.o
