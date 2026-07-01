@@ -6,6 +6,7 @@ OBJS = \
 	otel_fdw.o \
 	otel_log.o \
 	otel_planpath.o \
+	otel_planshape.o \
 	otel_planspans.o \
 	otel_planwalk.o \
 	otel_postgres_tracing.o \

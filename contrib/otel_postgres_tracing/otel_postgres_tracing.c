@@ -45,6 +45,7 @@
 #include "otel_planwalk.h"
 #include "otel_planpath.h"
 #include "otel_planspans.h"
+#include "otel_planshape.h"
 
 
 PG_MODULE_MAGIC;
@@ -184,6 +185,7 @@ _PG_init(void)
 	 */
 	otel_planpath_install();
 	otel_planspans_install();
+	otel_planshape_install();
 
 	/*
 	 * Reserve the "otel." and "otel_postgres_tracing." GUC prefixes now
