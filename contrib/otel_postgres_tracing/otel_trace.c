@@ -54,9 +54,13 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
+#include "executor/instrument.h"
+
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
 #include "otel_fdw.h"
+#include "otel_planwalk.h"
+#include "otel_planspans.h"
 
 /*
  * Span lifecycle state --- per backend.
@@ -146,6 +150,9 @@ otel_trace_install_hooks(void)
 
 	/* FDW scan spans (pg.fdw.scan); strategy is version-gated in otel_fdw.c. */
 	otel_fdw_install_hooks();
+
+	/* Planstate-walker dispatcher; also called by collectors at their install. */
+	otel_planwalk_install();
 
 	RegisterXactCallback(otel_pgtracing_xact_callback, NULL);
 	RegisterSubXactCallback(otel_pgtracing_subxact_callback, NULL);
@@ -586,6 +593,17 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		PG_END_TRY();
 	}
 
+	/*
+	 * Step 2: if any group-A feature is enabled, turn on per-node
+	 * Instrumentation for this query so collectors can read timing/row counts
+	 * at ExecutorEnd.  Must happen BEFORE standard_ExecutorStart so the
+	 * executor allocates Instrumentation nodes; mirrors auto_explain.c's
+	 * explain_ExecutorStart pattern exactly.
+	 */
+	if (span_active && otel_planwalk_want_instrumentation())
+		queryDesc->instrument_options |= INSTRUMENT_TIMER | INSTRUMENT_ROWS |
+			INSTRUMENT_BUFFERS | INSTRUMENT_WAL;
+
 	/* Chain. */
 	if (prev_ExecutorStart_hook)
 		prev_ExecutorStart_hook(queryDesc, eflags);
@@ -593,30 +611,32 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		standard_ExecutorStart(queryDesc, eflags);
 
 	/*
-	 * Open pg.fdw.scan spans now that the planstate tree exists.  Gated on
-	 * span_active so unsampled queries skip the work entirely (and so the
-	 * spans have a parent to nest under).  No-op on PG19+, where the core
-	 * ForeignScanBegin hook does this; see otel_fdw.c.
+	 * Drive the planstate-walker dispatcher now that the planstate tree exists.
+	 * Gated on span_active so unsampled queries skip the walk entirely.
+	 * On PG19+, the FDW collector is not registered (it uses core hooks
+	 * instead), so this dispatcher end-walk is a cheap no-op for FDW-less
+	 * queries on PG19+.  On PG18, the FDW collector registered here handles
+	 * pg.fdw.scan spans.  See otel_planwalk.c and otel_fdw.c.
 	 */
 	if (span_active)
-		otel_fdw_executor_start(queryDesc);
+		otel_planwalk_executor_start(queryDesc, &span_storage, span_cxt);
 }
 
 static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
 	/*
-	 * Emit any pg.fdw.scan spans first, so child spans are finalized before
-	 * we emit the enclosing pgsql.execute span -- emitting the parent while
-	 * children are still on the producer stack would trigger an
-	 * out-of-order-emit warning and silently drop the children.
+	 * Drive the planstate-walker end-walk before standard_ExecutorEnd frees
+	 * the planstate nodes, and before finalize_span emits the parent
+	 * pgsql.execute span (child spans must be emitted first to avoid
+	 * out-of-order-emit warnings from the producer).
 	 *
-	 * On PG18 this must happen before standard_ExecutorEnd frees the
-	 * ForeignScanState nodes we walk; no-op on PG19+, where the core
-	 * ForeignScanEnd hook (fired during standard_ExecutorEnd below) does it.
-	 * See otel_fdw.c.
+	 * On PG18, this runs the FDW collector which emits pg.fdw.scan spans.
+	 * On PG19+, no FDW collector is registered (core ForeignScanEnd hooks
+	 * do that work during standard_ExecutorEnd below), so this is a cheap
+	 * no-op when no other collector is enabled.
 	 */
-	otel_fdw_executor_end(queryDesc);
+	otel_planwalk_executor_end(queryDesc, &span_storage, span_cxt);
 
 	if (prev_ExecutorEnd_hook)
 		prev_ExecutorEnd_hook(queryDesc);
@@ -874,9 +894,11 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			finalize_span(OTEL_STATUS_ERROR);
-			/* FDW scan spans are dropped by the otel_api MemoryContext
-			 * callbacks on error unwind; reset their tracking here. */
+			/* FDW scan spans and curated child spans are dropped by the
+			 * otel_api MemoryContext callbacks on error unwind; reset their
+			 * tracking here. */
 			otel_fdw_reset();
+			otel_planspans_reset();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -900,6 +922,7 @@ otel_pgtracing_subxact_callback(SubXactEvent event,
 								void *arg)
 {
 	otel_fdw_subxact_abort(event);
+	otel_planspans_subxact_abort(event);
 }
 
 /*
