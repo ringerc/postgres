@@ -56,6 +56,7 @@
 
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
+#include "otel_fdw.h"
 
 /*
  * Span lifecycle state --- per backend.
@@ -107,6 +108,10 @@ static void otel_ProcessUtility(PlannedStmt *pstmt,
 								DestReceiver *dest,
 								QueryCompletion *qc);
 static void otel_pgtracing_xact_callback(XactEvent event, void *arg);
+static void otel_pgtracing_subxact_callback(SubXactEvent event,
+											SubTransactionId mySubid,
+											SubTransactionId parentSubid,
+											void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
 static OtelSamplerDecision decide_whether_to_record(const char *name_hint);
 static void start_span(QueryDesc *queryDesc);
@@ -139,7 +144,11 @@ otel_trace_install_hooks(void)
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = otel_ProcessUtility;
 
+	/* FDW scan spans (pg.fdw.scan); strategy is version-gated in otel_fdw.c. */
+	otel_fdw_install_hooks();
+
 	RegisterXactCallback(otel_pgtracing_xact_callback, NULL);
+	RegisterSubXactCallback(otel_pgtracing_subxact_callback, NULL);
 	on_proc_exit(otel_proc_exit_cb, (Datum) 0);
 }
 
@@ -582,18 +591,33 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		prev_ExecutorStart_hook(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+
+	/*
+	 * Open pg.fdw.scan spans now that the planstate tree exists.  Gated on
+	 * span_active so unsampled queries skip the work entirely (and so the
+	 * spans have a parent to nest under).  No-op on PG19+, where the core
+	 * ForeignScanBegin hook does this; see otel_fdw.c.
+	 */
+	if (span_active)
+		otel_fdw_executor_start(queryDesc);
 }
 
 static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
 	/*
-	 * Run cleanup first so that FDW-scan and other child spans (pushed
-	 * during ExecInitForeignScan / ExecEndForeignScan) are finalized
-	 * before we emit the enclosing pgsql.execute span.  Emitting the
-	 * parent while children are still on the producer stack would
-	 * trigger an out-of-order-emit warning and silently drop the children.
+	 * Emit any pg.fdw.scan spans first, so child spans are finalized before
+	 * we emit the enclosing pgsql.execute span -- emitting the parent while
+	 * children are still on the producer stack would trigger an
+	 * out-of-order-emit warning and silently drop the children.
+	 *
+	 * On PG18 this must happen before standard_ExecutorEnd frees the
+	 * ForeignScanState nodes we walk; no-op on PG19+, where the core
+	 * ForeignScanEnd hook (fired during standard_ExecutorEnd below) does it.
+	 * See otel_fdw.c.
 	 */
+	otel_fdw_executor_end(queryDesc);
+
 	if (prev_ExecutorEnd_hook)
 		prev_ExecutorEnd_hook(queryDesc);
 	else
@@ -850,6 +874,9 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			finalize_span(OTEL_STATUS_ERROR);
+			/* FDW scan spans are dropped by the otel_api MemoryContext
+			 * callbacks on error unwind; reset their tracking here. */
+			otel_fdw_reset();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -859,6 +886,20 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PRE_PREPARE:
 			break;
 	}
+}
+
+/*
+ * SubXactCallback --- on subtransaction abort, hand off to otel_fdw.c to
+ * clean up any in-flight pg.fdw.scan spans (ExecEndForeignScan / the
+ * ExecutorEnd walk do not run on subxact abort).  See otel_fdw.c.
+ */
+static void
+otel_pgtracing_subxact_callback(SubXactEvent event,
+								SubTransactionId mySubid,
+								SubTransactionId parentSubid,
+								void *arg)
+{
+	otel_fdw_subxact_abort(event);
 }
 
 /*

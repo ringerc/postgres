@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 otel_postgres_tracing_sources = files(
+  'otel_fdw.c',
   'otel_log.c',
   'otel_postgres_tracing.c',
   'otel_sdt_bridge.c',
