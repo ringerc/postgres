@@ -240,7 +240,15 @@ maybe_insert_slowest(const char *tag, double total_ms)
 static bool
 planpath_enabled(void)
 {
-	return otel_trace_plan_node_stats;
+	/*
+	 * The collector's walk runs if EITHER the compact rollup
+	 * (otel.trace_plan_node_stats) OR the rich per-node events
+	 * (otel.trace_plan_node_events) are on.  The two emit paths are
+	 * independent: node_end reads each node's instrument once and (a) feeds
+	 * the compact accumulator when stats is on, and (b) emits a pg.plan.node
+	 * event when events is on.
+	 */
+	return otel_trace_plan_node_stats || otel_trace_plan_node_events;
 }
 
 /*
@@ -550,6 +558,73 @@ planpath_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 		{
 			accum.worst_ratio = ratio;
 			accum.worst_node_tag = tag_name;
+		}
+	}
+
+	/* ----------------------------------------------------------------
+	 * Proposal 1 "rich": one span event per plan node.
+	 *
+	 * Additive and independent of the compact accumulation above -- gated on
+	 * its own GUC (otel.trace_plan_node_events).  We reuse the very same
+	 * finalized NodeInstrumentation fields the compact path reads (ni->startup,
+	 * ni->instr.total, ni->ntuples, ni->nloops, ni->instr.bufusage.*), so the
+	 * field access mirrors that code exactly.  No child spans are minted.
+	 *
+	 * All per-node events share the ExecutorEnd timestamp: we pass ts=0 ("now")
+	 * -- there is no per-node wall-clock capture point, only the aggregate
+	 * end-walk moment.  Attribute values are built transiently in ctx->attr_cxt
+	 * with psprintf; the generic event API COPIES name + attrs into the span's
+	 * context, so they may go out of scope immediately after the call.
+	 * ---------------------------------------------------------------- */
+	if (otel_trace_plan_node_events)
+	{
+		const OtelTracingApi *api = otel_api_get();
+
+		if (api != NULL && ctx->stmt_span != NULL && api->span_add_event != NULL)
+		{
+			OtelKeyValue attrs[8];
+			int			n = 0;
+			MemoryContext old = MemoryContextSwitchTo(ctx->attr_cxt);
+			double		startup_ms = INSTR_TIME_GET_MILLISEC(ni->startup) / ni->nloops;
+			double		total_ms = INSTR_TIME_GET_MILLISEC(ni->instr.total) / ni->nloops;
+			double		rows = ni->ntuples / ni->nloops;
+
+			/* Node type: string literal from nodetag_name(), no psprintf. */
+			attrs[n].key = "pg.plan.node.type";
+			attrs[n].value = tag_name;
+			n++;
+
+			attrs[n].key = "pg.plan.node.actual_startup_ms";
+			attrs[n].value = psprintf("%.3f", startup_ms); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			attrs[n].key = "pg.plan.node.actual_total_ms";
+			attrs[n].value = psprintf("%.3f", total_ms); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			attrs[n].key = "pg.plan.node.rows";
+			attrs[n].value = psprintf("%.0f", rows); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			attrs[n].key = "pg.plan.node.loops";
+			attrs[n].value = psprintf("%.0f", ni->nloops); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			attrs[n].key = "pg.plan.node.buffers_read";
+			attrs[n].value = psprintf(INT64_FORMAT, (int64) ni->instr.bufusage.shared_blks_read); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			attrs[n].key = "pg.plan.node.buffers_hit";
+			attrs[n].value = psprintf(INT64_FORMAT, (int64) ni->instr.bufusage.shared_blks_hit); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			attrs[n].key = "pg.plan.node.buffers_dirtied";
+			attrs[n].value = psprintf(INT64_FORMAT, (int64) ni->instr.bufusage.shared_blks_dirtied); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			n++;
+
+			api->span_add_event(ctx->stmt_span, "pg.plan.node", 0, attrs, n);
+
+			MemoryContextSwitchTo(old);
 		}
 	}
 }

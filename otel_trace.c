@@ -125,9 +125,8 @@ static void finalize_span(OtelSpanStatus status);
 static void generate_span_id(char out[OTEL_SPAN_ID_LEN + 1]);
 static void bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst);
 static void span_add_attr(const char *key, const char *value);
-static OtelSpanEvent *acquire_event_slot(void);
-static void capture_event_core(OtelEventCore *core, ErrorData *edata);
-static void capture_event_extended(OtelSpanEvent *event, ErrorData *edata);
+static void capture_event_core(OtelErrorCapture *ec, ErrorData *edata);
+static void capture_event_extended(OtelErrorCapture *ec, ErrorData *edata);
 /* otel_emit_span_as_log_line: the JSON log-line fallback emitter
  * lives in contrib/otel; this module reaches it via the producer
  * dispatch when otel.emit_spans_to_log is on. */
@@ -954,88 +953,41 @@ otel_proc_exit_cb(int code, Datum arg)
  * ==================================================================== */
 
 /*
- * Find or allocate an event slot on the current span.
- *
- * Returns the inline_event slot on first use (no allocation needed).
- * On subsequent calls, tries to grow the overflow_events array.
- * Returns NULL if the inline slot is already used and the overflow
- * allocation failed --- caller still updates span status.
- */
-static OtelSpanEvent *
-acquire_event_slot(void)
-{
-	OtelSpanEvent *slot = NULL;
-
-	if (!span_storage.inline_event_used)
-	{
-		span_storage.inline_event_used = true;
-		memset(&span_storage.inline_event, 0, sizeof(span_storage.inline_event));
-		return &span_storage.inline_event;
-	}
-
-	PG_TRY();
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
-		int			newcnt = span_storage.n_overflow_events + 1;
-		OtelSpanEvent *newarr;
-
-		if (span_storage.overflow_events == NULL)
-			newarr = palloc(sizeof(OtelSpanEvent) * newcnt);
-		else
-			newarr = repalloc(span_storage.overflow_events,
-							  sizeof(OtelSpanEvent) * newcnt);
-		/* Zero the new slot; older slots are already populated. */
-		memset(&newarr[newcnt - 1], 0, sizeof(OtelSpanEvent));
-		span_storage.overflow_events = newarr;
-		span_storage.n_overflow_events = newcnt;
-		slot = &span_storage.overflow_events[newcnt - 1];
-		MemoryContextSwitchTo(oldcxt);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-		slot = NULL;
-	}
-	PG_END_TRY();
-
-	return slot;
-}
-
-/*
- * Populate the core of an event from ErrorData.  Always succeeds; no
- * allocation, no failure modes.
+ * Populate the core of the error capture from ErrorData.  Always
+ * succeeds; no allocation, no failure modes --- only scalars and
+ * pointers to never-freed constants (see OtelErrorCapture).
  */
 static void
-capture_event_core(OtelEventCore *core, ErrorData *edata)
+capture_event_core(OtelErrorCapture *ec, ErrorData *edata)
 {
 	const char *sqlstate = unpack_sql_state(edata->sqlerrcode);
 
-	core->time = GetCurrentTimestamp();
-	core->elevel = edata->elevel;
+	ec->time = GetCurrentTimestamp();
+	ec->elevel = edata->elevel;
 	/* sqlstate is 5 chars + NUL; unpack_sql_state returns a pointer
 	 * to a static buffer.  Copy by value. */
-	memcpy(core->sqlstate, sqlstate, 6);
-	core->filename = edata->filename;	/* points at __FILE__ literal */
-	core->lineno = edata->lineno;
-	core->funcname = edata->funcname;	/* points at __func__ literal */
+	memcpy(ec->sqlstate, sqlstate, 6);
+	ec->filename = edata->filename;		/* points at __FILE__ literal */
+	ec->lineno = edata->lineno;
+	ec->funcname = edata->funcname;		/* points at __func__ literal */
 }
 
 /*
- * Populate the optional extended fields of an event.  Best-effort:
- * any individual field may end up NULL if its allocation fails.
- * Caller wraps in PG_TRY for the harder failure modes.
+ * Populate the optional extended fields of the error capture.
+ * Best-effort: any individual field may end up NULL if its allocation
+ * fails.  Caller wraps in PG_TRY for the harder failure modes.
  */
 static void
-capture_event_extended(OtelSpanEvent *event, ErrorData *edata)
+capture_event_extended(OtelErrorCapture *ec, ErrorData *edata)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
 
 	if (edata->message)
-		event->message = pstrdup(edata->message);
+		ec->message = pstrdup(edata->message);
 	if (edata->detail)
-		event->detail = pstrdup(edata->detail);
+		ec->detail = pstrdup(edata->detail);
 	if (edata->hint)
-		event->hint = pstrdup(edata->hint);
+		ec->hint = pstrdup(edata->hint);
 
 	/*
 	 * TODO: full log event capture — add the remaining ErrorData fields that
@@ -1072,17 +1024,30 @@ capture_event_extended(OtelSpanEvent *event, ErrorData *edata)
 void
 otel_span_record_log_event(ErrorData *edata)
 {
-	OtelSpanEvent *event;
+	OtelErrorCapture *ec = &span_storage.error_event;
 
 	if (!span_active || edata->elevel < WARNING)
 		return;
 
-	event = acquire_event_slot();
-
-	if (event != NULL)
+	/*
+	 * The span carries a single producer-private error-capture slot (no
+	 * inline/overflow event array on the error path anymore --- generic
+	 * events go through span_add_event).  When more than one qualifying
+	 * ereport fires on the same span, keep the most severe (ties resolved
+	 * in favour of the latest), so the terminating ERROR always wins over
+	 * a preceding WARNING.  At emit time the producer lowers this into an
+	 * "exception" event in span->events.
+	 */
+	if (!span_storage.error_event_used ||
+		edata->elevel >= ec->elevel)
 	{
+		/* Reset so a lower-severity prior capture's best-effort strings
+		 * don't linger; they live in span_cxt and are freed on reset. */
+		memset(ec, 0, sizeof(*ec));
+		span_storage.error_event_used = true;
+
 		/* Core is always populated --- no allocation needed. */
-		capture_event_core(&event->core, edata);
+		capture_event_core(ec, edata);
 
 		/* Extended capture: skip entirely under OOM/FATAL+ to
 		 * avoid re-entering the allocator from the error path. */
@@ -1091,7 +1056,7 @@ otel_span_record_log_event(ErrorData *edata)
 		{
 			PG_TRY();
 			{
-				capture_event_extended(event, edata);
+				capture_event_extended(ec, edata);
 			}
 			PG_CATCH();
 			{
