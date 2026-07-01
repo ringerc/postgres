@@ -61,6 +61,7 @@
 #include "otel_fdw.h"
 #include "otel_planwalk.h"
 #include "otel_planspans.h"
+#include "otel_planshape.h"
 
 /*
  * Span lifecycle state --- per backend.
@@ -619,7 +620,17 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * pg.fdw.scan spans.  See otel_planwalk.c and otel_fdw.c.
 	 */
 	if (span_active)
+	{
 		otel_planwalk_executor_start(queryDesc, &span_storage, span_cxt);
+
+		/*
+		 * Plan-shape capture (proposal 4): a separate Plan-tree walk that
+		 * stamps the statement span with a shape digest + structural-risk
+		 * flags.  Self-gates on otel.trace_plan_shape.  Runs at start so it is
+		 * captured even for queries that error during execution.
+		 */
+		otel_planshape_executor_start(queryDesc, &span_storage, span_cxt);
+	}
 }
 
 static void
