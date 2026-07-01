@@ -297,66 +297,35 @@ otel_emit_span_as_log_line(const OtelSpan *span)
 	}
 	appendStringInfoChar(&buf, '}');
 
+	/*
+	 * Events: the unified generic list.  Any ereport-derived
+	 * "exception" event has already been lowered into span->events by
+	 * otel_producer_span_emit before dispatch, so this path is fully
+	 * generic --- name, time, and attrs.  There is no longer any
+	 * elevel/sqlstate/filename/... special-casing here.
+	 */
 	appendStringInfoString(&buf, ",\"events\":[");
-	first = true;
-	if (span->inline_event_used)
+	for (i = 0; i < span->n_events; i++)
 	{
-		const OtelSpanEvent *e = &span->inline_event;
+		const OtelSpanEvent *e = &span->events[i];
+		int			j;
 
+		if (i > 0)
+			appendStringInfoChar(&buf, ',');
 		appendStringInfoChar(&buf, '{');
-		appendStringInfo(&buf, "\"time\":%" PRId64,
-						 (int64) e->core.time);
-		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
-		appendStringInfoString(&buf, ",\"sqlstate\":");
-		escape_json(&buf, e->core.sqlstate);
-		if (e->core.filename)
+		appendStringInfoString(&buf, "\"name\":");
+		escape_json(&buf, e->name ? e->name : "");
+		appendStringInfo(&buf, ",\"time\":%" PRId64, (int64) e->time);
+		appendStringInfoString(&buf, ",\"attributes\":{");
+		for (j = 0; j < e->n_attrs; j++)
 		{
-			appendStringInfoString(&buf, ",\"filename\":");
-			escape_json(&buf, e->core.filename);
-		}
-		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
-		if (e->message)
-		{
-			appendStringInfoString(&buf, ",\"message\":");
-			escape_json(&buf, e->message);
-		}
-		if (e->detail)
-		{
-			appendStringInfoString(&buf, ",\"detail\":");
-			escape_json(&buf, e->detail);
-		}
-		if (e->hint)
-		{
-			appendStringInfoString(&buf, ",\"hint\":");
-			escape_json(&buf, e->hint);
+			if (j > 0)
+				appendStringInfoChar(&buf, ',');
+			escape_json(&buf, e->attrs[j].key ? e->attrs[j].key : "");
+			appendStringInfoChar(&buf, ':');
+			escape_json(&buf, e->attrs[j].value ? e->attrs[j].value : "");
 		}
 		appendStringInfoChar(&buf, '}');
-		first = false;
-	}
-	for (i = 0; i < span->n_overflow_events; i++)
-	{
-		const OtelSpanEvent *e = &span->overflow_events[i];
-
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		appendStringInfoChar(&buf, '{');
-		appendStringInfo(&buf, "\"time\":%" PRId64,
-						 (int64) e->core.time);
-		appendStringInfo(&buf, ",\"elevel\":%d", e->core.elevel);
-		appendStringInfoString(&buf, ",\"sqlstate\":");
-		escape_json(&buf, e->core.sqlstate);
-		if (e->core.filename)
-		{
-			appendStringInfoString(&buf, ",\"filename\":");
-			escape_json(&buf, e->core.filename);
-		}
-		appendStringInfo(&buf, ",\"lineno\":%d", e->core.lineno);
-		if (e->message)
-		{
-			appendStringInfoString(&buf, ",\"message\":");
-			escape_json(&buf, e->message);
-		}
 		appendStringInfoChar(&buf, '}');
 	}
 	appendStringInfoChar(&buf, ']');
@@ -899,6 +868,90 @@ otel_producer_span_stack_depth(void)
  * Commit C adds per-entry unwind_policy handling (DROP silently /
  * ERROR emits-with-ERROR-status).
  */
+/*
+ * lower_error_event --- synthesize the generic "exception" OtelSpanEvent
+ * from a span's producer-private OtelErrorCapture and append it to
+ * span->events.  This is the single place the ereport->attribute mapping
+ * lives; exporters see only the resulting generic event.
+ *
+ * Attribute keys match what downstream translators expect
+ * (postgres.sqlstate / postgres.elevel / code.filepath / code.lineno /
+ * code.function / postgres.detail / postgres.hint) plus exception.message
+ * for the message.  Numeric fields (elevel, lineno) are stringified ---
+ * OtelKeyValue is string-only for now.
+ *
+ * On OOM the full event may be dropped; we then degrade to a literal
+ * name="exception" event with zero attrs (no allocation for name in the
+ * degraded path beyond the events-array slot itself).
+ */
+static void
+lower_error_event(OtelSpan *span)
+{
+	const OtelErrorCapture *ec = &span->error_event;
+	OtelKeyValue attrs[8];
+	int			n = 0;
+	char		elevel_buf[16];
+	char		lineno_buf[16];
+	int			before;
+
+	/* exception.message (best-effort; may be NULL) */
+	if (ec->message != NULL)
+	{
+		attrs[n].key = "exception.message";
+		attrs[n].value = ec->message;
+		n++;
+	}
+	if (ec->sqlstate[0] != '\0')
+	{
+		attrs[n].key = "postgres.sqlstate";
+		attrs[n].value = ec->sqlstate;
+		n++;
+	}
+	snprintf(elevel_buf, sizeof(elevel_buf), "%d", ec->elevel);
+	attrs[n].key = "postgres.elevel";
+	attrs[n].value = elevel_buf;
+	n++;
+	if (ec->filename != NULL)
+	{
+		attrs[n].key = "code.filepath";
+		attrs[n].value = ec->filename;
+		n++;
+	}
+	snprintf(lineno_buf, sizeof(lineno_buf), "%d", ec->lineno);
+	attrs[n].key = "code.lineno";
+	attrs[n].value = lineno_buf;
+	n++;
+	if (ec->funcname != NULL)
+	{
+		attrs[n].key = "code.function";
+		attrs[n].value = ec->funcname;
+		n++;
+	}
+	if (ec->detail != NULL)
+	{
+		attrs[n].key = "postgres.detail";
+		attrs[n].value = ec->detail;
+		n++;
+	}
+	if (ec->hint != NULL)
+	{
+		attrs[n].key = "postgres.hint";
+		attrs[n].value = ec->hint;
+		n++;
+	}
+
+	before = span->n_events;
+	otel_producer_span_add_event(span, "exception", ec->time, attrs, n);
+
+	/*
+	 * If the full event could not be allocated (attrs copy or array grow
+	 * failed under memory pressure), degrade to a literal name="exception"
+	 * event with zero attrs.
+	 */
+	if (span->n_events == before)
+		otel_producer_span_add_event(span, "exception", ec->time, NULL, 0);
+}
+
 void
 otel_producer_span_emit(OtelSpan *span)
 {
@@ -906,6 +959,18 @@ otel_producer_span_emit(OtelSpan *span)
 
 	if (span == NULL)
 		return;
+
+	/*
+	 * Lower any producer-private ereport capture into a generic
+	 * "exception" event before dispatch, so span->events is the complete
+	 * list every exporter reads.  Guarded so a span emitted twice (rare)
+	 * doesn't lower twice.
+	 */
+	if (span->error_event_used)
+	{
+		span->error_event_used = false;
+		lower_error_event(span);
+	}
 
 	/*
 	 * Locate the span on the stack (if pushed).  Search from top down
@@ -1071,6 +1136,161 @@ otel_producer_span_add_attribute_string_to_active(const char *key,
 		return false;
 
 	return otel_span_add_attribute_string(top->span, key, value);
+}
+
+
+/*
+ * otel_producer_span_add_event --- append a named generic event to a span.
+ *
+ * COPY semantics: the event name and every attribute key/value string,
+ * plus the OtelKeyValue array itself, are pstrdup'd / copied into the
+ * CurrentMemoryContext so the caller may free or reuse its transient
+ * buffers immediately.  (This is the per-node/transient-attrs case; it
+ * intentionally diverges from span_add_attribute_string's borrow rule.)
+ *
+ * ts == 0 means "now" (GetCurrentTimestamp()).  attrs may be NULL when
+ * n_attrs <= 0.
+ *
+ * The span->events array grows one entry at a time via
+ * palloc/repalloc with MCXT_ALLOC_NO_OOM (matching the overflow-attr
+ * pattern); on any allocation failure the event is silently dropped ---
+ * best-effort instrumentation, never breaks the query.
+ */
+void
+otel_producer_span_add_event(OtelSpan *span, const char *name,
+							 TimestampTz ts, const OtelKeyValue *attrs,
+							 int n_attrs)
+{
+	int			newcnt;
+	OtelSpanEvent *newarr;
+	OtelSpanEvent *ev;
+	char	   *name_copy;
+	OtelKeyValue *attrs_copy = NULL;
+
+	if (span == NULL)
+		return;
+	if (n_attrs < 0)
+		n_attrs = 0;
+	if (attrs == NULL)
+		n_attrs = 0;
+
+	if (ts == 0)
+		ts = GetCurrentTimestamp();
+
+	/*
+	 * Copy the name.  On OOM we drop the whole event (best-effort).
+	 */
+	name_copy = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
+													(name ? strlen(name) : 0) + 1,
+													MCXT_ALLOC_NO_OOM);
+	if (name_copy == NULL)
+		return;
+	if (name != NULL)
+		strcpy(name_copy, name);
+	else
+		name_copy[0] = '\0';
+
+	/*
+	 * Copy the attribute array + each key/value string.  On any OOM we
+	 * abandon the whole event (the already-allocated name_copy is left
+	 * for the span context to reclaim; harmless).
+	 */
+	if (n_attrs > 0)
+	{
+		int			k;
+
+		attrs_copy = (OtelKeyValue *)
+			MemoryContextAllocExtended(CurrentMemoryContext,
+									   sizeof(OtelKeyValue) * n_attrs,
+									   MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
+		if (attrs_copy == NULL)
+			return;
+
+		for (k = 0; k < n_attrs; k++)
+		{
+			const char *key = attrs[k].key;
+			const char *val = attrs[k].value;
+			char	   *keyc = NULL;
+			char	   *valc = NULL;
+
+			if (key != NULL)
+			{
+				keyc = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
+														   strlen(key) + 1,
+														   MCXT_ALLOC_NO_OOM);
+				if (keyc == NULL)
+					return;		/* drop event */
+				strcpy(keyc, key);
+			}
+			if (val != NULL)
+			{
+				valc = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
+														   strlen(val) + 1,
+														   MCXT_ALLOC_NO_OOM);
+				if (valc == NULL)
+					return;		/* drop event */
+				strcpy(valc, val);
+			}
+			attrs_copy[k].key = keyc;
+			attrs_copy[k].value = valc;
+		}
+	}
+
+	/* Grow the events array by one. */
+	newcnt = span->n_events + 1;
+	if (span->events == NULL)
+		newarr = (OtelSpanEvent *)
+			MemoryContextAllocExtended(CurrentMemoryContext,
+									   sizeof(OtelSpanEvent) * newcnt,
+									   MCXT_ALLOC_NO_OOM);
+	else
+		newarr = (OtelSpanEvent *)
+			repalloc_extended(span->events,
+							  sizeof(OtelSpanEvent) * newcnt,
+							  MCXT_ALLOC_NO_OOM);
+	if (newarr == NULL)
+		return;					/* drop event */
+
+	ev = &newarr[newcnt - 1];
+	ev->name = name_copy;
+	ev->time = ts;
+	ev->n_attrs = n_attrs;
+	ev->attrs = attrs_copy;
+
+	span->events = newarr;
+	span->n_events = newcnt;
+}
+
+/*
+ * otel_producer_span_add_event_to_active --- append a named event to the
+ * top-of-stack active span without a pointer to it.  Mirrors
+ * otel_producer_span_add_attribute_string_to_active.
+ *
+ * Returns true when the event was appended (or attempted best-effort on
+ * a valid active span), false when there is no active span with a
+ * stored pointer (empty stack, or top entry is OTEL_UNWIND_DROP).
+ */
+bool
+otel_producer_span_add_event_to_active(const char *name, TimestampTz ts,
+									   const OtelKeyValue *attrs, int n_attrs)
+{
+	OtelSpanStackEntry *top;
+
+	if (span_stack_top < 0)
+		return false;
+
+	top = &span_stack[span_stack_top];
+
+	/*
+	 * The span pointer is stored only for OTEL_UNWIND_ERROR entries; for
+	 * OTEL_UNWIND_DROP the slot holds NULL by design (see
+	 * otel_producer_span_push).
+	 */
+	if (top->span == NULL)
+		return false;
+
+	otel_producer_span_add_event(top->span, name, ts, attrs, n_attrs);
+	return true;
 }
 
 
