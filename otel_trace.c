@@ -39,7 +39,6 @@
 #include "access/xact.h"
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
-#include "executor/nodeForeignscan.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -53,11 +52,11 @@
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/rel.h"
 #include "utils/timestamp.h"
 
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
+#include "otel_fdw.h"
 
 /*
  * Span lifecycle state --- per backend.
@@ -97,31 +96,9 @@ static MemoryContext span_cxt = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
-static ForeignScanBegin_hook_type prev_ForeignScanBegin_hook = NULL;
-static ForeignScanEnd_hook_type prev_ForeignScanEnd_hook = NULL;
-
-/*
- * Stack of in-flight pg.fdw.scan spans; fdw_scan_depth tracks how many
- * are active.  Multiple ForeignScan nodes can be open simultaneously
- * (nested-loop join over a foreign table, async FDW, etc.).
- *
- * subxact_level records the transaction nesting level at push time so the
- * SubXactCallback can drop entries belonging to an aborting subtransaction
- * without touching entries from outer (still-live) subtransactions.
- */
-#define OTEL_FDW_SCAN_STACK_MAX 16
-static struct
-{
-	ForeignScanState *node;		/* key: the ForeignScanState pointer */
-	OtelSpan		  span;		/* OTEL_UNWIND_DROP → static storage ok */
-	int				  subxact_level;	/* GetCurrentTransactionNestLevel() at push */
-} fdw_scan_stack[OTEL_FDW_SCAN_STACK_MAX];
-static int	fdw_scan_depth = 0;
 
 static void otel_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void otel_ExecutorEnd(QueryDesc *queryDesc);
-static void otel_ForeignScanBegin(ForeignScanState *node, int eflags);
-static void otel_ForeignScanEnd(ForeignScanState *node);
 static void otel_ProcessUtility(PlannedStmt *pstmt,
 								const char *queryString,
 								bool readOnlyTree,
@@ -167,11 +144,8 @@ otel_trace_install_hooks(void)
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = otel_ProcessUtility;
 
-	/* FDW scan spans. */
-	prev_ForeignScanBegin_hook = ForeignScanBegin_hook;
-	ForeignScanBegin_hook = otel_ForeignScanBegin;
-	prev_ForeignScanEnd_hook = ForeignScanEnd_hook;
-	ForeignScanEnd_hook = otel_ForeignScanEnd;
+	/* FDW scan spans (pg.fdw.scan); strategy is version-gated in otel_fdw.c. */
+	otel_fdw_install_hooks();
 
 	RegisterXactCallback(otel_pgtracing_xact_callback, NULL);
 	RegisterSubXactCallback(otel_pgtracing_subxact_callback, NULL);
@@ -617,18 +591,33 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		prev_ExecutorStart_hook(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+
+	/*
+	 * Open pg.fdw.scan spans now that the planstate tree exists.  Gated on
+	 * span_active so unsampled queries skip the work entirely (and so the
+	 * spans have a parent to nest under).  No-op on PG19+, where the core
+	 * ForeignScanBegin hook does this; see otel_fdw.c.
+	 */
+	if (span_active)
+		otel_fdw_executor_start(queryDesc);
 }
 
 static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
 	/*
-	 * Run cleanup first so that FDW-scan and other child spans (pushed
-	 * during ExecInitForeignScan / ExecEndForeignScan) are finalized
-	 * before we emit the enclosing pgsql.execute span.  Emitting the
-	 * parent while children are still on the producer stack would
-	 * trigger an out-of-order-emit warning and silently drop the children.
+	 * Emit any pg.fdw.scan spans first, so child spans are finalized before
+	 * we emit the enclosing pgsql.execute span -- emitting the parent while
+	 * children are still on the producer stack would trigger an
+	 * out-of-order-emit warning and silently drop the children.
+	 *
+	 * On PG18 this must happen before standard_ExecutorEnd frees the
+	 * ForeignScanState nodes we walk; no-op on PG19+, where the core
+	 * ForeignScanEnd hook (fired during standard_ExecutorEnd below) does it.
+	 * See otel_fdw.c.
 	 */
+	otel_fdw_executor_end(queryDesc);
+
 	if (prev_ExecutorEnd_hook)
 		prev_ExecutorEnd_hook(queryDesc);
 	else
@@ -641,84 +630,6 @@ otel_ExecutorEnd(QueryDesc *queryDesc)
 	 * for the span. */
 	if (span_originator == SPAN_ORIGIN_EXECUTOR)
 		finalize_span(OTEL_STATUS_UNSET);
-}
-
-/*
- * ForeignScanBegin hook --- open a pg.fdw.scan span for each ForeignScan
- * node that enters execution.  Multiple nodes can be active at the same
- * time (nested-loop join probing a foreign table, async FDW, etc.), so
- * we maintain a fixed-depth stack keyed by the ForeignScanState pointer.
- *
- * The span is a child of whatever span is currently on the producer
- * active stack (typically the enclosing pgsql.execute or pg.execute SDT
- * span).  We use OTEL_SPAN_KIND_CLIENT because the backend is acting as
- * a client to an external data source.
- */
-static void
-otel_ForeignScanBegin(ForeignScanState *node, int eflags)
-{
-	const OtelTracingApi *api = otel_pg_ensure();
-	OtelSpan   *span;
-
-	if (api == NULL || fdw_scan_depth >= OTEL_FDW_SCAN_STACK_MAX)
-	{
-		if (prev_ForeignScanBegin_hook)
-			prev_ForeignScanBegin_hook(node, eflags);
-		return;
-	}
-
-	span = &fdw_scan_stack[fdw_scan_depth].span;
-	fdw_scan_stack[fdw_scan_depth].node = node;
-	fdw_scan_stack[fdw_scan_depth].subxact_level = GetCurrentTransactionNestLevel();
-
-	api->span_init(span, otel_pg_tracer, "pg.fdw.scan", OTEL_SPAN_KIND_CLIENT);
-	api->span_add_attribute_string(span, "db.system", "postgresql");
-
-	if (node->ss.ss_currentRelation != NULL)
-		api->span_add_attribute_string(span, "db.collection.name",
-									   RelationGetRelationName(node->ss.ss_currentRelation));
-
-	api->span_link_to_active_and_push(span);
-	fdw_scan_depth++;
-
-	if (prev_ForeignScanBegin_hook)
-		prev_ForeignScanBegin_hook(node, eflags);
-}
-
-/*
- * ForeignScanEnd hook --- locate the matching entry on the stack (end
- * may be non-LIFO with async FDW), emit its span, then compact the stack.
- *
- * Uses otel_api_get() rather than otel_pg_ensure() because we are only
- * emitting an already-initialised span, not registering a new tracer scope.
- */
-static void
-otel_ForeignScanEnd(ForeignScanState *node)
-{
-	const OtelTracingApi *api = otel_api_get();
-	int			i;
-
-	if (prev_ForeignScanEnd_hook)
-		prev_ForeignScanEnd_hook(node);
-
-	for (i = fdw_scan_depth - 1; i >= 0; i--)
-	{
-		if (fdw_scan_stack[i].node == node)
-		{
-			if (api != NULL)
-			{
-				fdw_scan_stack[i].span.end_time = GetCurrentTimestamp();
-				api->span_emit(&fdw_scan_stack[i].span);
-			}
-
-			/* Shift remaining entries down to fill the gap. */
-			for (; i < fdw_scan_depth - 1; i++)
-				fdw_scan_stack[i] = fdw_scan_stack[i + 1];
-			fdw_scan_depth--;
-			return;
-		}
-	}
-	/* Not found: already unwound via MemoryContext callback on error. */
 }
 
 /*
@@ -964,8 +875,8 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_ABORT:
 			finalize_span(OTEL_STATUS_ERROR);
 			/* FDW scan spans are dropped by the otel_api MemoryContext
-			 * callbacks on error unwind; reset our depth counter here. */
-			fdw_scan_depth = 0;
+			 * callbacks on error unwind; reset their tracking here. */
+			otel_fdw_reset();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
@@ -978,21 +889,9 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 }
 
 /*
- * SubXactCallback --- clean up fdw_scan_stack[] when a subtransaction aborts.
- *
- * ExecEndForeignScan is NOT called on subtransaction abort; the executor
- * tears down resources via MemoryContext reset instead.  The producer's
- * span_stack[] is correctly maintained by on_memory_context_reset callbacks
- * in otel_producer.c, but fdw_scan_stack[] has no such mechanism.  Without
- * this callback, repeated ROLLBACK TO SAVEPOINT cycles over foreign scans
- * would ratchet fdw_scan_depth toward OTEL_FDW_SCAN_STACK_MAX, after which
- * otel_ForeignScanBegin silently stops creating new pg.fdw.scan spans.
- * Stale node pointers also risk an ABA false-match in otel_ForeignScanEnd.
- *
- * On SUBXACT_EVENT_ABORT_SUB we drop all fdw_scan_stack[] entries that were
- * pushed at the aborting nesting level or deeper.  Entries from enclosing
- * subtransactions / the top-level transaction are preserved intact because
- * their ForeignScan nodes are still alive and will be closed normally.
+ * SubXactCallback --- on subtransaction abort, hand off to otel_fdw.c to
+ * clean up any in-flight pg.fdw.scan spans (ExecEndForeignScan / the
+ * ExecutorEnd walk do not run on subxact abort).  See otel_fdw.c.
  */
 static void
 otel_pgtracing_subxact_callback(SubXactEvent event,
@@ -1000,35 +899,7 @@ otel_pgtracing_subxact_callback(SubXactEvent event,
 								SubTransactionId parentSubid,
 								void *arg)
 {
-	int			current_level;
-	int			new_depth;
-	int			i;
-
-	if (event != SUBXACT_EVENT_ABORT_SUB || fdw_scan_depth == 0)
-		return;
-
-	/*
-	 * During SUBXACT_EVENT_ABORT_SUB, GetCurrentTransactionNestLevel()
-	 * returns the level of the subtransaction that is aborting.  Any
-	 * entry pushed at that level (or deeper, for savepoints nested within
-	 * it) belongs to code that is being rolled back and must be discarded.
-	 * The producer has already popped those spans via on_memory_context_reset.
-	 */
-	current_level = GetCurrentTransactionNestLevel();
-	new_depth = 0;
-
-	for (i = 0; i < fdw_scan_depth; i++)
-	{
-		if (fdw_scan_stack[i].subxact_level < current_level)
-		{
-			/* Pushed in an enclosing subxact; still live. */
-			if (new_depth != i)
-				fdw_scan_stack[new_depth] = fdw_scan_stack[i];
-			new_depth++;
-		}
-		/* else: belongs to the aborting subxact; producer already dropped it. */
-	}
-	fdw_scan_depth = new_depth;
+	otel_fdw_subxact_abort(event);
 }
 
 /*
