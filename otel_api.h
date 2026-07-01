@@ -90,7 +90,7 @@
 #define OTEL_API_MINOR(v)			((v) & OTEL_API_MINOR_MASK)
 
 #define OTEL_TRACING_API_MAJOR		2
-#define OTEL_TRACING_API_MINOR		2
+#define OTEL_TRACING_API_MINOR		3
 #define OTEL_TRACING_API_VERSION	OTEL_MAKE_VERSION(OTEL_TRACING_API_MAJOR, \
 													  OTEL_TRACING_API_MINOR)
 
@@ -424,6 +424,36 @@ typedef struct OtelTracingApi
 	 */
 	bool	  (*span_add_attribute_string_to_active) (const char *key,
 													  const char *value);
+
+	/*
+	 * Attach a named event to a span.
+	 *
+	 * COPY semantics (diverges from span_add_attribute_string's borrow
+	 * rule): `name` and the `attrs` array --- including every key and
+	 * value string --- are COPIED into the span's own memory context.
+	 * Event attributes are typically built per-node and transient, so
+	 * the caller may free or reuse its `name`/`attrs`/key/value buffers
+	 * immediately after the call returns.
+	 *
+	 * `ts` is the event time; pass 0 to mean "now"
+	 * (GetCurrentTimestamp()).  `attrs` may be NULL when n_attrs == 0.
+	 *
+	 * The event is appended to span->events; on allocation failure the
+	 * event is silently dropped (best-effort instrumentation).
+	 *
+	 * span_add_event_to_active targets the top-of-stack active span
+	 * (mirrors span_add_attribute_string_to_active); it returns false
+	 * when there is no suitable active span (empty stack, or the top
+	 * entry stores no span pointer), true otherwise.
+	 *
+	 * Added in MINOR 3 (appended at end of struct per additive-extension rules).
+	 */
+	void	  (*span_add_event) (OtelSpan *span, const char *name,
+								 TimestampTz ts, const OtelKeyValue *attrs,
+								 int n_attrs);
+	bool	  (*span_add_event_to_active) (const char *name, TimestampTz ts,
+										   const OtelKeyValue *attrs,
+										   int n_attrs);
 } OtelTracingApi;
 
 

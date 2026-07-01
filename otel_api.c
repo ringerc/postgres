@@ -254,6 +254,10 @@ static const OtelTracingApi otel_tracing_api = {
 	.span_add_attribute_string = otel_span_add_attribute_string,
 	.span_add_attribute_string_to_active = otel_producer_span_add_attribute_string_to_active,
 
+	/* Generic span-event API (MINOR 3). */
+	.span_add_event = otel_producer_span_add_event,
+	.span_add_event_to_active = otel_producer_span_add_event_to_active,
+
 	/* Phase 4: surface needed by the split-out query-tracing
 	 * module. */
 	.span_push = otel_producer_span_push,

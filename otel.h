@@ -20,13 +20,13 @@
  *	 * The OtelSpan passed to the hook, and all char* pointers it
  *	   transitively contains, are valid only for the duration of the
  *	   hook call.  An exporter that needs to defer work must copy.
- *	 * Some const char* pointers (notably OtelEventCore.filename and
- *	   .funcname) point into postgres rodata and are valid forever;
- *	   exporters may safely store these pointers without copying.
- *	   This is not true of OtelSpan.name, span attributes, or event
- *	   message/detail/hint, which may live in transient memory.
- *	 * Any of the optional extended-event fields (message, detail,
- *	   hint, attrs) may be NULL independently of the others, meaning
+ *	 * OtelSpan.name, span attributes, and event names/attributes may
+ *	   live in transient memory valid only for the hook call; copy to
+ *	   defer.  (The producer copies event names/attrs into the span's
+ *	   context; ereport-derived rodata pointers such as file/func are
+ *	   lowered into event attribute *values*, which the producer also
+ *	   copies, so exporters need not special-case their lifetime.)
+ *	 * Any individual event attribute value may be NULL, meaning
  *	   "this field was not captured" (typically because allocation
  *	   failed under memory pressure).  Treat NULL as omitted, not
  *	   empty.
@@ -253,20 +253,54 @@ typedef struct OtelResourceAttribute
 } OtelResourceAttribute;
 
 /*
- * Common substrate of every captured event.
+ * The single, OTLP-faithful span event.
  *
- * The core is what gets captured first, unconditionally, with NO
- * string allocation --- only scalars and pointers to never-freed
- * constants.  filename and funcname point into postgres rodata
- * (__FILE__ / __func__ literals from the originating ereport site)
- * and are valid forever.  sqlstate is stored by-value (a SQLSTATE
- * is always 5 ASCII chars + NUL), not as a pointer, so it can be
- * captured without copying.
+ * OTLP has exactly one event concept: { name, time_unix_nano,
+ * attributes[] }.  This struct mirrors it directly --- there is no
+ * "exception event" type.  An ereport-derived event is just an ordinary
+ * event whose `name` is the conventional string "exception" and whose
+ * ereport fields (message, sqlstate, file, line, func, detail, hint,
+ * elevel) have been lowered into `attrs` by the producer at emit time.
  *
- * The core is the substrate of every event, NOT an emergency
- * fallback used in lieu of the real thing --- see OtelSpanEvent.
+ * `name` and the `attrs` array (including each key/value string) are
+ * COPIED into the span's memory context by the producer's
+ * span_add_event; exporters read them for the duration of the emit hook
+ * only and must copy anything they defer.
+ *
+ * `attrs` may be NULL when n_attrs == 0.  Any individual attribute
+ * value may be NULL; treat NULL as "not captured", not empty.
  */
-typedef struct OtelEventCore
+typedef struct OtelSpanEvent
+{
+	const char *name;			/* required; "exception" for ereport-derived */
+	TimestampTz time;
+	int			n_attrs;
+	OtelKeyValue *attrs;		/* copied into the span's context; may be NULL */
+} OtelSpanEvent;
+
+/*
+ * Producer-private error capture --- NOT visible to exporters.
+ *
+ * When an ereport fires while a span is active, the producer captures
+ * it here first, unconditionally, with NO string allocation on the
+ * OOM/unwind path --- only scalars and pointers to never-freed
+ * constants.  filename and funcname point into postgres rodata
+ * (__FILE__ / __func__ literals from the originating ereport site) and
+ * are valid forever.  sqlstate is stored by-value (a SQLSTATE is always
+ * 5 ASCII chars + NUL), not as a pointer, so it can be captured without
+ * copying.
+ *
+ * The extended fields (message, detail, hint) are best-effort: each may
+ * remain NULL independently if that specific allocation failed under
+ * memory pressure.
+ *
+ * At emit time the producer LOWERS this capture into a generic
+ * OtelSpanEvent{ name="exception", ... } appended to span->events; the
+ * ereport->attribute mapping lives in the producer, once.  Exporters
+ * never read OtelErrorCapture directly --- they only ever see the
+ * lowered OtelSpanEvent in span->events.
+ */
+typedef struct OtelErrorCapture
 {
 	TimestampTz time;
 	int			elevel;			/* WARNING / ERROR / FATAL / PANIC */
@@ -274,26 +308,11 @@ typedef struct OtelEventCore
 	const char *filename;		/* __FILE__ literal; const for life */
 	int			lineno;
 	const char *funcname;		/* __func__ literal; const for life */
-} OtelEventCore;
-
-/*
- * One captured ereport on a span.
- *
- * core is always populated when the event slot is in use.  The
- * extended fields (message, detail, hint, attrs) are best-effort: any
- * of them may be NULL independently if that specific allocation
- * failed under memory pressure.  Exporters MUST tolerate NULL on each
- * field independently and treat NULL as "not captured."
- */
-typedef struct OtelSpanEvent
-{
-	OtelEventCore core;
+	/* Best-effort extended fields; any may be NULL under memory pressure. */
 	const char *message;
 	const char *detail;
 	const char *hint;
-	int			n_attrs;
-	OtelKeyValue *attrs;
-} OtelSpanEvent;
+} OtelErrorCapture;
 
 /*
  * Number of attribute slots stored inline on every OtelSpan.  Spans
@@ -402,14 +421,23 @@ typedef struct OtelSpan
 	int			n_overflow_attrs;
 	OtelKeyValue *overflow_attrs;	/* NULL if not used or alloc failed */
 
-	/* Events: first event has inline storage so its core can always
-	 * be captured without allocation.  Additional events go to
-	 * overflow_events; if that allocation fails, additional events
-	 * are silently dropped (span status is still updated). */
-	bool		inline_event_used;
-	OtelSpanEvent inline_event;
-	int			n_overflow_events;
-	OtelSpanEvent *overflow_events; /* NULL if not used or alloc failed */
+	/* Producer-private error capture.  When an ereport fires on an
+	 * active span, the producer records it here with no allocation on
+	 * the OOM/unwind path (see OtelErrorCapture).  At emit time the
+	 * producer lowers this into a generic "exception" OtelSpanEvent
+	 * appended to events[] below; exporters never read error_event
+	 * directly. */
+	bool		error_event_used;
+	OtelErrorCapture error_event;
+
+	/* Generic events --- the unified list exporters read.
+	 * span_add_event appends here (palloc'd in the span's context,
+	 * grows one at a time; silent drop on OOM).  At emit time the
+	 * producer lowers error_event (if used) into an "exception" event
+	 * placed in this array, so span->events[0..n_events) is the
+	 * complete event list an exporter should translate. */
+	int			n_events;
+	OtelSpanEvent *events;		/* NULL if none; palloc'd in span ctx */
 
 	/* Span links: associate this span with related spans in OTHER
 	 * traces.  Used by the SDT bridge to tie a transaction-lifetime
