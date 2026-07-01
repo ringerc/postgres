@@ -22,6 +22,7 @@
  */
 #include "postgres.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "access/htup_details.h"
@@ -51,10 +52,8 @@ typedef struct CapturedKV
 
 typedef struct CapturedEvent
 {
-	OtelEventCore core;			/* core is by-value; safe */
-	char	   *message;
-	char	   *detail;
-	char	   *hint;
+	char	   *name;			/* required; "exception" for ereport-derived */
+	TimestampTz time;
 	int			n_attrs;
 	CapturedKV *attrs;
 } CapturedEvent;
@@ -220,38 +219,29 @@ copy_span(const OtelSpan *span, CapturedSpan *slot)
 		slot->attrs = out;
 	}
 
-	/* Flatten inline + overflow events. */
-	n_events = (span->inline_event_used ? 1 : 0) + span->n_overflow_events;
+	/*
+	 * Copy the unified generic event list.  The producer has already
+	 * lowered any ereport capture into an "exception" event in
+	 * span->events before the emit hook fires, so this path is fully
+	 * generic: name, time, and attrs.  ereport fields (sqlstate, message,
+	 * elevel, code.*, detail, hint) arrive as ordinary event attributes.
+	 */
+	n_events = span->n_events;
 	if (n_events > 0)
 	{
 		CapturedEvent *out =
 			MemoryContextAllocZero(otel_test_cxt,
 								   sizeof(CapturedEvent) * n_events);
-		int			j = 0;
 		int			i;
 
-		if (span->inline_event_used)
+		for (i = 0; i < n_events; i++)
 		{
-			out[j].core = span->inline_event.core;
-			out[j].message = copy_str(span->inline_event.message);
-			out[j].detail = copy_str(span->inline_event.detail);
-			out[j].hint = copy_str(span->inline_event.hint);
-			out[j].n_attrs = span->inline_event.n_attrs;
-			out[j].attrs = copy_kv_array(span->inline_event.attrs,
-										 span->inline_event.n_attrs);
-			j++;
-		}
-		for (i = 0; i < span->n_overflow_events; i++)
-		{
-			const OtelSpanEvent *e = &span->overflow_events[i];
+			const OtelSpanEvent *e = &span->events[i];
 
-			out[j].core = e->core;
-			out[j].message = copy_str(e->message);
-			out[j].detail = copy_str(e->detail);
-			out[j].hint = copy_str(e->hint);
-			out[j].n_attrs = e->n_attrs;
-			out[j].attrs = copy_kv_array(e->attrs, e->n_attrs);
-			j++;
+			out[i].name = copy_str(e->name);
+			out[i].time = e->time;
+			out[i].n_attrs = e->n_attrs;
+			out[i].attrs = copy_kv_array(e->attrs, e->n_attrs);
 		}
 		slot->n_events = n_events;
 		slot->events = out;
@@ -433,17 +423,14 @@ test_otel_pop_span(PG_FUNCTION_ARGS)
 		const CapturedEvent *e = &s->events[i];
 		int			j;
 
-		appendStringInfo(&buf, "event.elevel=%d\n", e->core.elevel);
-		appendStringInfo(&buf, "event.sqlstate=%s\n", e->core.sqlstate);
-		appendStringInfo(&buf, "event.filename=%s\n",
-						 e->core.filename ? e->core.filename : "");
-		appendStringInfo(&buf, "event.lineno=%d\n", e->core.lineno);
-		if (e->message)
-			appendStringInfo(&buf, "event.message=%s\n", e->message);
-		if (e->detail)
-			appendStringInfo(&buf, "event.detail=%s\n", e->detail);
-		if (e->hint)
-			appendStringInfo(&buf, "event.hint=%s\n", e->hint);
+		/*
+		 * Generic per-event dump: a name line, a time line, then one
+		 * line per attribute.  ereport-derived events surface as
+		 * event.name=exception with their sqlstate / message / elevel /
+		 * code.* / detail / hint carried under event.attr= keys.
+		 */
+		appendStringInfo(&buf, "event.name=%s\n", e->name ? e->name : "");
+		appendStringInfo(&buf, "event.time=%" PRId64 "\n", (int64) e->time);
 		for (j = 0; j < e->n_attrs; j++)
 			appendStringInfo(&buf, "event.attr=%s=%s\n",
 							 e->attrs[j].key ? e->attrs[j].key : "",
@@ -578,6 +565,22 @@ test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
 
 	api->span_add_attribute_string(&span, "test.case", "roundtrip");
 	api->span_add_attribute_string(&span, "test.name", name);
+
+	/*
+	 * Exercise the MINOR-3 generic event API: attach a named event with
+	 * two attributes so the TAP test can assert it round-trips (name +
+	 * attrs) through the log dump.  attrs are COPIED by the producer, so
+	 * a transient on-stack array is fine.  ts=0 => "now".
+	 */
+	{
+		OtelKeyValue evattrs[2] = {
+			{"event.kind", "generic"},
+			{"event.seq", "1"},
+		};
+
+		api->span_add_event(&span, "test.event", 0, evattrs, 2);
+	}
+
 	otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
 	otel_span_finalize(&span);
 
