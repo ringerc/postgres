@@ -181,8 +181,8 @@ $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 
 like(
 	$log,
-	qr/otel-span: \{.*"status":2.*"events":\[\{.*"sqlstate":"22012"/s,
-	'errored span log line shows status=ERROR with a captured event');
+	qr/otel-span: \{.*"status":2.*"events":\[\{.*"name":"exception".*"postgres\.sqlstate":"22012"/s,
+	'errored span log line shows status=ERROR with a lowered "exception" event');
 
 # ----------------------------------------------------------------------
 # Tidy up.

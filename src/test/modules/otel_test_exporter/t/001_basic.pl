@@ -273,14 +273,18 @@ like($span, qr/status=2\n/,
 	'span status is ERROR (2) for a query that raised an ereport(ERROR)');
 # In current postgres (v18+), ERROR's numeric value is 21
 # (WARNING_CLIENT_ONLY occupies 20).
-like($span, qr/event\.elevel=21\n/,
+# The ereport is lowered by the producer into a generic "exception"
+# event whose ereport fields are carried as event attributes.
+like($span, qr/event\.name=exception\n/,
+	'ereport lowered into a generic "exception" event');
+like($span, qr/event\.attr=postgres\.elevel=21\n/,
 	'event elevel matches ERROR (21)');
-like($span, qr/event\.sqlstate=22012\n/,
+like($span, qr/event\.attr=postgres\.sqlstate=22012\n/,
 	'event sqlstate is 22012 (division_by_zero)');
-like($span, qr/event\.message=division by zero/,
+like($span, qr/event\.attr=exception\.message=division by zero/,
 	'event message captures the ereport text');
-like($span, qr/event\.filename=\w+\.c/,
-	'event filename is a postgres source file');
+like($span, qr/event\.attr=code\.filepath=\S*\w+\.c/,
+	'event code.filepath is a postgres source file');
 
 # Connection is now in a failed-transaction state; ROLLBACK to clear.
 run_query($sock, 'ROLLBACK');
@@ -307,9 +311,9 @@ like($span, qr/name=DO\n/,
 	'utility span name is "DO" (the command tag)');
 like($span, qr/status=0\n/,
 	'utility span status remains UNSET when only WARNING fires');
-like($span, qr/event\.elevel=19\n/,
+like($span, qr/event\.attr=postgres\.elevel=19\n/,
 	'WARNING-level event captured on the utility span (elevel 19)');
-like($span, qr/event\.message=test-warn/,
+like($span, qr/event\.attr=exception\.message=test-warn/,
 	'WARNING message captured on the utility span');
 
 # ----------------------------------------------------------------------

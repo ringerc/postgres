@@ -84,6 +84,15 @@ like($combined, qr/^attr=test\.case=roundtrip$/m,
 like($combined, qr/^attr=test\.name=producer\.roundtrip$/m,
 	'attribute test.name round-tripped');
 
+# The MINOR-3 generic event API: a named event with attributes attached
+# via api->span_add_event must round-trip through the log dump.
+like($combined, qr/^event\.name=test\.event$/m,
+	'generic named event round-tripped (name)');
+like($combined, qr/^event\.attr=event\.kind=generic$/m,
+	'generic event attribute event.kind round-tripped');
+like($combined, qr/^event\.attr=event\.seq=1$/m,
+	'generic event attribute event.seq round-tripped');
+
 my ($start) = $combined =~ /^start_time=(\d+)$/m;
 my ($end)   = $combined =~ /^end_time=(\d+)$/m;
 cmp_ok($start, '<=', $end, 'start_time captured before or at end_time');
