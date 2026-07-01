@@ -490,19 +490,34 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			}
 
 			/*
-			 * Enrich the active OTel statement span with the plan text.
-			 * otel_api_get() returns NULL when the provider is absent, making
-			 * this a no-op without otel_api loaded.  The plan text pointer is
-			 * valid until standard_ExecutorEnd frees es_query_cxt, which
-			 * happens after the otel hook finalizes and dispatches the span.
+			 * Enrich the active OTel statement span with the plan text as a
+			 * span EVENT (name="plan") rather than a span attribute.  A
+			 * KB-sized plan on every sampled span bloats the attribute set,
+			 * and under ANALYZE the embedded timings make a plan-text
+			 * attribute high-cardinality; an event is the correct home.
+			 *
+			 * otel_api_get() returns NULL when the provider is absent (or too
+			 * old: it validates struct_size against the OtelTracingApi we
+			 * compiled against, and span_add_event_to_active is a MINOR-3
+			 * table entry), making this a safe no-op in those cases.
+			 *
+			 * The producer COPIES the attribute array and its key/value
+			 * strings into the span's context, so the transient stack array
+			 * below and the es->str->data lifetime are not a concern here
+			 * (the copy happens before this call returns).
 			 */
 #ifdef HAVE_OTEL_API
 			{
 				const OtelTracingApi *otel = otel_api_get();
 
 				if (otel != NULL)
-					otel->span_add_attribute_string_to_active(
-						"db.postgresql.explain_plan", es->str->data);
+				{
+					const OtelKeyValue attrs[] = {
+						{"db.postgresql.explain_plan", es->str->data},
+					};
+
+					otel->span_add_event_to_active("plan", 0, attrs, 1);
+				}
 			}
 #endif
 
