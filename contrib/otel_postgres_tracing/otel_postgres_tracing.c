@@ -42,6 +42,10 @@
 #include <otel_api/otel_api.h>
 
 #include "otel_postgres_tracing.h"
+#include "otel_planwalk.h"
+#include "otel_planpath.h"
+#include "otel_planspans.h"
+#include "otel_planshape.h"
 
 
 PG_MODULE_MAGIC;
@@ -150,9 +154,61 @@ _PG_init(void)
 	 * unrecognised placeholders under a reserved prefix and silently
 	 * dropped at load time.
 	 */
+	/*
+	 * otel.trace_plan_node_stats: group-A gate for per-node Instrumentation.
+	 * When on (and a span is active), INSTRUMENT_TIMER | INSTRUMENT_ROWS |
+	 * INSTRUMENT_BUFFERS | INSTRUMENT_WAL are ORed into
+	 * queryDesc->instrument_options before standard_ExecutorStart so the
+	 * executor allocates per-node Instrumentation for sampled queries.
+	 * Must be registered BEFORE MarkGUCPrefixReserved("otel") below.
+	 */
+	DefineCustomBoolVariable("otel.trace_plan_node_stats",
+							 "Collect per-node execution statistics for sampled queries.",
+							 "When on, enables per-node Instrumentation (timing, rows, buffers) "
+							 "for queries that are being traced. Has no effect when no span is "
+							 "active for a given query. Off by default.",
+							 &otel_trace_plan_node_stats,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * otel.trace_plan_node_events: "rich" per-node span events.  Distinct from
+	 * otel.trace_plan_node_stats DELIBERATELY -- the stats GUC folds a bounded
+	 * compact rollup onto the single pgsql.execute span, whereas this GUC emits
+	 * one span event PER PlanState node (far higher volume).  Operators need to
+	 * enable the cheap rollup without opting into the per-node event firehose,
+	 * so we do not reuse trace_plan_node_stats.  Either GUC ORs the same
+	 * INSTRUMENT_* flags into instrument_options for sampled queries.
+	 * Must be registered BEFORE MarkGUCPrefixReserved("otel") below.
+	 */
+	DefineCustomBoolVariable("otel.trace_plan_node_events",
+							 "Emit one span event per plan node for sampled queries.",
+							 "When on, attaches a pg.plan.node span event (type, actual "
+							 "timing, rows, loops, buffers) to the pgsql.execute span for "
+							 "every executed plan node. Much higher volume than "
+							 "otel.trace_plan_node_stats. Has no effect when no span is "
+							 "active for a given query. Off by default.",
+							 &otel_trace_plan_node_events,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	otel_trace_install_hooks();
 	otel_log_install_hooks();
 	otel_sdt_install();
+
+	/*
+	 * Register the planstate-walker collectors.  otel_planpath_install only
+	 * registers a collector (its otel.trace_plan_node_stats GUC is defined
+	 * above); otel_planspans_install also defines otel.trace_plan_child_spans,
+	 * so it MUST run before MarkGUCPrefixReserved("otel") below.
+	 */
+	otel_planpath_install();
+	otel_planspans_install();
+	otel_planshape_install();
 
 	/*
 	 * Reserve the "otel." and "otel_postgres_tracing." GUC prefixes now
