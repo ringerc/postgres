@@ -58,7 +58,6 @@
 #include <math.h>
 
 #include "executor/instrument.h"
-#include "executor/instrument_node.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodes.h"
 #include "nodes/plannodes.h"
@@ -69,6 +68,32 @@
 #include <otel_api/otel_api.h>
 #include "otel_planpath.h"
 #include "otel_planwalk.h"
+
+/*
+ * PlanState.instrument accessors, papering over the PG18/PG19 divergence.
+ *
+ * On the patched PG19 core, PlanState.instrument is NodeInstrumentation* --
+ * the per-node stats were split into executor/instrument_node.h, the base
+ * Instrumentation is nested as .instr, and the timing counters (total,
+ * startup) are instr_time (read via INSTR_TIME_GET_MILLISEC).
+ *
+ * On PG18 it is the stock Instrumentation*: total/startup are plain doubles in
+ * *seconds* and bufusage is a top-level field.  These macros yield the same
+ * millisecond / BufferUsage values from either layout so the collector body is
+ * shared verbatim.  ntuples/nloops are top-level in both and used directly.
+ */
+#if PG_VERSION_NUM >= 190000
+#include "executor/instrument_node.h"
+typedef NodeInstrumentation OtelNodeInstr;
+#define OTEL_NI_TOTAL_MS(ni)	INSTR_TIME_GET_MILLISEC((ni)->instr.total)
+#define OTEL_NI_STARTUP_MS(ni)	INSTR_TIME_GET_MILLISEC((ni)->startup)
+#define OTEL_NI_BUFUSAGE(ni)	((ni)->instr.bufusage)
+#else
+typedef Instrumentation OtelNodeInstr;
+#define OTEL_NI_TOTAL_MS(ni)	((ni)->total * 1000.0)
+#define OTEL_NI_STARTUP_MS(ni)	((ni)->startup * 1000.0)
+#define OTEL_NI_BUFUSAGE(ni)	((ni)->bufusage)
+#endif
 
 /* -------------------------------------------------------------------------
  * Local constants
@@ -290,7 +315,7 @@ planpath_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 {
 	NodeTag		tag;
 	const char *tag_name;
-	NodeInstrumentation *ni;
+	OtelNodeInstr *ni;
 
 	if (ps == NULL)
 		return;
@@ -522,14 +547,14 @@ planpath_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 		return;					/* node never executed */
 
 	/* Step 4: buffer usage aggregation. */
-	accum.buffers_read += ni->instr.bufusage.shared_blks_read;
-	accum.buffers_hit += ni->instr.bufusage.shared_blks_hit;
-	accum.buffers_dirtied += ni->instr.bufusage.shared_blks_dirtied;
+	accum.buffers_read += OTEL_NI_BUFUSAGE(ni).shared_blks_read;
+	accum.buffers_hit += OTEL_NI_BUFUSAGE(ni).shared_blks_hit;
+	accum.buffers_dirtied += OTEL_NI_BUFUSAGE(ni).shared_blks_dirtied;
 
 	/* Step 4: top-N slowest nodes by actual total time. */
 	{
 		double		total_ms =
-			INSTR_TIME_GET_MILLISEC(ni->instr.total) / ni->nloops;
+			OTEL_NI_TOTAL_MS(ni) / ni->nloops;
 
 		maybe_insert_slowest(tag_name, total_ms);
 	}
@@ -585,8 +610,8 @@ planpath_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 			OtelKeyValue attrs[8];
 			int			n = 0;
 			MemoryContext old = MemoryContextSwitchTo(ctx->attr_cxt);
-			double		startup_ms = INSTR_TIME_GET_MILLISEC(ni->startup) / ni->nloops;
-			double		total_ms = INSTR_TIME_GET_MILLISEC(ni->instr.total) / ni->nloops;
+			double		startup_ms = OTEL_NI_STARTUP_MS(ni) / ni->nloops;
+			double		total_ms = OTEL_NI_TOTAL_MS(ni) / ni->nloops;
 			double		rows = ni->ntuples / ni->nloops;
 
 			/* Node type: string literal from nodetag_name(), no psprintf. */
@@ -611,15 +636,15 @@ planpath_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 			n++;
 
 			attrs[n].key = "pg.plan.node.buffers_read";
-			attrs[n].value = psprintf(INT64_FORMAT, (int64) ni->instr.bufusage.shared_blks_read); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			attrs[n].value = psprintf(INT64_FORMAT, (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_read); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
 			n++;
 
 			attrs[n].key = "pg.plan.node.buffers_hit";
-			attrs[n].value = psprintf(INT64_FORMAT, (int64) ni->instr.bufusage.shared_blks_hit); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			attrs[n].value = psprintf(INT64_FORMAT, (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_hit); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
 			n++;
 
 			attrs[n].key = "pg.plan.node.buffers_dirtied";
-			attrs[n].value = psprintf(INT64_FORMAT, (int64) ni->instr.bufusage.shared_blks_dirtied); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
+			attrs[n].value = psprintf(INT64_FORMAT, (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_dirtied); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
 			n++;
 
 			api->span_add_event(ctx->stmt_span, "pg.plan.node", 0, attrs, n);
