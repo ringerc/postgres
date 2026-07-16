@@ -129,6 +129,14 @@ extern bool otel_producer_span_add_event_to_active(const char *name,
 												   const OtelKeyValue *attrs,
 												   int n_attrs);
 
+/* Explicit-parent-and-push constructors (MINOR 4). */
+extern void otel_producer_span_link_to_ctx_and_push(OtelSpan *span,
+													 const OtelSpanContext *parent_ctx);
+extern void otel_producer_span_link_to_span_and_push(OtelSpan *span,
+													  const OtelSpan *parent);
+extern void otel_producer_span_context_of(const OtelSpan *span,
+										  OtelSpanContext *out);
+
 /* JSON-log fallback emitter; lives in otel_trace.c for now.  Phase
  * 2 exposes it so otel_producer.c's dispatch can call it too,
  * giving the producer-API emit path the same log-line emission as
