@@ -102,6 +102,20 @@ static OtelSpan			sdt_pool[SDT_POOL_SIZE];
 static int				sdt_top = 0;	/* next free slot; 0 == empty */
 
 /*
+ * Per-query sampler gate.  Set once at QUERY_START after consulting the
+ * sampler policy; cleared at QUERY_DONE and at transaction reset.  When
+ * true, every START probe in the current query must skip its push and
+ * every DONE probe must skip its pop/emit, keeping sdt_top unchanged and
+ * the DONE side a clean no-op.
+ *
+ * The decision is stable for the lifetime of one query: the trace_id and
+ * trace_flags come from the propagated root context, which does not change
+ * while a statement is executing.  Computing it once (rather than per-probe)
+ * is therefore both correct and cheaper.
+ */
+static bool				sdt_query_drop = false;
+
+/*
  * Per-slot scratch storage for integer-valued attributes.
  *
  * span_add_attribute_string does NOT copy its value: the pointer must stay
@@ -547,6 +561,7 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				txn_active = false;
 			}
 			sdt_top = 0;
+			sdt_query_drop = false;
 			return;
 		case PG_SDT_TRANSACTION_ABORT:
 			if (txn_active)
@@ -577,6 +592,7 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			 * errors visible, not just execute-phase ones.
 			 */
 			sdt_top = 0;
+			sdt_query_drop = false;
 			return;
 
 		/* --- Query --- */
@@ -768,6 +784,41 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		 */
 		api->get_root_context_snapshot(&rc);
 		if (!rc.is_set)
+			return;
+
+		/*
+		 * Consult the sampler policy.  The decision is computed once per
+		 * query at QUERY_START (the root of the SDT span sub-tree) and
+		 * cached in sdt_query_drop.  Sub-phase probes (parse, rewrite,
+		 * plan, execute) skip this block and rely on the cached flag.
+		 *
+		 * This mirrors the decide_whether_to_record() pattern in
+		 * otel_trace.c: build an OtelSamplerInput from the root context
+		 * and call api->compute_sampler_decision.  Any result other than
+		 * OTEL_SAMPLE_DROP allows the span to proceed.
+		 *
+		 * We only re-evaluate at QUERY_START (id == PG_SDT_QUERY_START).
+		 * For all other START probes the query root has already set
+		 * sdt_query_drop; if it is true we bail out immediately to avoid
+		 * pushing a span that would never be popped.
+		 */
+		if ((PgSdtProbeId) id == PG_SDT_QUERY_START)
+		{
+			OtelSamplerInput in;
+
+			in.trace_id = rc.trace_id;
+			in.parent_span_id = rc.span_id;
+			in.trace_flags = rc.trace_flags;
+			in.tracestate = rc.tracestate;
+			in.name = span_name;
+			in.kind = OTEL_SPAN_KIND_INTERNAL;
+
+			sdt_query_drop =
+				(api->compute_sampler_decision(&in, rc.sampled_flag_set)
+				 == OTEL_SAMPLE_DROP);
+		}
+
+		if (sdt_query_drop)
 			return;
 
 		if (sdt_top >= SDT_POOL_SIZE)
@@ -1001,6 +1052,20 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	}
 
 	/* ---- DONE path ---- */
+
+	/*
+	 * If the query's sampler decision was DROP, every START probe skipped
+	 * its push so sdt_top was not incremented.  Honour the same gate here
+	 * so we never pop a slot that was never pushed.  Clear sdt_query_drop
+	 * at the query root so the next statement starts with a clean state.
+	 */
+	if (sdt_query_drop)
+	{
+		if ((PgSdtProbeId) id == PG_SDT_QUERY_DONE)
+			sdt_query_drop = false;
+		return;
+	}
+
 	if (sdt_top <= 0)
 		return;					/* no matching START on our stack */
 
@@ -1050,6 +1115,7 @@ otel_sdt_xact_cb(XactEvent event, void *arg)
 			 * level, parallel-worker failures).
 			 */
 			sdt_top = 0;
+			sdt_query_drop = false;
 			break;
 
 		default:
