@@ -429,6 +429,7 @@ unwind_to(int target_top, const char *reason)
 			e->span->status_description = reason;
 			e->span->end_time = GetCurrentTimestamp();
 			dispatch_span(e->span);
+			e->span->on_active_stack = false;
 		}
 		/* Clear before decrementing so a future re-push to this slot
 		 * starts with a clean slate. */
@@ -484,6 +485,7 @@ on_memory_context_reset(void *arg)
 				e->span->status_description = "unwound by ereport";
 				e->span->end_time = GetCurrentTimestamp();
 				dispatch_span(e->span);
+				e->span->on_active_stack = false;
 			}
 
 			/* Remove the matched entry; slide entries above down by
@@ -644,6 +646,8 @@ otel_producer_span_push(OtelSpan *span)
 			node->cb.arg = node;
 			MemoryContextRegisterResetCallback(CurrentMemoryContext, &node->cb);
 		}
+
+		span->on_active_stack = true;
 	}
 	else
 	{
@@ -743,6 +747,8 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 			node->cb.arg = node;
 			MemoryContextRegisterResetCallback(CurrentMemoryContext, &node->cb);
 		}
+
+		span->on_active_stack = true;
 	}
 	else
 	{
@@ -775,12 +781,29 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
  *
  * If `parent` is NULL, span identity stays as the caller
  * pre-populated it.
+ *
+ * IMPORTANT: must NOT be called on a span that has been pushed
+ * via any _and_push verb.  Doing so rewrites the span's trace_id
+ * but leaves the LIFO stack entry holding the old pre-push
+ * snapshot; children pushed while this span is active will
+ * inherit the stale trace_id and appear in a disconnected trace.
+ * Under USE_ASSERT_CHECKING this misuse is caught here.
  */
 void
 otel_producer_span_set_parent_explicit(OtelSpan *span, const OtelSpanContext *parent)
 {
 	if (span == NULL || parent == NULL)
 		return;
+
+	/*
+	 * Guard against the "push then reparent" bug class.  If this span is
+	 * already on the active LIFO stack, the stack entry holds a snapshot
+	 * of the pre-push trace_id; rewriting trace_id here leaves the snapshot
+	 * stale so children pushed while this span is active inherit the wrong
+	 * trace.  Use span_link_to_ctx_and_push / span_link_to_span_and_push
+	 * instead to get a consistent snapshot from construction time.
+	 */
+	Assert(!span->on_active_stack);
 
 	memcpy(span->trace_id, parent->trace_id, sizeof(span->trace_id));
 	memcpy(span->parent_span_id, parent->span_id, sizeof(span->parent_span_id));
@@ -993,6 +1016,7 @@ otel_producer_span_emit(OtelSpan *span)
 			/* Pop the target entry itself. */
 			span_stack[span_stack_top].span = NULL;
 			span_stack_top = i - 1;
+			span->on_active_stack = false;
 			break;
 		}
 	}
@@ -1314,4 +1338,110 @@ otel_producer_init(void)
 	/* Zero-initialise active-stack state; static storage is already
 	 * zero, so this is effectively a documentation site. */
 	span_stack_top = -1;
+}
+
+
+/* ====================================================================
+ * Explicit-parent-and-push constructors (MINOR 4).
+ *
+ * These replace the bug-prone sequence:
+ *
+ *	   api->span_link_to_active_and_push(&span);   // snapshots throwaway
+ *	   api->span_set_parent_explicit(&span, &p);   // rewrites span,
+ *	                                               // stack entry stale
+ *
+ * ...which silently broke child LIFO span lineage because the LIFO
+ * stack entry kept the throwaway trace_id captured at push time.
+ * ==================================================================== */
+
+/*
+ * otel_producer_span_link_to_ctx_and_push --- construct a LIFO stack
+ * span whose parent identity is taken from `parent_ctx`.
+ *
+ * Behaviour is the union of span_set_parent_explicit (rewrite
+ * trace_id / parent_span_id / trace_flags from the supplied context)
+ * and span_push (push the result onto the active stack), executed
+ * atomically before the stack snapshot is taken.  This guarantees the
+ * pushed entry sees the same trace_id as the span itself, so children
+ * pushed while this span is active correctly inherit the explicit
+ * parent's trace.
+ *
+ * `parent_ctx` may be NULL: the span keeps its api->span_init-generated
+ * trace_id with zero parent_span_id (fresh root trace).
+ *
+ * Caller must have called api->span_init on `span` first (same idiom
+ * as span_link_to_active_and_push).
+ */
+void
+otel_producer_span_link_to_ctx_and_push(OtelSpan *span,
+										const OtelSpanContext *parent_ctx)
+{
+	if (span == NULL)
+		return;
+
+	/* Apply the explicit parent before push so the stack entry snapshot
+	 * is consistent with the span from the start. */
+	if (parent_ctx != NULL)
+	{
+		memcpy(span->trace_id, parent_ctx->trace_id, sizeof(span->trace_id));
+		memcpy(span->parent_span_id, parent_ctx->span_id, sizeof(span->parent_span_id));
+		memcpy(span->trace_flags, parent_ctx->trace_flags, sizeof(span->trace_flags));
+	}
+	/* else: parent_ctx == NULL -> root span; keep span_init's trace_id,
+	 * leave parent_span_id as zeroed by span_init. */
+
+	otel_producer_span_push(span);
+}
+
+/*
+ * otel_producer_span_link_to_span_and_push --- convenience wrapper
+ * around span_link_to_ctx_and_push that takes another OtelSpan as
+ * the parent (e.g. a heap-allocated apply.txn / output.txn span).
+ *
+ * Copies the parent's trace_id / span_id / trace_flags into a
+ * temporary OtelSpanContext and delegates.  `parent` may be NULL
+ * (root behaviour identical to span_link_to_ctx_and_push(span, NULL)).
+ */
+void
+otel_producer_span_link_to_span_and_push(OtelSpan *span,
+										 const OtelSpan *parent)
+{
+	if (span == NULL)
+		return;
+
+	if (parent != NULL)
+	{
+		OtelSpanContext tmp;
+
+		memcpy(tmp.trace_id, parent->trace_id, sizeof(tmp.trace_id));
+		memcpy(tmp.span_id, parent->span_id, sizeof(tmp.span_id));
+		memcpy(tmp.trace_flags, parent->trace_flags, sizeof(tmp.trace_flags));
+		tmp.tracestate = NULL;
+		otel_producer_span_link_to_ctx_and_push(span, &tmp);
+	}
+	else
+		otel_producer_span_link_to_ctx_and_push(span, NULL);
+}
+
+/*
+ * otel_producer_span_context_of --- populate `out` with a SpanContext
+ * describing `span`'s current identity (trace_id, span_id,
+ * trace_flags; tracestate = NULL).
+ *
+ * Safe for callers who need to pass a running span as the parent of
+ * another span without going through span_current_context (which
+ * returns the top-of-stack, not necessarily `span`).
+ *
+ * `span` and `out` must not be NULL.
+ */
+void
+otel_producer_span_context_of(const OtelSpan *span, OtelSpanContext *out)
+{
+	Assert(span != NULL);
+	Assert(out != NULL);
+
+	memcpy(out->trace_id, span->trace_id, sizeof(out->trace_id));
+	memcpy(out->span_id, span->span_id, sizeof(out->span_id));
+	memcpy(out->trace_flags, span->trace_flags, sizeof(out->trace_flags));
+	out->tracestate = NULL;
 }

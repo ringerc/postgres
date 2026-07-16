@@ -90,7 +90,7 @@
 #define OTEL_API_MINOR(v)			((v) & OTEL_API_MINOR_MASK)
 
 #define OTEL_TRACING_API_MAJOR		2
-#define OTEL_TRACING_API_MINOR		3
+#define OTEL_TRACING_API_MINOR		4
 #define OTEL_TRACING_API_VERSION	OTEL_MAKE_VERSION(OTEL_TRACING_API_MAJOR, \
 													  OTEL_TRACING_API_MINOR)
 
@@ -260,7 +260,7 @@ typedef struct OtelTracingApi
 	 * is required: the callback pops the stack entry and applies
 	 * the unwind_policy automatically.
 	 *
-	 * Three variants for starting a span:
+	 * Four variants for establishing parentage on a span:
 	 *
 	 *	  1. Implicit-fetch + push (the common case):
 	 *	     api->span_link_to_active_and_push(&span)
@@ -268,16 +268,41 @@ typedef struct OtelTracingApi
 	 *	         if stack empty, or none (root span on a new trace);
 	 *	       - new span pushed onto active stack.
 	 *
-	 *	  2. Explicit parent, no push (the independent-trace case):
+	 *	  2. Explicit parent + push (cross-node / heap-parent case):
+	 *	     api->span_link_to_ctx_and_push(&span, &parent_ctx)
+	 *	     api->span_link_to_span_and_push(&span, &parent_span)
+	 *	       - parent identity from caller-supplied SpanContext or
+	 *	         another OtelSpan; parent_ctx / parent_span may be
+	 *	         NULL (behaves as a fresh root trace);
+	 *	       - new span pushed onto active stack;
+	 *	       - the stack entry snapshot matches the reparented span
+	 *	         from the start, so children pushed later inherit the
+	 *	         correct trace_id.
+	 *	     Use these whenever a LIFO span needs an explicit parent
+	 *	     (e.g. wire-supplied traceparent on recv, or a
+	 *	     heap-allocated apply.txn / output.txn span).  Both
+	 *	     require a prior api->span_init call (same idiom as
+	 *	     span_link_to_active_and_push).
+	 *
+	 *	  3. Explicit parent, no push (the heap-span case):
 	 *	     api->span_set_parent_explicit(&span, &parent_ctx)
 	 *	       - parent identity from caller-supplied SpanContext;
-	 *	       - active stack untouched.  Used for traces that must
-	 *	         not appear as children of the call-stack-based
-	 *	         trace --- background apply work, etc.
+	 *	       - active stack untouched.
+	 *	     **Do NOT** call this on a span that has been pushed via
+	 *	     any _and_push verb.  Doing so rewrites the span's
+	 *	     trace_id but leaves the LIFO stack entry holding the old
+	 *	     snapshot; any children pushed while this span is active
+	 *	     inherit the stale trace_id and appear in a disconnected
+	 *	     trace.  Under USE_ASSERT_CHECKING an Assert fires on
+	 *	     this misuse.  Use span_link_to_ctx_and_push or
+	 *	     span_link_to_span_and_push instead.
+	 *	     Legitimate use: reparenting heap/unpushed spans (e.g.
+	 *	     background apply work that must not appear as a child of
+	 *	     the call-stack-based trace).
 	 *
-	 *	  3. Neither: caller calls no link function.  fresh trace_id
-	 *	     and span_id from otel_span_init (Commit D); parent
-	 *	     stays zero.  Brand-new root span on its own trace.
+	 *	  4. Neither: caller calls no link function.  fresh trace_id
+	 *	     and span_id from api->span_init; parent stays zero.
+	 *	     Brand-new root span on its own trace.
 	 *
 	 * Inspection: api->span_current_context / span_root_context /
 	 * span_stack_depth let consumers reason about the active trace
@@ -287,6 +312,22 @@ typedef struct OtelTracingApi
 	 * exporter hooks; pops it from the stack if pushed.
 	 */
 	void	  (*span_link_to_active_and_push) (OtelSpan *span);
+	/*
+	 * span_set_parent_explicit --- rewrite span->trace_id,
+	 * parent_span_id, and trace_flags from a caller-supplied
+	 * SpanContext; the active LIFO stack is untouched.
+	 *
+	 * Legitimate use: reparenting heap/unpushed spans (e.g.
+	 * background apply work whose trace is managed independently of
+	 * the call-stack-based trace).
+	 *
+	 * **Do NOT** call this on a span that has been pushed via any
+	 * _and_push verb.  The LIFO stack entry holds a snapshot
+	 * captured at push time; rewriting the span's trace_id here
+	 * leaves the snapshot stale and silently breaks child span
+	 * lineage.  Under USE_ASSERT_CHECKING this misuse is caught via
+	 * Assert(!span->on_active_stack).
+	 */
 	void	  (*span_set_parent_explicit) (OtelSpan *span,
 										   const OtelSpanContext *parent);
 	const OtelSpanContext *(*span_current_context) (void);
@@ -454,6 +495,63 @@ typedef struct OtelTracingApi
 	bool	  (*span_add_event_to_active) (const char *name, TimestampTz ts,
 										   const OtelKeyValue *attrs,
 										   int n_attrs);
+
+	/*
+	 * Explicit-parent-and-push constructors (MINOR 4).
+	 *
+	 * These make the "explicit-parent AND push" case a first-class
+	 * construction verb, replacing the previously-required and
+	 * bug-prone sequence:
+	 *
+	 *	   api->span_link_to_active_and_push(&span);  // snapshots throwaway
+	 *	   api->span_set_parent_explicit(&span, &p);  // rewrites span,
+	 *	                                              // stack entry stale
+	 *
+	 * ...which silently broke child LIFO span lineage because the
+	 * LIFO stack entry kept the throwaway trace_id captured at push
+	 * time.
+	 *
+	 * Both functions require a prior api->span_init call on `span`
+	 * (same idiom as span_link_to_active_and_push).
+	 *
+	 * span_link_to_ctx_and_push
+	 * -------------------------
+	 * Construct a LIFO stack span whose parent identity is taken from
+	 * `parent_ctx`.  Atomic init + set_parent_explicit + push, so the
+	 * pushed stack entry snapshot matches the reparented span from the
+	 * start.  `parent_ctx` may be NULL: behaves as
+	 * span_link_to_active_and_push with an empty stack (i.e. the span
+	 * starts a fresh root trace with its api->span_init-generated
+	 * trace_id, parent_span_id zero).
+	 *
+	 * Use this whenever a LIFO span needs to inherit from a
+	 * wire-supplied SpanContext (cross-node recv sites) or from any
+	 * source other than the currently-active stack.
+	 *
+	 * span_link_to_span_and_push
+	 * --------------------------
+	 * Convenience wrapper around span_link_to_ctx_and_push that
+	 * copies the parent's trace_id / span_id / trace_flags into a
+	 * temporary SpanContext.  `parent` may be NULL (root).
+	 *
+	 * span_context_of
+	 * ---------------
+	 * Populate `out` with a SpanContext describing `span`'s current
+	 * identity (trace_id, span_id, trace_flags; tracestate = NULL).
+	 * Safe for callers who need to pass a running span as the parent
+	 * of another span without going through span_current_context
+	 * (which returns the top-of-stack, not necessarily `span`).
+	 * `span` must not be NULL.
+	 *
+	 * Added in MINOR 4 (appended at end of struct per
+	 * additive-extension rules).
+	 */
+	void	  (*span_link_to_ctx_and_push) (OtelSpan *span,
+											const OtelSpanContext *parent_ctx);
+	void	  (*span_link_to_span_and_push) (OtelSpan *span,
+											 const OtelSpan *parent);
+	void	  (*span_context_of) (const OtelSpan *span,
+								  OtelSpanContext *out);
 } OtelTracingApi;
 
 

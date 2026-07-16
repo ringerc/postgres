@@ -446,6 +446,24 @@ typedef struct OtelSpan
 	 * the link target); links past OTEL_INLINE_LINKS are dropped. */
 	int			n_links;
 	OtelSpanContext links[OTEL_INLINE_LINKS];
+
+	/*
+	 * Producer-private tracking: true while this span is present on
+	 * the active LIFO span stack (i.e. after a successful push via
+	 * span_link_to_active_and_push, span_link_to_ctx_and_push,
+	 * span_link_to_span_and_push, or span_push, and before
+	 * span_emit pops it or the unwind callback removes it).
+	 *
+	 * Used by span_set_parent_explicit to assert -- under
+	 * USE_ASSERT_CHECKING -- that reparenting a pushed span is not
+	 * attempted; that bug silently breaks child span lineage because
+	 * the LIFO stack entry holds a stale snapshot of the pre-push
+	 * trace_id.
+	 *
+	 * Pre-1.0 ABI note: adding this field changes OtelSpan's layout;
+	 * rebuild every consumer after updating the installed headers.
+	 */
+	bool		on_active_stack;
 } OtelSpan;
 
 /*

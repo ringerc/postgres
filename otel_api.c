@@ -258,6 +258,11 @@ static const OtelTracingApi otel_tracing_api = {
 	.span_add_event = otel_producer_span_add_event,
 	.span_add_event_to_active = otel_producer_span_add_event_to_active,
 
+	/* Explicit-parent-and-push constructors + SpanContext extractor (MINOR 4). */
+	.span_link_to_ctx_and_push = otel_producer_span_link_to_ctx_and_push,
+	.span_link_to_span_and_push = otel_producer_span_link_to_span_and_push,
+	.span_context_of = otel_producer_span_context_of,
+
 	/* Phase 4: surface needed by the split-out query-tracing
 	 * module. */
 	.span_push = otel_producer_span_push,
