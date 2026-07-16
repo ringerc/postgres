@@ -23,9 +23,10 @@
  *	    file reads it via the existing assign-hook-populated state.
  *
  *	  * Active stack: bounded array of OtelSpanStackEntry, one per
- *	    currently-open span pushed by a consumer.  All entries share
- *	    one trace_id by construction (push variants only chain to the
- *	    existing top); explicit-parent variants do not touch the stack.
+ *	    currently-open span pushed by a consumer.  Each entry stores
+ *	    enough W3C identity to reconstitute the current context; push
+ *	    variants chain to the existing top, while explicit-parent
+ *	    variants do not touch the stack.
  *
  * Lifecycle of a pushed span
  * --------------------------
@@ -94,8 +95,8 @@
 
 /*
  * Maximum depth of the active-span stack.  Hard-coded for now; promoted
- * to a GUC if/when real workloads need tuning.  At ~88 bytes per entry
- * (OtelSpanStackEntry size below), 64 deep is ~5.5 KB of per-backend
+ * to a GUC if/when real workloads need tuning.  At ~120 bytes per entry
+ * (OtelSpanStackEntry size below), 64 deep is ~7.5 KB of per-backend
  * static memory --- negligible.
  *
  * Beyond this depth, new pushes still link parent_span_id to the
@@ -119,6 +120,7 @@ typedef struct OtelSpanStackEntry
 	/* Identity, inline for fast inspection.  No tracestate here: it
 	 * lives in the shared otel_tracestate_guc and is constant across
 	 * the lifetime of a trace within a backend. */
+	char		trace_id[OTEL_TRACE_ID_LEN + 1];
 	char		span_id[OTEL_SPAN_ID_LEN + 1];
 	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
 
@@ -619,6 +621,7 @@ otel_producer_span_push(OtelSpan *span)
 
 		span_stack_top++;
 		entry = &span_stack[span_stack_top];
+		memcpy(entry->trace_id, span->trace_id, sizeof(entry->trace_id));
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
@@ -669,11 +672,7 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 	{
 		const OtelSpanStackEntry *top = &span_stack[span_stack_top];
 
-		/* trace_id is shared across the stack by construction; read
-		 * it from the root context if set (or leave caller's
-		 * pre-populated value alone if not). */
-		if (otel_ctx.is_set)
-			memcpy(span->trace_id, otel_ctx.trace_id, sizeof(span->trace_id));
+		memcpy(span->trace_id, top->trace_id, sizeof(span->trace_id));
 		memcpy(span->parent_span_id, top->span_id, sizeof(span->parent_span_id));
 		memcpy(span->trace_flags, top->trace_flags, sizeof(span->trace_flags));
 	}
@@ -710,6 +709,7 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 
 		span_stack_top++;
 		entry = &span_stack[span_stack_top];
+		memcpy(entry->trace_id, span->trace_id, sizeof(entry->trace_id));
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
@@ -803,13 +803,7 @@ otel_producer_span_current_context(void)
 	{
 		const OtelSpanStackEntry *top = &span_stack[span_stack_top];
 
-		/* trace_id is shared across the stack; read from root context
-		 * if set, else fall back to zeros (which signals "no trace"
-		 * but should be impossible if anything is on the stack). */
-		if (otel_ctx.is_set)
-			memcpy(current_ctx_buf.trace_id, otel_ctx.trace_id, sizeof(current_ctx_buf.trace_id));
-		else
-			memset(current_ctx_buf.trace_id, 0, sizeof(current_ctx_buf.trace_id));
+		memcpy(current_ctx_buf.trace_id, top->trace_id, sizeof(current_ctx_buf.trace_id));
 		memcpy(current_ctx_buf.span_id, top->span_id, sizeof(current_ctx_buf.span_id));
 		memcpy(current_ctx_buf.trace_flags, top->trace_flags, sizeof(current_ctx_buf.trace_flags));
 		current_ctx_buf.tracestate = otel_tracestate_guc;
@@ -1036,7 +1030,8 @@ otel_span_init(OtelSpan *span,
 			   const char *name,
 			   OtelSpanKind kind)
 {
-	unsigned char buf[OTEL_SPAN_ID_LEN / 2];
+	unsigned char span_buf[OTEL_SPAN_ID_LEN / 2];
+	unsigned char trace_buf[OTEL_TRACE_ID_LEN / 2];
 
 	memset(span, 0, sizeof(*span));
 
@@ -1044,15 +1039,28 @@ otel_span_init(OtelSpan *span,
 	 * span IDs (8 random bytes is enough collision resistance for
 	 * any realistic trace volume) but it's the available API and
 	 * does the right thing. */
-	if (!pg_strong_random(buf, sizeof(buf)))
+	if (!pg_strong_random(span_buf, sizeof(span_buf)))
 	{
 		/* Random source unavailable --- degrade gracefully.  Use a
 		 * timestamp + pid mix for at least some uniqueness within
 		 * the backend. */
 		uint64		fallback = (uint64) GetCurrentTimestamp() ^ (uint64) MyProcPid;
-		memcpy(buf, &fallback, sizeof(buf));
+		memcpy(span_buf, &fallback, sizeof(span_buf));
 	}
-	bytes_to_lower_hex(buf, sizeof(buf), span->span_id);
+	bytes_to_lower_hex(span_buf, sizeof(span_buf), span->span_id);
+
+	/* Generate a fresh trace_id as well.  If no active/root context
+	 * exists when the span is pushed, this span becomes the root of a
+	 * new valid trace rather than carrying an all-zero trace_id. */
+	if (!pg_strong_random(trace_buf, sizeof(trace_buf)))
+	{
+		uint64		fallback_a = (uint64) GetCurrentTimestamp() ^ (uint64) MyProcPid;
+		uint64		fallback_b = (uint64) MyStartTimestamp ^ ((uint64) MyProcPid << 32);
+
+		memcpy(trace_buf, &fallback_a, sizeof(fallback_a));
+		memcpy(trace_buf + sizeof(fallback_a), &fallback_b, sizeof(fallback_b));
+	}
+	bytes_to_lower_hex(trace_buf, sizeof(trace_buf), span->trace_id);
 
 	span->scope = scope;
 	span->name = name;
