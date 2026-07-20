@@ -279,6 +279,9 @@ static const OtelTracingApi otel_tracing_api = {
 	 * InstrumentationScope registration. */
 	.get_resource_attributes = otel_resource_attrs_get,
 	.tracer_register = otel_tracer_register,
+
+	/* Late-add resource attribute (MINOR 5). */
+	.resource_add = otel_resource_add,
 };
 
 

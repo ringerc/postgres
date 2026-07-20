@@ -90,7 +90,7 @@
 #define OTEL_API_MINOR(v)			((v) & OTEL_API_MINOR_MASK)
 
 #define OTEL_TRACING_API_MAJOR		2
-#define OTEL_TRACING_API_MINOR		4
+#define OTEL_TRACING_API_MINOR		5
 #define OTEL_TRACING_API_VERSION	OTEL_MAKE_VERSION(OTEL_TRACING_API_MAJOR, \
 													  OTEL_TRACING_API_MINOR)
 
@@ -552,6 +552,26 @@ typedef struct OtelTracingApi
 											 const OtelSpan *parent);
 	void	  (*span_context_of) (const OtelSpan *span,
 								  OtelSpanContext *out);
+
+	/*
+	 * Add or update a process-level Resource attribute (MINOR 5).
+	 *
+	 * Safe to call from any backend context after _PG_init completes,
+	 * before the first span is emitted in a given backend.  Strings are
+	 * copied into TopMemoryContext.  If `key` already exists the value is
+	 * overwritten (last-write-wins semantics, useful for deferred identity
+	 * publishing where the initial value may be a placeholder).
+	 *
+	 * Intended for extension initialization hooks (e.g. ExecutorStart,
+	 * ProcessUtility) that need to publish per-node identity (node name,
+	 * node group, etc.) after catalog data becomes accessible, which is
+	 * after _PG_init completes.  Exporters calling get_resource_attributes()
+	 * from their emit hook will see these late-added attrs because the Rust
+	 * exporter builds its Resource lazily on first emit.
+	 *
+	 * Added in MINOR 5.
+	 */
+	void	  (*resource_add) (const char *key, const char *value);
 } OtelTracingApi;
 
 
