@@ -175,7 +175,8 @@ sub run_cell
 	send_msg($sock, 'M', headers_body('otel.traceparent' => $tp));
 	run_query($sock, 'SELECT 1');
 
-	my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
+	my @msgs = run_query($sock,
+		"SELECT test_otel_count_spans_by_name('pgsql.execute')");
 	my $got  = first_value(@msgs);
 	is($got, "$expected", $label);
 }

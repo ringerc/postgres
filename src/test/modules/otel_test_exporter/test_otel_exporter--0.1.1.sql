@@ -12,6 +12,16 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'test_otel_pop_span'
 LANGUAGE C VOLATILE PARALLEL SAFE;
 
+CREATE FUNCTION test_otel_pop_span_by_name(name text)
+RETURNS text
+AS 'MODULE_PATHNAME', 'test_otel_pop_span_by_name'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION test_otel_count_spans_by_name(name text)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'test_otel_count_spans_by_name'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
 CREATE FUNCTION test_otel_clear()
 RETURNS void
 AS 'MODULE_PATHNAME', 'test_otel_clear'

@@ -77,8 +77,8 @@ like($combined, qr/^span_id=\Q$span_id\E$/m,
 	'captured span_id matches what the SQL function returned');
 like($combined, qr/^parent_span_id=$/m,
 	'no parent (root span on a new trace)');
-like($combined, qr/^trace_id=$/m,
-	'trace_id empty (no propagated context, no auto-generated trace_id)');
+like($combined, qr/^trace_id=[0-9a-f]{32}$/m,
+	'trace_id is auto-generated for root span (no propagated context)');
 like($combined, qr/^attr=test\.case=roundtrip$/m,
 	'attribute test.case round-tripped');
 like($combined, qr/^attr=test\.name=producer\.roundtrip$/m,
