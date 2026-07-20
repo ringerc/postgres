@@ -431,12 +431,14 @@ _PG_init(void)
 
 	DefineCustomStringVariable("otel_api.service_name",
 							   "OTel Resource service.name attribute for this postmaster.",
-							   "Identifies the service emitting traces / metrics.  Default "
-							   "\"postgres\".  Operators typically set this to a deployment-"
-							   "specific name (e.g. \"orders-db-primary\").  Matches the "
-							   "OTel-standard OTEL_SERVICE_NAME environment variable.",
+							   "Identifies the service emitting traces / metrics.  When unset "
+							   "(the default), the value is resolved in order: "
+							   "(1) this GUC if explicitly set to a non-empty value, "
+							   "(2) the OTEL_SERVICE_NAME environment variable, "
+							   "(3) the service.name key inside OTEL_RESOURCE_ATTRIBUTES, "
+							   "(4) the hard-coded fallback \"postgres\".",
 							   &otel_service_name_guc,
-							   "postgres",
+							   NULL,
 							   PGC_POSTMASTER,
 							   0,
 							   NULL, NULL, NULL);
@@ -444,9 +446,13 @@ _PG_init(void)
 	DefineCustomStringVariable("otel_api.service_instance_id",
 							   "OTel Resource service.instance.id attribute for this postmaster.",
 							   "Uniquely identifies this postmaster instance among instances "
-							   "of the same service.  Empty string (the default) selects the "
-							   "cluster's pg_control system identifier, which is stable across "
-							   "postmaster restarts and unique per initdb.",
+							   "of the same service.  When unset (empty string, the default), "
+							   "the value is resolved in order: "
+							   "(1) this GUC if explicitly set to a non-empty value, "
+							   "(2) the OTEL_SERVICE_INSTANCE_ID environment variable, "
+							   "(3) the service.instance.id key inside OTEL_RESOURCE_ATTRIBUTES, "
+							   "(4) the cluster's pg_control system identifier, which is stable "
+							   "across postmaster restarts and unique per initdb.",
 							   &otel_service_instance_id_guc,
 							   "",
 							   PGC_POSTMASTER,

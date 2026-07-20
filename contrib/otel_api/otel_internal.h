@@ -67,6 +67,7 @@ extern OtelSamplerHookPolicy	otel_get_sampler_hook_policy(void);
  * OtelTracingApi rendezvous struct.  Also home to the
  * InstrumentationScope registry (otel_tracer_register). */
 extern void otel_resource_init(void);
+extern void otel_resource_add(const char *key, const char *value);
 extern const OtelResourceAttribute *otel_resource_attrs_get(int *n_out);
 extern OtelInstrumentationScope *otel_tracer_register(const char *name,
 													  const char *version,
