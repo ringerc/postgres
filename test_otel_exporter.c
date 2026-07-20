@@ -368,6 +368,62 @@ test_otel_span_count(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Format a captured span into a stable key=value\n text blob used by
+ * pop_span and pop_span_by_name.  Caller must have called initStringInfo
+ * before passing buf.
+ */
+static void
+format_span(const CapturedSpan *s, StringInfoData *buf)
+{
+	int			i;
+
+	appendStringInfo(buf, "scope.name=%s\n",
+					 s->scope_name ? s->scope_name : "");
+	appendStringInfo(buf, "scope.version=%s\n",
+					 s->scope_version ? s->scope_version : "");
+	appendStringInfo(buf, "scope.schema_url=%s\n",
+					 s->scope_schema_url ? s->scope_schema_url : "");
+	appendStringInfo(buf, "name=%s\n", s->name ? s->name : "");
+	appendStringInfo(buf, "kind=%d\n", (int) s->kind);
+	appendStringInfo(buf, "status=%d\n", (int) s->status);
+	appendStringInfo(buf, "trace_id=%s\n", s->trace_id);
+	appendStringInfo(buf, "span_id=%s\n", s->span_id);
+	appendStringInfo(buf, "parent_span_id=%s\n", s->parent_span_id);
+	appendStringInfo(buf, "trace_flags=%s\n", s->trace_flags);
+	appendStringInfo(buf, "tracestate=%s\n",
+					 s->tracestate ? s->tracestate : "");
+	appendStringInfo(buf, "start_time=%" PRId64 "\n",
+					 (int64) s->start_time);
+	appendStringInfo(buf, "end_time=%" PRId64 "\n",
+					 (int64) s->end_time);
+	if (s->status_description)
+		appendStringInfo(buf, "status_description=%s\n",
+						 s->status_description);
+	for (i = 0; i < s->n_attrs; i++)
+		appendStringInfo(buf, "attr=%s=%s\n",
+						 s->attrs[i].key ? s->attrs[i].key : "",
+						 s->attrs[i].value ? s->attrs[i].value : "");
+	for (i = 0; i < s->n_events; i++)
+	{
+		const CapturedEvent *e = &s->events[i];
+		int			j;
+
+		/*
+		 * Generic per-event dump: a name line, a time line, then one
+		 * line per attribute.  ereport-derived events surface as
+		 * event.name=exception with their sqlstate / message / elevel /
+		 * code.* / detail / hint carried under event.attr= keys.
+		 */
+		appendStringInfo(buf, "event.name=%s\n", e->name ? e->name : "");
+		appendStringInfo(buf, "event.time=%" PRId64 "\n", (int64) e->time);
+		for (j = 0; j < e->n_attrs; j++)
+			appendStringInfo(buf, "event.attr=%s=%s\n",
+							 e->attrs[j].key ? e->attrs[j].key : "",
+							 e->attrs[j].value ? e->attrs[j].value : "");
+	}
+}
+
+/*
  * Pop the oldest captured span and return it as a single text blob.
  * Returns NULL if the ring is empty.  Format is a stable
  * key=value\n flat representation chosen for cheap regex assertion
@@ -383,7 +439,6 @@ test_otel_pop_span(PG_FUNCTION_ARGS)
 	int			idx;
 	CapturedSpan *s;
 	StringInfoData buf;
-	int			i;
 
 	if (ring_count == 0)
 		PG_RETURN_NULL();
@@ -392,55 +447,99 @@ test_otel_pop_span(PG_FUNCTION_ARGS)
 	s = &ring[idx];
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "scope.name=%s\n",
-					 s->scope_name ? s->scope_name : "");
-	appendStringInfo(&buf, "scope.version=%s\n",
-					 s->scope_version ? s->scope_version : "");
-	appendStringInfo(&buf, "scope.schema_url=%s\n",
-					 s->scope_schema_url ? s->scope_schema_url : "");
-	appendStringInfo(&buf, "name=%s\n", s->name ? s->name : "");
-	appendStringInfo(&buf, "kind=%d\n", (int) s->kind);
-	appendStringInfo(&buf, "status=%d\n", (int) s->status);
-	appendStringInfo(&buf, "trace_id=%s\n", s->trace_id);
-	appendStringInfo(&buf, "span_id=%s\n", s->span_id);
-	appendStringInfo(&buf, "parent_span_id=%s\n", s->parent_span_id);
-	appendStringInfo(&buf, "trace_flags=%s\n", s->trace_flags);
-	appendStringInfo(&buf, "tracestate=%s\n",
-					 s->tracestate ? s->tracestate : "");
-	appendStringInfo(&buf, "start_time=%" PRId64 "\n",
-					 (int64) s->start_time);
-	appendStringInfo(&buf, "end_time=%" PRId64 "\n",
-					 (int64) s->end_time);
-	if (s->status_description)
-		appendStringInfo(&buf, "status_description=%s\n",
-						 s->status_description);
-	for (i = 0; i < s->n_attrs; i++)
-		appendStringInfo(&buf, "attr=%s=%s\n",
-						 s->attrs[i].key ? s->attrs[i].key : "",
-						 s->attrs[i].value ? s->attrs[i].value : "");
-	for (i = 0; i < s->n_events; i++)
-	{
-		const CapturedEvent *e = &s->events[i];
-		int			j;
-
-		/*
-		 * Generic per-event dump: a name line, a time line, then one
-		 * line per attribute.  ereport-derived events surface as
-		 * event.name=exception with their sqlstate / message / elevel /
-		 * code.* / detail / hint carried under event.attr= keys.
-		 */
-		appendStringInfo(&buf, "event.name=%s\n", e->name ? e->name : "");
-		appendStringInfo(&buf, "event.time=%" PRId64 "\n", (int64) e->time);
-		for (j = 0; j < e->n_attrs; j++)
-			appendStringInfo(&buf, "event.attr=%s=%s\n",
-							 e->attrs[j].key ? e->attrs[j].key : "",
-							 e->attrs[j].value ? e->attrs[j].value : "");
-	}
+	format_span(s, &buf);
 
 	/* Advance past this slot. */
 	ring_count--;
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * Pop the oldest captured span whose name exactly matches the argument.
+ * Scans the ring in FIFO order (oldest first), removes the first matching
+ * entry (shifting later entries one position toward the head to close the
+ * gap), and returns the span text in the same format as test_otel_pop_span.
+ * Returns NULL if no match is found.
+ */
+PG_FUNCTION_INFO_V1(test_otel_pop_span_by_name);
+Datum
+test_otel_pop_span_by_name(PG_FUNCTION_ARGS)
+{
+	text	   *name_arg = PG_GETARG_TEXT_PP(0);
+	const char *name_to_find = text_to_cstring(name_arg);
+	int			match_lpos = -1;
+	int			i;
+	StringInfoData buf;
+
+	/* Find the oldest span matching the requested name. */
+	for (i = 0; i < ring_count; i++)
+	{
+		int			phys = (ring_head - ring_count + i + CAPTURE_RING_SIZE)
+			% CAPTURE_RING_SIZE;
+
+		if (ring[phys].name && strcmp(ring[phys].name, name_to_find) == 0)
+		{
+			match_lpos = i;
+			break;
+		}
+	}
+
+	if (match_lpos < 0)
+		PG_RETURN_NULL();
+
+	/* Format the matched span before we overwrite its slot. */
+	{
+		int			phys = (ring_head - ring_count + match_lpos + CAPTURE_RING_SIZE)
+			% CAPTURE_RING_SIZE;
+
+		initStringInfo(&buf);
+		format_span(&ring[phys], &buf);
+	}
+
+	/*
+	 * Close the gap: shift all later entries one logical position toward
+	 * the oldest end, then shrink ring_head by one.  This preserves the
+	 * circular layout and the ring_head / ring_count invariants.
+	 */
+	for (i = match_lpos; i < ring_count - 1; i++)
+	{
+		int			src = (ring_head - ring_count + i + 1 + CAPTURE_RING_SIZE)
+			% CAPTURE_RING_SIZE;
+		int			dst = (ring_head - ring_count + i + CAPTURE_RING_SIZE)
+			% CAPTURE_RING_SIZE;
+
+		ring[dst] = ring[src];	/* shallow copy; all strings in otel_test_cxt */
+	}
+	ring_head = (ring_head - 1 + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
+	ring_count--;
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * Count spans in the ring whose name exactly matches the argument.
+ * Does not remove any entries.
+ */
+PG_FUNCTION_INFO_V1(test_otel_count_spans_by_name);
+Datum
+test_otel_count_spans_by_name(PG_FUNCTION_ARGS)
+{
+	text	   *name_arg = PG_GETARG_TEXT_PP(0);
+	const char *name_to_find = text_to_cstring(name_arg);
+	int			count = 0;
+	int			i;
+
+	for (i = 0; i < ring_count; i++)
+	{
+		int			phys = (ring_head - ring_count + i + CAPTURE_RING_SIZE)
+			% CAPTURE_RING_SIZE;
+
+		if (ring[phys].name && strcmp(ring[phys].name, name_to_find) == 0)
+			count++;
+	}
+
+	PG_RETURN_INT32(count);
 }
 
 /*

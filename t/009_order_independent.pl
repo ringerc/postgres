@@ -156,10 +156,10 @@ EOCONF
 	run_query($sock, 'SELECT 1');
 
 	my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-	is(first_value(@msgs), '1',
-		'span captured with reverse preload order (provider last)');
+	is(first_value(@msgs), '6',
+		'six spans captured with reverse preload order (provider last)');
 
-	@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+	@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 	my $span = first_value(@msgs);
 	like($span, qr/trace_id=$TRACE_ID/,
 		'span carries propagated trace_id (reverse order)');
@@ -245,10 +245,10 @@ EOCONF
 	run_query($sock, 'SELECT 1');
 
 	my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-	is(first_value(@msgs), '1',
-		'span captured via session_preload_libraries exporter');
+	is(first_value(@msgs), '6',
+		'six spans captured via session_preload_libraries exporter');
 
-	@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+	@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 	my $span = first_value(@msgs);
 	like($span, qr/trace_id=$TRACE_ID/,
 		'span carries propagated trace_id (session_preload path)');
@@ -320,10 +320,10 @@ EOCONF
 	run_query($sock, 'SELECT 1');
 
 	my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-	is(first_value(@msgs), '1',
-		'span captured after mid-session LOAD of exporter');
+	is(first_value(@msgs), '6',
+		'six spans captured after mid-session LOAD of exporter');
 
-	@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+	@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 	my $span = first_value(@msgs);
 	like($span, qr/trace_id=$TRACE_ID/,
 		'span carries propagated trace_id (mid-session LOAD path)');

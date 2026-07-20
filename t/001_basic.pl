@@ -171,13 +171,14 @@ my $count = $node->safe_psql('postgres', 'SELECT test_otel_span_count()');
 # connection.  Switch back to that connection for the readout.
 
 my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-is(first_value(@msgs), '1',
-	'one span captured by the test exporter');
+is(first_value(@msgs), '6',
+	'six spans captured (pgsql.execute + 5 SDT sub-phase spans)');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+# Pop the statement span by name so attribute assertions target the right span.
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 my $span = first_value(@msgs);
 ok(defined $span && length $span,
-	'test_otel_pop_span returned a span body');
+	'test_otel_pop_span_by_name returned the pgsql.execute span body');
 
 # trace_id matches what the client supplied
 like($span, qr/trace_id=$TRACE_ID/,
@@ -264,10 +265,10 @@ send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'SELECT 1/i FROM generate_series(0,0) AS i');
 
 @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-is(first_value(@msgs), '1',
-	'one span captured even though the query errored');
+is(first_value(@msgs), '4',
+	'four spans captured for the errored query (parse+rewrite+plan+pgsql.execute; pg.execute/pg.query not closed on error path)');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 $span = first_value(@msgs);
 like($span, qr/status=2\n/,
 	'span status is ERROR (2) for a query that raised an ereport(ERROR)');
@@ -305,7 +306,7 @@ run_query($sock, q{DO $$ BEGIN RAISE WARNING 'test-warn'; END $$});
 isnt(first_value(@msgs), '0',
 	'at least one span captured for the DO block');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('DO')");
 $span = first_value(@msgs);
 like($span, qr/name=DO\n/,
 	'utility span name is "DO" (the command tag)');
@@ -335,11 +336,11 @@ send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'COMMIT');
 
 # At least two spans (BEGIN and COMMIT); names should reflect.
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('BEGIN')");
 $span = first_value(@msgs);
 like($span, qr/name=BEGIN\n/, 'first utility span is BEGIN');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('COMMIT')");
 $span = first_value(@msgs);
 like($span, qr/name=COMMIT\n/, 'second utility span is COMMIT');
 

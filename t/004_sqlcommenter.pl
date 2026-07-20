@@ -144,15 +144,16 @@ sub run_query
 	return drain_to_rfq($sock);
 }
 
-# Run a SQL Query, then pop the most-recently captured span via
-# test_otel_pop_span() and return it as a text blob (or undef if
-# the ring was empty).
+# Run a SQL Query, then pop the pgsql.execute span via
+# test_otel_pop_span_by_name() and return it as a text blob (or undef if
+# the ring held no pgsql.execute span).  The sqlcommenter path emits two
+# spans (pg.execute + pgsql.execute); we want the statement span.
 sub query_and_pop_span
 {
 	my ($sock, $sql) = @_;
 	run_query($sock, 'SELECT test_otel_clear()');
 	run_query($sock, $sql);
-	my @msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+	my @msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 	return first_value(@msgs);
 }
 
@@ -314,9 +315,9 @@ run_query($sock,
 	"/* traceparent='00-${COMMENT_TRACE_LEAD}-${COMMENT_SPAN_LEAD}-01' */ SELECT 1"
 );
 run_query($sock, "SELECT 2");
-@msgs = run_query($sock, 'SELECT test_otel_span_count()');
+@msgs = run_query($sock, "SELECT test_otel_count_spans_by_name('pgsql.execute')");
 is(first_value(@msgs), '1',
-	'statement scope: only the comment-bearing query produced a span');
+	'statement scope: only the comment-bearing query produced a pgsql.execute span');
 
 # ----------------------------------------------------------------------
 # Test 8: The Mode-3 PREPARE/EXECUTE breakage --- documented
