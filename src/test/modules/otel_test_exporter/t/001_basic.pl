@@ -211,6 +211,10 @@ like($span, qr/attr=db\.statement=SELECT 1/,
 like($span, qr/status=0\n/,
 	'status is UNSET on the success path');
 
+# No status_description on non-error spans
+unlike($span, qr/status_description=/,
+	'status_description absent on non-error spans');
+
 # Timestamps are sane (start <= end)
 my ($start) = $span =~ /start_time=(-?\d+)/;
 my ($end)   = $span =~ /end_time=(-?\d+)/;
@@ -284,6 +288,8 @@ like($span, qr/event\.attr=postgres\.sqlstate=22012\n/,
 	'event sqlstate is 22012 (division_by_zero)');
 like($span, qr/event\.attr=exception\.message=division by zero/,
 	'event message captures the ereport text');
+like($span, qr/status_description=22012 \/ division by zero/,
+	'status_description is populated with SQLSTATE / message summary');
 like($span, qr/event\.attr=code\.filepath=\S*\w+\.c/,
 	'event code.filepath is a postgres source file');
 
@@ -316,6 +322,8 @@ like($span, qr/event\.attr=postgres\.elevel=19\n/,
 	'WARNING-level event captured on the utility span (elevel 19)');
 like($span, qr/event\.attr=exception\.message=test-warn/,
 	'WARNING message captured on the utility span');
+unlike($span, qr/status_description=/,
+	'status_description absent on WARNING-only span (Status.message reserved for Error status)');
 
 # ----------------------------------------------------------------------
 # Test 6: explicit BEGIN/COMMIT cycle - the BEGIN and COMMIT statements
