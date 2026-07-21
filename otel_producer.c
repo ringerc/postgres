@@ -967,6 +967,58 @@ lower_error_event(OtelSpan *span)
 	 */
 	if (span->n_events == before)
 		otel_producer_span_add_event(span, "exception", ec->time, NULL, 0);
+
+	/*
+	 * Populate the OTLP Status.message field from the same capture, so
+	 * downstream StatusMessage columns aren't empty on Error-status spans.
+	 * Only synthesize when:
+	 *   - the span's final status is ERROR --- the capture slot also
+	 *     retains WARNING-severity ereports (they still lower into the
+	 *     exception event), but OTLP semantics reserve Status.message
+	 *     for Error-status spans, so a WARNING-only span must keep an
+	 *     empty StatusMessage;
+	 *   - the caller hasn't already set an explicit status_description
+	 *     (e.g. via the unwind paths);
+	 *   - at least one of SQLSTATE or message is available (otherwise
+	 *     leave NULL rather than fabricate).
+	 * Bounded to 256 chars to stay friendly to table-column consumers
+	 * (ClickHouse StatusMessage LowCardinality, Grafana table cells).
+	 */
+	if (span->status == OTEL_STATUS_ERROR &&
+		span->status_description == NULL &&
+		(ec->sqlstate[0] != '\0' || ec->message != NULL))
+	{
+		const size_t maxlen = 256;
+		char	   *buf;
+
+		buf = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
+												  maxlen,
+												  MCXT_ALLOC_NO_OOM);
+		if (buf != NULL)
+		{
+			int			written;
+			const char *sqlstate = (ec->sqlstate[0] != '\0') ? ec->sqlstate : NULL;
+			const char *msg = ec->message;
+
+			if (sqlstate != NULL && msg != NULL)
+				written = snprintf(buf, maxlen, "%s / %s", sqlstate, msg);
+			else if (sqlstate != NULL)
+				written = snprintf(buf, maxlen, "%s", sqlstate);
+			else
+				written = snprintf(buf, maxlen, "%s", msg);
+
+			/* If output was truncated, mark with "..." tail. */
+			if (written >= (int) maxlen && maxlen >= 4)
+			{
+				buf[maxlen - 4] = '.';
+				buf[maxlen - 3] = '.';
+				buf[maxlen - 2] = '.';
+				buf[maxlen - 1] = '\0';
+			}
+
+			span->status_description = buf;
+		}
+	}
 }
 
 void
