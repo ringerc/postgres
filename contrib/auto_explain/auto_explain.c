@@ -27,6 +27,17 @@
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
+/*
+ * Optional OTel span enrichment.  When otel_api is present in the build tree
+ * (patched PostgreSQL), include its header so explain_ExecutorEnd can attach
+ * the plan text to the active statement span.  otel_api_get() returns NULL
+ * when the provider is absent at runtime, making this a safe no-op.
+ */
+#ifdef PG_HAVE_SDT_PROBE_HOOK		/* defined in pg_config_manual.h by our patch */
+#include "otel_api/otel_api.h"
+#define HAVE_OTEL_API 1
+#endif
+
 PG_MODULE_MAGIC_EXT(
 					.name = "auto_explain",
 					.version = PG_VERSION
@@ -477,6 +488,38 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				es->str->data[0] = '{';
 				es->str->data[es->str->len - 1] = '}';
 			}
+
+			/*
+			 * Enrich the active OTel statement span with the plan text as a
+			 * span EVENT (name="plan") rather than a span attribute.  A
+			 * KB-sized plan on every sampled span bloats the attribute set,
+			 * and under ANALYZE the embedded timings make a plan-text
+			 * attribute high-cardinality; an event is the correct home.
+			 *
+			 * otel_api_get() returns NULL when the provider is absent (or too
+			 * old: it validates struct_size against the OtelTracingApi we
+			 * compiled against, and span_add_event_to_active is a MINOR-3
+			 * table entry), making this a safe no-op in those cases.
+			 *
+			 * The producer COPIES the attribute array and its key/value
+			 * strings into the span's context, so the transient stack array
+			 * below and the es->str->data lifetime are not a concern here
+			 * (the copy happens before this call returns).
+			 */
+#ifdef HAVE_OTEL_API
+			{
+				const OtelTracingApi *otel = otel_api_get();
+
+				if (otel != NULL)
+				{
+					const OtelKeyValue attrs[] = {
+						{"db.postgresql.explain_plan", es->str->data},
+					};
+
+					otel->span_add_event_to_active("plan", 0, attrs, 1);
+				}
+			}
+#endif
 
 			/*
 			 * Note: we rely on the existing logging of context or

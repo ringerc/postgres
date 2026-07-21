@@ -1,0 +1,5 @@
+# otel_api extension
+comment = 'OpenTelemetry trace-context API for PostgreSQL extensions'
+default_version = '0.1.1'
+module_pathname = '$libdir/otel_api'
+relocatable = true

@@ -498,6 +498,21 @@ struct pg_conn
 	 */
 	PGcmdQueueEntry *cmd_queue_recycle;
 
+	/*
+	 * Trace-context protocol message ('M' / TraceContext).
+	 * Availability is derived from conn->pversion (>= 3.3), not a
+	 * negotiated flag.
+	 *
+	 * tcTraceparent / tcTracestate are malloc'd strings, NULL when unset.
+	 * tcArmed: re-emit once per pipeline until disarmed (PQsetTraceContext).
+	 * tcPendingOneShot: emit once before next message, then clear
+	 *   (PQattachTraceContext).
+	 */
+	char	   *tcTraceparent;
+	char	   *tcTracestate;
+	bool		tcArmed;
+	bool		tcPendingOneShot;
+
 	/* Connection data */
 	pgsocket	sock;			/* FD for socket, PGINVALID_SOCKET if
 								 * unconnected */
@@ -747,6 +762,12 @@ extern pgthreadlock_t pg_g_threadlock;
 
 #define pglock_thread()		pg_g_threadlock(true)
 #define pgunlock_thread()	pg_g_threadlock(false)
+
+/* === in fe-trace-context.c === */
+
+extern int	pqFlushTraceContext(PGconn *conn);
+extern void pqReleaseTraceContext(PGconn *conn);
+
 
 /* === in fe-exec.c === */
 

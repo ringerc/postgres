@@ -35,4 +35,11 @@ extern void ExecAsyncForeignScanRequest(AsyncRequest *areq);
 extern void ExecAsyncForeignScanConfigureWait(AsyncRequest *areq);
 extern void ExecAsyncForeignScanNotify(AsyncRequest *areq);
 
+/* Hooks for FDW scan begin/end observation (e.g., OTel tracing). */
+typedef void (*ForeignScanBegin_hook_type) (ForeignScanState *node, int eflags);
+typedef void (*ForeignScanEnd_hook_type) (ForeignScanState *node);
+
+PGDLLIMPORT extern ForeignScanBegin_hook_type ForeignScanBegin_hook;
+PGDLLIMPORT extern ForeignScanEnd_hook_type ForeignScanEnd_hook;
+
 #endif							/* NODEFOREIGNSCAN_H */

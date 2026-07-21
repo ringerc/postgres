@@ -49,9 +49,12 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
 #include "utils/rel.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
+
+#include "otel_api/otel_api.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "postgres_fdw",
@@ -760,6 +763,45 @@ static void merge_fdw_options(PgFdwRelationInfo *fpinfo,
 							  const PgFdwRelationInfo *fpinfo_o,
 							  const PgFdwRelationInfo *fpinfo_i);
 static int	get_batch_size_option(Relation rel);
+
+/* Lazily initialized tracer scope for postgres_fdw OTel spans. */
+static const OtelInstrumentationScope *pgfdw_tracer = NULL;
+
+static const OtelInstrumentationScope *
+pgfdw_get_tracer(const OtelTracingApi *api)
+{
+	if (pgfdw_tracer == NULL)
+		pgfdw_tracer = api->tracer_register("postgres_fdw", PG_VERSION, NULL);
+	return pgfdw_tracer;
+}
+
+/*
+ * Propagate the current active span context to the remote server by issuing
+ * SET otel_api.traceparent.  This lets the remote server's statement spans
+ * appear as children of our local FDW span.  No-ops when there is no active
+ * trace or the remote lacks otel_api (PostgreSQL accepts unknown dotted GUC
+ * names as custom-variable placeholders, so the SET never errors).
+ */
+static void
+pgfdw_propagate_trace_context(PGconn *conn, PgFdwConnState *conn_state,
+							  const OtelTracingApi *api)
+{
+	const OtelSpanContext *ctx;
+	char		cmd[100];
+	PGresult   *res;
+
+	ctx = api->span_current_context();
+	if (ctx == NULL || ctx->trace_id[0] == '\0')
+		return;
+
+	snprintf(cmd, sizeof(cmd),
+			 "SET otel_api.traceparent = '00-%s-%s-%s'",
+			 ctx->trace_id, ctx->span_id, ctx->trace_flags);
+
+	res = pgfdw_exec_query(conn, cmd, conn_state);
+	PQclear(res);
+	/* Ignore result: error surfaces on next real query if anything went wrong */
+}
 
 
 /*
@@ -3947,6 +3989,21 @@ create_cursor(ForeignScanState *node)
 	PGconn	   *conn = fsstate->conn;
 	StringInfoData buf;
 	PGresult   *res;
+	const OtelTracingApi *api;
+	OtelSpan	span;
+	bool		span_pushed = false;
+
+	/* OTel: start a span covering the remote cursor declaration. */
+	api = otel_api_get();
+	if (api != NULL)
+	{
+		api->span_init(&span, pgfdw_get_tracer(api),
+					   "pg.fdw.cursor", OTEL_SPAN_KIND_CLIENT);
+		api->span_add_attribute_string(&span, "db.system", "postgresql");
+		api->span_add_attribute_string(&span, "db.statement", fsstate->query);
+		api->span_link_to_active_and_push(&span);
+		span_pushed = true;
+	}
 
 	/* First, process a pending asynchronous request, if any. */
 	if (fsstate->conn_state->pendingAreq)
@@ -3970,6 +4027,10 @@ create_cursor(ForeignScanState *node)
 
 		MemoryContextSwitchTo(oldcontext);
 	}
+
+	/* OTel: send our span context to the remote before the cursor query. */
+	if (span_pushed)
+		pgfdw_propagate_trace_context(conn, fsstate->conn_state, api);
 
 	/* Construct the DECLARE CURSOR command */
 	initStringInfo(&buf);
@@ -4003,6 +4064,13 @@ create_cursor(ForeignScanState *node)
 	fsstate->fetch_ct_2 = 0;
 	fsstate->eof_reached = false;
 
+	/* OTel: emit the cursor span now that the remote query has completed. */
+	if (span_pushed)
+	{
+		span.end_time = GetCurrentTimestamp();
+		api->span_emit(&span);
+	}
+
 	/* Clean up */
 	pfree(buf.data);
 }
@@ -4019,6 +4087,20 @@ fetch_more_data(ForeignScanState *node)
 	int			numrows;
 	int			i;
 	MemoryContext oldcontext;
+	const OtelTracingApi *api;
+	OtelSpan	span;
+	bool		span_pushed = false;
+
+	/* OTel: start span before context switch so callback binds to caller's ctx. */
+	api = otel_api_get();
+	if (api != NULL)
+	{
+		api->span_init(&span, pgfdw_get_tracer(api),
+					   "pg.fdw.fetch", OTEL_SPAN_KIND_CLIENT);
+		api->span_add_attribute_string(&span, "db.system", "postgresql");
+		api->span_link_to_active_and_push(&span);
+		span_pushed = true;
+	}
 
 	/*
 	 * We'll store the tuples in the batch_cxt.  First, flush the previous
@@ -4087,6 +4169,17 @@ fetch_more_data(ForeignScanState *node)
 	PQclear(res);
 
 	MemoryContextSwitchTo(oldcontext);
+
+	/* OTel: record row count and emit span. */
+	if (span_pushed)
+	{
+		char		rowsbuf[16];
+
+		snprintf(rowsbuf, sizeof(rowsbuf), "%d", numrows);
+		api->span_add_attribute_string(&span, "pg.fdw.fetch.rows", rowsbuf);
+		span.end_time = GetCurrentTimestamp();
+		api->span_emit(&span);
+	}
 }
 
 /*
@@ -4734,6 +4827,21 @@ execute_dml_stmt(ForeignScanState *node)
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			numParams = dmstate->numParams;
 	const char **values = dmstate->param_values;
+	const OtelTracingApi *api;
+	OtelSpan	span;
+	bool		span_pushed = false;
+
+	/* OTel: start span covering the remote DML execution. */
+	api = otel_api_get();
+	if (api != NULL)
+	{
+		api->span_init(&span, pgfdw_get_tracer(api),
+					   "pg.fdw.modify", OTEL_SPAN_KIND_CLIENT);
+		api->span_add_attribute_string(&span, "db.system", "postgresql");
+		api->span_add_attribute_string(&span, "db.statement", dmstate->query);
+		api->span_link_to_active_and_push(&span);
+		span_pushed = true;
+	}
 
 	/* First, process a pending asynchronous request, if any. */
 	if (dmstate->conn_state->pendingAreq)
@@ -4747,6 +4855,10 @@ execute_dml_stmt(ForeignScanState *node)
 							 dmstate->param_flinfo,
 							 dmstate->param_exprs,
 							 values);
+
+	/* OTel: propagate trace context to remote before the DML query. */
+	if (span_pushed)
+		pgfdw_propagate_trace_context(dmstate->conn, dmstate->conn_state, api);
 
 	/*
 	 * Notice that we pass NULL for paramTypes, thus forcing the remote server
@@ -4780,6 +4892,13 @@ execute_dml_stmt(ForeignScanState *node)
 		dmstate->num_tuples = PQntuples(dmstate->result);
 	else
 		dmstate->num_tuples = atoi(PQcmdTuples(dmstate->result));
+
+	/* OTel: emit span after the remote DML completes. */
+	if (span_pushed)
+	{
+		span.end_time = GetCurrentTimestamp();
+		api->span_emit(&span);
+	}
 }
 
 /*
