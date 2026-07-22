@@ -132,16 +132,22 @@ static bool				sdt_query_drop = false;
 static char				sdt_attr_scratch[SDT_POOL_SIZE][SDT_ATTR_BUFS][SDT_ATTR_BUFLEN];
 
 /* InstrumentationScope for this bridge's spans. */
-/*
- * TODO: tag every span this bridge emits with an explicit
- * pg.otel.span_source = "sdt_probe" attribute so consumers can cleanly
- * separate these intercepted-tracepoint spans (pg.*) from the hook-based
- * spans in otel_trace.c (pgsql.execute / command-tag utility spans). The
- * sdt_scope below is meant to distinguish them, but the Rust exporter
- * collapses ScopeName to the crate name on export, so scope can't be used
- * downstream. See the fuller TODO in otel_trace.c.
- */
 static const OtelInstrumentationScope *sdt_scope = NULL;
+
+/*
+ * Common attribute stamped on every span this bridge emits (pg.txn,
+ * pg.replica.apply, and every per-statement span: pg.query, pg.parse,
+ * pg.rewrite, pg.plan, pg.execute, pg.sort, pg.smgr.read, pg.smgr.write,
+ * pg.syncrep.wait, pg.lock.wait).
+ * Lets downstream consumers (ClickHouse, Grafana) cleanly filter spans
+ * this bridge produced from the hook-based spans emitted by otel_trace.c
+ * (pgsql.execute / command-tag utility spans), which the exporter can't
+ * distinguish via ScopeName (the Rust exporter collapses ScopeName to
+ * the crate name).  String literal — safe for the borrowed-pointer
+ * contract of span_add_attribute_string.
+ */
+#define SDT_SPAN_SOURCE_ATTR_KEY	"pg.otel.span_source"
+#define SDT_SPAN_SOURCE_ATTR_VAL	"sdt_probe"
 
 /*
  * Transaction-lifetime span.  Unlike the per-statement spans, this one
@@ -543,6 +549,9 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				 * trace_id so the transaction is its own trace. */
 				api->span_init(&txn_span, sdt_scope, "pg.txn",
 							   OTEL_SPAN_KIND_INTERNAL);
+				api->span_add_attribute_string(&txn_span,
+											   SDT_SPAN_SOURCE_ATTR_KEY,
+											   SDT_SPAN_SOURCE_ATTR_VAL);
 				if (!pg_strong_random(buf, sizeof(buf)))
 					memset(buf, 0xa5, sizeof(buf));
 				sdt_bytes_to_hex(buf, sizeof(buf), txn_span.trace_id);
@@ -726,6 +735,9 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			 */
 			api->span_init(&replica_span, sdt_scope, "pg.replica.apply",
 						   OTEL_SPAN_KIND_CONSUMER);
+			api->span_add_attribute_string(&replica_span,
+										   SDT_SPAN_SOURCE_ATTR_KEY,
+										   SDT_SPAN_SOURCE_ATTR_VAL);
 
 			/* trace_id: 32 hex chars at offset 3 */
 			memcpy(replica_span.trace_id, traceparent + 3, 32);
@@ -841,6 +853,9 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		 * root context when the stack is empty).
 		 */
 		api->span_init(s, sdt_scope, span_name, OTEL_SPAN_KIND_INTERNAL);
+		api->span_add_attribute_string(s,
+									   SDT_SPAN_SOURCE_ATTR_KEY,
+									   SDT_SPAN_SOURCE_ATTR_VAL);
 
 		/*
 		 * Add useful attributes for query-level probes.  nargs and arg

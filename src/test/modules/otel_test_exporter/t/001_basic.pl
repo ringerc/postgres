@@ -174,6 +174,19 @@ my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
 is(first_value(@msgs), '6',
 	'six spans captured (pgsql.execute + 5 SDT sub-phase spans)');
 
+# Every span from the SDT bridge should carry the common filter attribute
+# pg.otel.span_source=sdt_probe, and the executor-hook span should NOT.
+for my $sdt_name (qw(pg.query pg.parse pg.rewrite pg.plan pg.execute))
+{
+	my @sm = run_query($sock,
+		"SELECT test_otel_pop_span_by_name('$sdt_name')");
+	my $s = first_value(@sm);
+	ok(defined $s && length $s,
+		"SDT span '$sdt_name' was captured for tagging check");
+	like($s, qr/attr=pg\.otel\.span_source=sdt_probe/,
+		"SDT span '$sdt_name' carries pg.otel.span_source=sdt_probe");
+}
+
 # Pop the statement span by name so attribute assertions target the right span.
 @msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 my $span = first_value(@msgs);

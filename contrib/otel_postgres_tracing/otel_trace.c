@@ -348,8 +348,16 @@ start_span(QueryDesc *queryDesc)
 	 * (this file: ExecutorStart/End -> "pgsql.execute", ProcessUtility ->
 	 * command-tag/"pgsql.utility") from INTERCEPTED-tracepoint spans
 	 * (otel_sdt_bridge.c: pg.query/parse/rewrite/plan/execute/sort/smgr/txn).
-	 * Today the only discriminator is the span-name convention, which is
-	 * fragile and inconsistent:
+	 *
+	 * The SDT half now stamps every span it emits with
+	 * pg.otel.span_source = "sdt_probe" (see SDT_SPAN_SOURCE_ATTR_* in
+	 * otel_sdt_bridge.c), so downstream can filter/exclude SDT spans by
+	 * that attribute.  This file should adopt the symmetric convention
+	 * (e.g. pg.otel.span_source = "executor_hook" | "process_utility_hook")
+	 * so a single attribute predicate discriminates every producer.
+	 *
+	 * Today the discriminator on the hook side is still the span-name
+	 * convention, which is fragile and inconsistent:
 	 *   - "pgsql.*" is meant to mean hook-based, but ProcessUtility spans are
 	 *     named by raw command tag ("SET", "BEGIN", "CREATE TABLE AS", ...),
 	 *     so they carry no "pgsql." prefix at all;
@@ -357,11 +365,6 @@ start_span(QueryDesc *queryDesc)
 	 *     here vs sdt_scope in the bridge) but the Rust exporter collapses every
 	 *     span's ScopeName to the crate name ("postgres_otel_tracing_demo"), so
 	 *     scope is useless for filtering downstream (verified in ClickHouse).
-	 * Proposed fix: set an explicit span attribute on every span at creation,
-	 * e.g. pg.otel.span_source = "executor_hook" | "process_utility_hook" |
-	 * "sdt_probe", in BOTH producers; and/or fix the exporter so distinct
-	 * InstrumentationScope names survive export, then document the
-	 * scope->producer mapping. See the companion TODO in otel_sdt_bridge.c.
 	 */
 
 	/* Flip the active flag BEFORE populating attributes --- the
