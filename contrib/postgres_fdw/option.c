@@ -44,6 +44,14 @@ static PgFdwOption *postgres_fdw_options;
  * GUC parameters
  */
 char	   *pgfdw_application_name = NULL;
+int			pgfdw_trace_propagation = PGFDW_TRACE_PROPAGATION_COMMENT;
+
+static const struct config_enum_entry pgfdw_trace_propagation_options[] = {
+	{"off", PGFDW_TRACE_PROPAGATION_OFF, false},
+	{"comment", PGFDW_TRACE_PROPAGATION_COMMENT, false},
+	{"set", PGFDW_TRACE_PROPAGATION_SET, false},
+	{NULL, 0, false},
+};
 
 /*
  * Helper functions
@@ -590,6 +598,22 @@ _PG_init(void)
 							   NULL,
 							   NULL,
 							   NULL);
+
+	DefineCustomEnumVariable("postgres_fdw.trace_propagation",
+							 "Controls how postgres_fdw propagates local OTel trace context to the remote server.",
+							 "\"off\" never propagates (remote-only sampling); "
+							 "\"comment\" embeds the traceparent in a sqlcommenter "
+							 "trailing comment in the query text (default, no extra "
+							 "round trip); \"set\" issues a separate SET "
+							 "otel_api.traceparent before the query.",
+							 &pgfdw_trace_propagation,
+							 PGFDW_TRACE_PROPAGATION_COMMENT,
+							 pgfdw_trace_propagation_options,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	MarkGUCPrefixReserved("postgres_fdw");
 }

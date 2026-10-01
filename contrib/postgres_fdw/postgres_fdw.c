@@ -772,15 +772,16 @@ static int	get_batch_size_option(Relation rel);
 static OtelTracer pgfdw_tracer = {.name = "postgres_fdw", .version = PG_VERSION};
 
 /*
- * Propagate span s's context to the remote server by issuing SET
- * otel_api.traceparent.  This lets the remote server's statement spans
- * appear as children of our local FDW span.  No-op when s is
- * OTEL_SPAN_NONE (s.v == 0): no local tracing is in effect, so there is no
- * context to propagate.  An unsampled span (s.v < 0) still has a valid
- * context and is propagated, so the remote continues the same trace even
- * when this side isn't recording.  PostgreSQL accepts unknown dotted GUC
- * names as custom-variable placeholders, so the SET never errors even if
- * the remote lacks otel_api.
+ * "set"-mode propagation: send span s's context to the remote server by
+ * issuing SET otel_api.traceparent ahead of the real query.  This lets the
+ * remote server's statement spans appear as children of our local FDW
+ * span.  No-op unless postgres_fdw.trace_propagation = set, and even then
+ * only when s is non-zero (no local tracing in effect otherwise, so there
+ * is no context to propagate).  An unsampled span (s.v < 0) still has a
+ * valid context and is propagated, so the remote continues the same trace
+ * even when this side isn't recording.  PostgreSQL accepts unknown dotted
+ * GUC names as custom-variable placeholders, so the SET never errors even
+ * if the remote lacks otel_api.
  */
 static void
 pgfdw_propagate_trace_context(OtelSpanRef s, PGconn *conn,
@@ -791,6 +792,8 @@ pgfdw_propagate_trace_context(OtelSpanRef s, PGconn *conn,
 	char		cmd[64 + OTEL_TRACEPARENT_LEN];
 	PGresult   *res;
 
+	if (pgfdw_trace_propagation != PGFDW_TRACE_PROPAGATION_SET)
+		return;
 	if (s.v == 0)
 		return;
 	if (!otel_span_context_of(s, &ctx))
@@ -802,6 +805,39 @@ pgfdw_propagate_trace_context(OtelSpanRef s, PGconn *conn,
 	res = pgfdw_exec_query(conn, cmd, conn_state);
 	PQclear(res);
 	/* Ignore result: error surfaces on next real query if anything went wrong */
+}
+
+/*
+ * "comment"-mode propagation: build a sqlcommenter trailing comment
+ * carrying span s's trace context, e.g. " /...traceparent='00-...-...-..'.../"
+ * (written with ... in place of the comment delimiters to keep this out of
+ * the way of an actual C comment), ready to append to the remote query
+ * text.  Per the sqlcommenter spec
+ * (https://google.github.io/sqlcommenter/spec/) this needs to be the last
+ * thing in the statement; the receiving otel_api only looks for a block
+ * comment at the very start or the very end of the query string.  The W3C
+ * traceparent alphabet (hex digits and '-') is already RFC 3986
+ * "unreserved", so no percent-encoding is needed here.
+ *
+ * Returns NULL (no allocation at all) when there is nothing to propagate:
+ * propagation isn't in "comment" mode, or s has no context.  Otherwise
+ * palloc's the comment in the current context; caller must pfree it.
+ */
+static char *
+pgfdw_trace_comment(OtelSpanRef s)
+{
+	OtelSpanContext ctx;
+	char		traceparent[OTEL_TRACEPARENT_LEN + 1];
+
+	if (pgfdw_trace_propagation != PGFDW_TRACE_PROPAGATION_COMMENT)
+		return NULL;
+	if (s.v == 0)
+		return NULL;
+	if (!otel_span_context_of(s, &ctx))
+		return NULL;
+
+	otel_traceparent_format(&ctx, traceparent);
+	return psprintf(" /*traceparent='%s'*/", traceparent);
 }
 
 
@@ -4031,6 +4067,17 @@ create_cursor(ForeignScanState *node)
 	appendStringInfo(&buf, "DECLARE c%u CURSOR FOR\n%s",
 					 fsstate->cursor_number, fsstate->query);
 
+	/* OTel: "comment"-mode propagation, appended after the remote SELECT. */
+	{
+		char	   *trace_comment = pgfdw_trace_comment(span);
+
+		if (trace_comment)
+		{
+			appendStringInfoString(&buf, trace_comment);
+			pfree(trace_comment);
+		}
+	}
+
 	/*
 	 * Notice that we pass NULL for paramTypes, thus forcing the remote server
 	 * to infer types for all parameters.  Since we explicitly cast every
@@ -4827,19 +4874,42 @@ execute_dml_stmt(ForeignScanState *node)
 							 dmstate->param_exprs,
 							 values);
 
-	/* OTel: propagate trace context to remote before the DML query. */
+	/* OTel: "set"-mode propagation to remote before the DML query. */
 	pgfdw_propagate_trace_context(span, dmstate->conn, dmstate->conn_state);
 
 	/*
-	 * Notice that we pass NULL for paramTypes, thus forcing the remote server
-	 * to infer types for all parameters.  Since we explicitly cast every
-	 * parameter (see deparse.c), the "inference" is trivial and will produce
-	 * the desired result.  This allows us to avoid assuming that the remote
-	 * server has the same OIDs we do for the parameters' types.
+	 * OTel: "comment"-mode propagation.  dmstate->query is reused on every
+	 * call, so build a separate copy with the comment appended rather than
+	 * modifying it in place; only done when there's actually a comment to
+	 * add.
 	 */
-	if (!PQsendQueryParams(dmstate->conn, dmstate->query, numParams,
-						   NULL, values, NULL, NULL, 0))
-		pgfdw_report_error(NULL, dmstate->conn, dmstate->query);
+	{
+		char	   *trace_comment = pgfdw_trace_comment(span);
+		const char *query_to_send = dmstate->query;
+		char	   *query_with_comment = NULL;
+
+		if (trace_comment)
+		{
+			query_with_comment = psprintf("%s%s", dmstate->query, trace_comment);
+			pfree(trace_comment);
+			query_to_send = query_with_comment;
+		}
+
+		/*
+		 * Notice that we pass NULL for paramTypes, thus forcing the remote
+		 * server to infer types for all parameters.  Since we explicitly
+		 * cast every parameter (see deparse.c), the "inference" is trivial
+		 * and will produce the desired result.  This allows us to avoid
+		 * assuming that the remote server has the same OIDs we do for the
+		 * parameters' types.
+		 */
+		if (!PQsendQueryParams(dmstate->conn, query_to_send, numParams,
+							   NULL, values, NULL, NULL, 0))
+			pgfdw_report_error(NULL, dmstate->conn, query_to_send);
+
+		if (query_with_comment)
+			pfree(query_with_comment);
+	}
 
 	/*
 	 * Get the result, and check for success.
