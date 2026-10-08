@@ -43,7 +43,8 @@
 #include "utils/guc.h"
 #include "utils/json.h"
 
-#include <otel_api/otel_api.h>
+#include <otel_api/otel_exporter.h>
+#include <otel_api/otel_semconv.h>
 
 PG_MODULE_MAGIC;
 
@@ -123,25 +124,34 @@ format_span_json(const OtelSpan *span, StringInfo out)
 {
 	int			i;
 	const char *db_stmt = NULL;
+	char		trace_id_hex[OTEL_TRACE_ID_HEX_LEN + 1];
+	char		span_id_hex[OTEL_SPAN_ID_HEX_LEN + 1];
+	char		parent_span_id_hex[OTEL_SPAN_ID_HEX_LEN + 1];
 
-	/* Pull the db.statement attribute out for convenience; everything
+	/* Pull the db.query.text attribute out for convenience; everything
 	 * else is captured via the structured fields. */
 	for (i = 0; i < span->n_attrs; i++)
 	{
-		if (span->attrs[i].key && strcmp(span->attrs[i].key, "db.statement") == 0)
+		if (span->attrs[i].key &&
+			strcmp(span->attrs[i].key, OTEL_SC_DB_QUERY_TEXT) == 0 &&
+			span->attrs[i].type == OTEL_ATTR_STRING)
 		{
-			db_stmt = span->attrs[i].value;
+			db_stmt = span->attrs[i].v.s;
 			break;
 		}
 	}
 
+	otel_trace_id_to_hex(&span->trace_id, trace_id_hex);
+	otel_span_id_to_hex(&span->span_id, span_id_hex);
+	otel_span_id_to_hex(&span->parent_span_id, parent_span_id_hex);
+
 	appendStringInfoChar(out, '{');
 	appendStringInfoString(out, "\"trace_id\":");
-	escape_json(out, span->trace_id);
+	escape_json(out, trace_id_hex);
 	appendStringInfoString(out, ",\"span_id\":");
-	escape_json(out, span->span_id);
+	escape_json(out, span_id_hex);
 	appendStringInfoString(out, ",\"parent_span_id\":");
-	escape_json(out, span->parent_span_id);
+	escape_json(out, parent_span_id_hex);
 	appendStringInfoString(out, ",\"name\":");
 	escape_json(out, span->name ? span->name : "");
 	appendStringInfo(out, ",\"status\":%d", (int) span->status);
@@ -266,7 +276,7 @@ _PG_init(void)
 	memset(&pending_reg, 0, sizeof(pending_reg));
 	pending_reg.emit_hook = otel_demo_exporter_emit;
 	pending_reg.emit_prev_out = &prev_emit_hook;
-	otel_api_register_when_ready(&pending_reg);
+	otel_exporter_register_when_ready(&pending_reg);
 
 	on_proc_exit(close_output, (Datum) 0);
 }
