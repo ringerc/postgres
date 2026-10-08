@@ -193,16 +193,14 @@ run_query($sock, 'SELECT test_otel_clear()');
 my $log_offset = -s $node->logfile;
 
 #
-# No ORDER BY here: postgres_fdw would push it down to the remote as
-# "ORDER BY a ASC NULLS LAST", and fdw_otel_src has no index on "a", so
-# the remote plan would need an actual Sort node.  That trips an
-# unrelated, pre-existing assertion failure in otel_postgres_tracing's
-# per-node span bookkeeping when a Sort node is fetched through a
-# cursor's FETCH (a real bug, filed separately; not something this test
-# is meant to exercise).  Row order doesn't matter for what's asserted
-# below, so a plain Seq Scan avoids it.
+# ORDER BY a: postgres_fdw pushes this down to the remote as "ORDER BY a
+# ASC NULLS LAST", and fdw_otel_src has no index on "a", so the remote
+# plan needs an actual Sort node, fetched through the cursor's FETCH
+# (postgres-cdq.39; see otel_sdt_bridge.c's PG_SDT_SORT_START/DONE
+# handling and tests/otel_test_exporter/t/010_cursor_spans.pl scenarios
+# 8/9 in postgres_otel_api for the minimal, non-FDW repro and the fix).
 send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
-run_query($sock, 'SELECT a FROM fdw_otel_f');
+run_query($sock, 'SELECT a FROM fdw_otel_f ORDER BY a');
 
 my @msgs = run_query($sock,
 	"SELECT test_otel_pop_span_by_name('pg.fdw.cursor')");
