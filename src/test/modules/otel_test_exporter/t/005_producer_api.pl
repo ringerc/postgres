@@ -38,6 +38,9 @@ $node->append_conf(
 	'postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
+# The producer's span starts a new trace, and new traces go to the
+# sampler hook, which drops by default in this exporter.
+test_otel_exporter.sampler_decision = record_and_sample
 EOCONF
 $node->start;
 $node->safe_psql('postgres',
