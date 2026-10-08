@@ -46,8 +46,8 @@
 #include "utils/memutils.h"
 
 #include <otel_api/otel.h>
-#include <otel_api/otel_api.h>
 #include "otel_postgres_tracing.h"
+#include "otel_pg_attrs.h"
 #include "otel_planshape.h"
 
 /* GUC backing variable; defined in otel_planshape_install(). */
@@ -157,23 +157,19 @@ planshape_walk(Plan *plan, PlanShapeCtx *ctx)
 }
 
 void
-otel_planshape_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
+otel_planshape_executor_start(QueryDesc *queryDesc, OtelSpanRef stmt_span,
 							  MemoryContext attr_cxt)
 {
-	const OtelTracingApi *api;
 	PlannedStmt *pstmt;
 	PlanShapeCtx ctx;
 	MemoryContext old;
-	char	   *v;
+	char	   *shape_hash;
 
 	if (!otel_trace_plan_shape)
 		return;
 
-	if (queryDesc == NULL || queryDesc->plannedstmt == NULL || stmt_span == NULL)
-		return;
-
-	api = otel_api_get();
-	if (api == NULL)
+	if (queryDesc == NULL || queryDesc->plannedstmt == NULL ||
+		!otel_span_recording(stmt_span))
 		return;
 
 	pstmt = queryDesc->plannedstmt;
@@ -187,12 +183,10 @@ otel_planshape_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
 	old = MemoryContextSwitchTo(attr_cxt);
 
 	/* Shape hash: an identity string, not a numeric measure. */
-	v = psprintf("%08x", ctx.digest);
-	api->span_add_attribute_string(stmt_span, "pg.plan.shape_hash", v);
+	shape_hash = psprintf("%08x", ctx.digest);
+	otel_span_set_str(stmt_span, OTEL_ATTR_PG_PLAN_SHAPE_HASH, shape_hash);
 
-	v = psprintf("%d", ctx.node_count);
-	api->span_add_attribute_string(stmt_span, "pg.plan.node_count",
-								   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
+	otel_span_set_int(stmt_span, OTEL_ATTR_PG_PLAN_NODE_COUNT, ctx.node_count);
 
 	if (ctx.risk_seqscan_large || ctx.risk_nestloop_high_inner)
 	{
@@ -204,8 +198,7 @@ otel_planshape_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
 		if (ctx.risk_nestloop_high_inner)
 			appendStringInfo(&risks, "%snestloop_high_inner",
 							 risks.len > 0 ? "," : "");
-		/* risks.data is already in attr_cxt. */
-		api->span_add_attribute_string(stmt_span, "pg.plan.risks", risks.data);
+		otel_span_set_str(stmt_span, OTEL_ATTR_PG_PLAN_RISKS, risks.data);
 	}
 
 	MemoryContextSwitchTo(old);

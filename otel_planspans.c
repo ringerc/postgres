@@ -21,8 +21,10 @@
  *
  * The span machinery is the same as otel_fdw.c: a fixed-depth stack keyed by
  * the PlanState pointer so ends can be matched non-LIFO, plus (sub)xact-abort
- * cleanup (planspans_subxact_abort / planspans_reset).  Spans use
- * OTEL_UNWIND_DROP (span_init default) so static storage is safe.
+ * cleanup (planspans_subxact_abort / planspans_reset).  A span abandoned by
+ * abort is exported with ERROR status by otel_api's own resource-owner
+ * release; every attribute is copied into the span at set time, so nothing
+ * here dereferences the (possibly already-freed) PlanState during export.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -43,8 +45,8 @@
 #include "utils/timestamp.h"
 
 #include <otel_api/otel.h>
-#include <otel_api/otel_api.h>
 #include "otel_postgres_tracing.h"
+#include "otel_pg_attrs.h"
 #include "otel_planwalk.h"
 #include "otel_planspans.h"
 
@@ -61,7 +63,7 @@ bool		otel_trace_plan_child_spans = false;
 static struct
 {
 	PlanState  *node;			/* key: the PlanState pointer */
-	OtelSpan	span;			/* OTEL_UNWIND_DROP -> static storage ok */
+	OtelSpanRef ref;
 	int			subxact_level;	/* GetCurrentTransactionNestLevel() at push */
 } planspans_stack[OTEL_PLANSPANS_STACK_MAX];
 static int	planspans_depth = 0;
@@ -95,27 +97,41 @@ planspans_span_name(PlanState *ps)
  * stack.  Structural attributes available at init time are added here; runtime
  * attributes (parallel worker counts) are added at node_end.
  */
+/*
+ * The span of ps's nearest ancestor that has one, else the statement span.
+ */
+static OtelSpanRef
+planspans_parent(OtelPlanwalkContext *ctx)
+{
+	for (int a = ctx->n_ancestors - 1; a >= 0; a--)
+		for (int i = planspans_depth - 1; i >= 0; i--)
+			if (planspans_stack[i].node == ctx->ancestors[a])
+				return planspans_stack[i].ref;
+	return ctx->stmt_span;
+}
+
 static void
 planspans_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 {
-	const OtelTracingApi *api;
 	const char *name = planspans_span_name(ps);
-	OtelSpan   *span;
+	OtelSpanRef s;
 
-	(void) ctx;
-
-	if (name == NULL)
+	if (name == NULL || planspans_depth >= OTEL_PLANSPANS_STACK_MAX)
 		return;
 
-	api = otel_pg_ensure();
-	if (api == NULL || planspans_depth >= OTEL_PLANSPANS_STACK_MAX)
+	/*
+	 * Every node's span starts in one walk at ExecutorStart and ends in
+	 * another at ExecutorEnd, so they don't nest in the C call stack:
+	 * detached, with the plan-tree parent named explicitly.
+	 */
+	s = otel_span_start(.tracer = &otel_pg_tracer,
+						.name = name,
+						.kind = OTEL_SPAN_KIND_INTERNAL,
+						.detached = true,
+						.parent = OTEL_PARENT_SPAN,
+						.parent_span = planspans_parent(ctx));
+	if (s.v == 0)
 		return;
-
-	span = &planspans_stack[planspans_depth].span;
-	planspans_stack[planspans_depth].node = ps;
-	planspans_stack[planspans_depth].subxact_level = GetCurrentTransactionNestLevel();
-
-	api->span_init(span, otel_pg_tracer, name, OTEL_SPAN_KIND_INTERNAL);
 
 	if (IsA(ps, CustomScanState))
 	{
@@ -126,21 +142,22 @@ planspans_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 		const char *cname = ((CustomScanState *) ps)->methods->CustomName;
 
 		if (cname != NULL)
-			api->span_add_attribute_string(span, "pg.customscan.method", cname);
+			otel_span_set_str(s, OTEL_ATTR_PG_CUSTOMSCAN_METHOD, cname);
 	}
 
-	api->span_link_to_active_and_push(span);
+	planspans_stack[planspans_depth].node = ps;
+	planspans_stack[planspans_depth].ref = s;
+	planspans_stack[planspans_depth].subxact_level = GetCurrentTransactionNestLevel();
 	planspans_depth++;
 }
 
 /*
  * node_end: locate the tracking entry for this node (non-LIFO), add any
- * runtime attributes, emit the span, and compact the stack.
+ * runtime attributes, end the span, and compact the stack.
  */
 static void
 planspans_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 {
-	const OtelTracingApi *api = otel_api_get();
 	int			i;
 
 	if (planspans_span_name(ps) == NULL || planspans_depth == 0)
@@ -150,43 +167,34 @@ planspans_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 	{
 		if (planspans_stack[i].node == ps)
 		{
-			OtelSpan   *span = &planspans_stack[i].span;
+			OtelSpanRef s = planspans_stack[i].ref;
 
-			if (api != NULL)
+			/*
+			 * Parallel worker counts are only known after execution, so
+			 * add them here (not at begin).  Emit even when launched ==
+			 * planned so a healthy parallel region is still visible.
+			 */
+			if (IsA(ps, GatherState) || IsA(ps, GatherMergeState))
 			{
-				/*
-				 * Parallel worker counts are only known after execution, so
-				 * add them here (not at begin).  Emit even when launched ==
-				 * planned so a healthy parallel region is still visible.
-				 */
-				if (IsA(ps, GatherState) || IsA(ps, GatherMergeState))
+				int			planned;
+				int			launched;
+
+				if (IsA(ps, GatherState))
 				{
-					int			planned;
-					int			launched;
-					MemoryContext old;
-
-					if (IsA(ps, GatherState))
-					{
-						launched = ((GatherState *) ps)->nworkers_launched;
-						planned = ((Gather *) ps->plan)->num_workers;
-					}
-					else
-					{
-						launched = ((GatherMergeState *) ps)->nworkers_launched;
-						planned = ((GatherMerge *) ps->plan)->num_workers;
-					}
-
-					old = MemoryContextSwitchTo(ctx->attr_cxt);
-					api->span_add_attribute_string(span, "pg.parallel.workers_planned",
-												   psprintf("%d", planned)); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-					api->span_add_attribute_string(span, "pg.parallel.workers_launched",
-												   psprintf("%d", launched)); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-					MemoryContextSwitchTo(old);
+					launched = ((GatherState *) ps)->nworkers_launched;
+					planned = ((Gather *) ps->plan)->num_workers;
+				}
+				else
+				{
+					launched = ((GatherMergeState *) ps)->nworkers_launched;
+					planned = ((GatherMerge *) ps->plan)->num_workers;
 				}
 
-				span->end_time = GetCurrentTimestamp();
-				api->span_emit(span);
+				otel_span_set_int(s, OTEL_PG_PARALLEL_WORKERS_PLANNED, planned);
+				otel_span_set_int(s, OTEL_PG_PARALLEL_WORKERS_LAUNCHED, launched);
 			}
+
+			otel_span_end(s);
 
 			/* Shift remaining entries down to fill the gap. */
 			for (; i < planspans_depth - 1; i++)
@@ -195,7 +203,7 @@ planspans_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 			return;
 		}
 	}
-	/* Not found: already unwound via MemoryContext callback on error. */
+	/* Not found: already unwound via the resource owner on error. */
 }
 
 static bool
@@ -264,8 +272,9 @@ otel_planspans_subxact_abort(SubXactEvent event)
 }
 
 /*
- * Reset on top-level transaction abort.  The spans are dropped by the otel_api
- * MemoryContext callbacks during error unwind; we just clear our depth counter.
+ * Reset on top-level transaction abort.  The spans are ended (exported with
+ * ERROR status) by otel_api's own resource-owner release during error
+ * unwind; we just clear our depth counter.
  */
 void
 otel_planspans_reset(void)

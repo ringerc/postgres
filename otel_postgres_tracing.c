@@ -39,7 +39,7 @@
 #include "utils/elog.h"
 #include "utils/guc.h"
 
-#include <otel_api/otel_api.h>
+#include <otel_api/otel.h>
 
 #include "otel_postgres_tracing.h"
 #include "otel_planwalk.h"
@@ -52,20 +52,12 @@ PG_MODULE_MAGIC;
 
 
 /*
- * The OtelTracingApi pointer.  Lazily resolved on first hot-path call
- * via otel_pg_ensure(); written here so otel_trace.c and otel_log.c
- * can read it without calling through the getter every time.
- * NULL until the provider is first seen.
+ * This module's tracer (OTel InstrumentationScope).  otel_api fills in
+ * ->scope the first time it is passed to otel_span_start(); no explicit
+ * registration call is needed with the new producer API.
  * Declared in otel_postgres_tracing.h.
  */
-const OtelTracingApi *otel_api = NULL;
-
-/*
- * InstrumentationScope handle for this module's spans.  Populated
- * lazily the first time otel_pg_ensure() succeeds.
- * Declared in otel_postgres_tracing.h.
- */
-const OtelInstrumentationScope *otel_pg_tracer = NULL;
+OtelTracer	otel_pg_tracer = {.name = "otel_postgres_tracing", .version = PG_VERSION};
 
 /*
  * GUC controlling whether spans are emitted for queries that
@@ -76,38 +68,6 @@ bool otel_trace_all_queries = false;
 
 
 void		_PG_init(void);
-
-
-/*
- * otel_pg_ensure() — lazy provider resolution.
- *
- * Called from every hot-path site that needs the API.  On first
- * successful resolution it also registers the InstrumentationScope
- * handle.  Returns the cached OtelTracingApi pointer, or NULL when
- * the provider is absent/incompatible.
- *
- * Defined here (not in a header) so otel_trace.c and otel_log.c can
- * call it; it is declared in otel_postgres_tracing.h.
- */
-const OtelTracingApi *
-otel_pg_ensure(void)
-{
-	const OtelTracingApi *api = otel_api_get();
-
-	if (api == NULL)
-		return NULL;
-
-	/* Cache the pointer in the module global for other TUs. */
-	otel_api = api;
-
-	/* Register the tracer scope once (idempotent: otel_pg_tracer stays
-	 * non-NULL after the first successful call). */
-	if (otel_pg_tracer == NULL)
-		otel_pg_tracer = api->tracer_register("contrib/otel_postgres_tracing",
-											  PG_VERSION,
-											  NULL);
-	return api;
-}
 
 
 void

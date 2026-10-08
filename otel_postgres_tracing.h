@@ -18,27 +18,12 @@
 
 #include <otel_api/otel.h>
 
-
 /*
- * Cached pointer to the OtelTracingApi, lazily populated by
- * otel_pg_ensure().  NULL until the provider is first seen.
- * otel_trace.c / otel_log.c use otel_pg_ensure() on hot paths
- * rather than reading this directly.
+ * This module's tracer (OTel InstrumentationScope).  otel_api fills in
+ * ->scope on first use; every otel_span_start() call in this module
+ * passes &otel_pg_tracer.  Defined in otel_postgres_tracing.c.
  */
-extern const OtelTracingApi *otel_api;
-
-/*
- * InstrumentationScope handle for this module.  Populated lazily
- * on the first otel_pg_ensure() success.
- */
-extern const OtelInstrumentationScope *otel_pg_tracer;
-
-/*
- * Lazy provider resolution.  Returns the OtelTracingApi pointer
- * (or NULL when absent/incompatible).  Also registers the tracer
- * scope on first success.  Safe to call on every hot-path invocation.
- */
-extern const OtelTracingApi *otel_pg_ensure(void);
+extern OtelTracer otel_pg_tracer;
 
 /* Behaviour GUCs owned by this module. */
 extern bool otel_trace_all_queries;
@@ -48,10 +33,6 @@ extern void otel_trace_install_hooks(void);
 
 /* Defined in otel_log.c.  Called once from _PG_init. */
 extern void otel_log_install_hooks(void);
-
-/* Called from otel_log.c's emit_log_hook to record an ereport as a
- * span event when a span is active.  No-op otherwise. */
-extern void otel_span_record_log_event(ErrorData *edata);
 
 /* Defined in otel_sdt_bridge.c.  Called once from _PG_init. */
 extern void otel_sdt_install(void);
@@ -66,9 +47,7 @@ extern void otel_sdt_install(void);
  * from the active pg.txn span back to a statement span.
  */
 extern bool otel_sdt_get_txn_context(OtelSpanContext *out);
-extern void otel_sdt_link_stmt_to_txn(const char *trace_id,
-									  const char *span_id,
-									  const char *trace_flags);
+extern void otel_sdt_link_stmt_to_txn(const OtelSpanContext *stmt_ctx);
 #endif							/* PG_HAVE_SDT_PROBE_HOOK */
 
 

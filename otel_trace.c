@@ -1,27 +1,27 @@
 /*-------------------------------------------------------------------------
  *
  * otel_trace.c
- *	  Span production hooks for contrib/otel.
+ *	  Span production hooks for contrib/otel_postgres_tracing.
  *
- * Owns the span lifecycle (start / finalize) and the executor hooks
- * that produce one OtelSpan per top-level statement.  When a span
- * is emitted, hands it to whichever exporter registered via
- * otel_span_emit_hook.
+ * Owns the executor / utility hooks that produce one span per statement.
+ * otel_api owns all span storage now (an OtelSpanRef is an 8-byte
+ * handle); this file keeps only a small bookkeeping stack that maps a
+ * statement's identity (its QueryDesc, or a per-call token for a
+ * utility statement) to the OtelSpanRef so the matching ExecutorEnd /
+ * ProcessUtility return can end it.  Nested statements (e.g. CREATE
+ * TABLE AS running its SELECT through the executor) now get their own
+ * span apiece, nested under the outer one via the API's active stack
+ * (OTEL_PARENT_ACTIVE, the default parent).
  *
  * Hot path:
- *	 ExecutorStart_hook -> early-bail or start_span(queryDesc)
- *	 ExecutorEnd_hook   -> finalize_span(OTEL_STATUS_UNSET)
+ *	 ExecutorStart_hook -> early-bail or start_stmt_span()
+ *	 ExecutorEnd_hook   -> end the span matching this QueryDesc
  *
- * Error path (ExecutorEnd_hook is not called):
- *	 XACT_EVENT_ABORT   -> finalize_span(OTEL_STATUS_ERROR) if active
- *
- * Worst case:
- *	 on_proc_exit       -> defensively finalize any orphan span
- *
- * State lives in module-statics (span_storage, span_cxt, span_active).
- * Per-query allocation is limited to whatever overflow_attrs/events
- * we need, all in span_cxt which is reset between spans.
- *
+ * Error path: if ExecutorEnd is never reached (an error unwinds past
+ * it), the span's resource owner is released on abort and otel_api
+ * exports it with ERROR status.  This file does not need its own
+ * abort-time span cleanup; it only needs to keep its own bookkeeping
+ * stack in sync, which the xact/subxact callbacks below do.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -36,14 +36,16 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "access/parallel.h"
 #include "access/xact.h"
-#include "commands/dbcommands.h"
 #include "executor/executor.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "tcop/cmdtag.h"
+#include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/backend_status.h"
 #include "utils/elog.h"
@@ -64,45 +66,86 @@
 #include "otel_planshape.h"
 
 /*
- * Span lifecycle state --- per backend.
+ * Bookkeeping stack: maps a statement's identity to the OtelSpanRef
+ * started for it.  Not span storage -- just enough to find the right
+ * handle again at the matching ExecutorEnd / ProcessUtility return.
  *
- * span_storage is a static slab reused for every span (no per-span
- * palloc).  span_active flags whether it currently holds a live
- * span.  span_cxt is a per-backend MemoryContext used for any
- * variable-length data we need to copy in (e.g. on the abort path
- * where the portal's memory may already be gone).  It is reset
- * between spans, never deleted.
+ * key is queryDesc for executor spans, or the address of a stack-local
+ * in the owning otel_ProcessUtility() frame for utility spans (unique
+ * and stable for the duration of that call, including recursive
+ * invocations for nested utility statements).
  *
- * span_originator identifies which hook owns the active span, so the
- * matching hook is the one that finalizes it.  This matters for the
- * nested case (utility command that runs an executor underneath, e.g.
- * CTAS): the outer hook keeps ownership; the inner hook's End is a
- * no-op for the span.  Set when start_span() is called, cleared on
- * finalize_span().
+ * Entries are removed at the matching end call.  On (sub)transaction
+ * abort, entries at or above the aborting nesting level are dropped
+ * here too: their spans are ended (and exported with ERROR status) by
+ * otel_api's own resource-owner release, so this is bookkeeping
+ * cleanup only, not span cleanup.
+ *
+ * detached marks a cursor's executor span (see
+ * otel_declaring_cursor_name below): it is .detached, so it does not
+ * sit on otel_api's active stack across the statements between
+ * DECLARE and CLOSE/portal-drop.  otel_ExecutorRun() looks entries up
+ * by key (without removing them) to activate/deactivate it around the
+ * one ExecutorRun call that belongs to its FETCH.
  */
-typedef enum SpanOriginator
+#define OTEL_STMT_STACK_MAX 32
+typedef struct StmtSpanEntry
 {
-	SPAN_ORIGIN_NONE = 0,
-	SPAN_ORIGIN_EXECUTOR = 1,
-	SPAN_ORIGIN_UTILITY = 2,
-} SpanOriginator;
+	const void *key;
+	OtelSpanRef ref;
+	int			subxact_level;
+	bool		detached;		/* a cursor's executor span */
+} StmtSpanEntry;
 
-static OtelSpan span_storage;
-static bool		span_active = false;
-static SpanOriginator span_originator = SPAN_ORIGIN_NONE;
-static MemoryContext span_cxt = NULL;
+static StmtSpanEntry stmt_stack[OTEL_STMT_STACK_MAX];
+static int	stmt_stack_depth = 0;
 
-/* Phase 3: the saved_current_span_id_guc + restore machinery is
- * gone.  Parallel-worker propagation now uses the per-backend
- * shared-memory slot in otel_parallel.c; the leader publishes at
- * start_span and clears at finalize_span. */
+/*
+ * The portal name from a DeclareCursorStmt currently being processed
+ * by otel_ProcessUtility(), or NULL.  PerformCursorOpen() plans the
+ * cursor's query (which can run arbitrary nested statements, e.g. a
+ * volatile-in-practice IMMUTABLE function folded by the planner, each
+ * with its own ExecutorStart) *before* it creates the portal and
+ * calls PortalStart() -- so a bare "are we inside DECLARE CURSOR's
+ * ProcessUtility call" flag would wrongly mark every such nested
+ * statement's span .detached too, not just the cursor's own.
+ *
+ * PortalStart() (tcop/pquery.c) sets the global ActivePortal to the
+ * new portal *before* calling ExecutorStart() for it, and nothing
+ * else does between here and there (planning happens first, with
+ * ActivePortal still pointing at whatever the enclosing statement's
+ * portal is). So otel_ExecutorStart() checks ActivePortal->name
+ * against this name: true only for the cursor's own ExecutorStart,
+ * never for a nested statement run during planning.
+ */
+static const char *otel_declaring_cursor_name = NULL;
+
+/* True iff ActivePortal is the cursor otel_declaring_cursor_name names --
+ * i.e. this ExecutorStart is the cursor's own, not some nested statement
+ * run while planning it. */
+static inline bool
+otel_active_portal_is_declaring_cursor(void)
+{
+	return otel_declaring_cursor_name != NULL &&
+		ActivePortal != NULL &&
+		ActivePortal->name != NULL &&
+		strcmp(ActivePortal->name, otel_declaring_cursor_name) == 0;
+}
+
+/* Per-backend scratch context for building attribute values (e.g. plan
+ * shape digests) that are copied into the span the moment they're set;
+ * it need not outlive the setter call, so it is just reset per use. */
+static MemoryContext stmt_attr_cxt = NULL;
 
 /* Hook chains */
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 static void otel_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void otel_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
+							  uint64 count);
 static void otel_ExecutorEnd(QueryDesc *queryDesc);
 static void otel_ProcessUtility(PlannedStmt *pstmt,
 								const char *queryString,
@@ -118,18 +161,16 @@ static void otel_pgtracing_subxact_callback(SubXactEvent event,
 											SubTransactionId parentSubid,
 											void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
-static OtelSamplerDecision decide_whether_to_record(const char *name_hint);
-static void start_span(QueryDesc *queryDesc);
-static void start_utility_span(PlannedStmt *pstmt, const char *queryString);
-static void finalize_span(OtelSpanStatus status);
-static void generate_span_id(char out[OTEL_SPAN_ID_LEN + 1]);
-static void bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst);
-static void span_add_attr(const char *key, const char *value);
-static void capture_event_core(OtelErrorCapture *ec, ErrorData *edata);
-static void capture_event_extended(OtelErrorCapture *ec, ErrorData *edata);
-/* otel_emit_span_as_log_line: the JSON log-line fallback emitter
- * lives in contrib/otel; this module reaches it via the producer
- * dispatch when otel.emit_spans_to_log is on. */
+static void push_stmt_span(const void *key, OtelSpanRef ref, bool detached);
+static OtelSpanRef pop_stmt_span(const void *key);
+static bool peek_cursor_span(const void *key, OtelSpanRef *ref);
+static void maybe_apply_sqlcommenter(const char *sql);
+static void maybe_reset_comment_context(void);
+static void publish_leader_context(OtelSpanRef s);
+static void restore_leader_context(void);
+static OtelSpanRef start_stmt_span(const char *name, const char *query_text,
+								   uint64 query_id, bool detached);
+static void finalize_stmt_span(OtelSpanRef s);
 
 
 /*
@@ -141,10 +182,12 @@ otel_trace_install_hooks(void)
 {
 	prev_ExecutorStart_hook = ExecutorStart_hook;
 	ExecutorStart_hook = otel_ExecutorStart;
+	prev_ExecutorRun_hook = ExecutorRun_hook;
+	ExecutorRun_hook = otel_ExecutorRun;
 	prev_ExecutorEnd_hook = ExecutorEnd_hook;
 	ExecutorEnd_hook = otel_ExecutorEnd;
 
-	/* Utility-statement spans (step 4). */
+	/* Utility-statement spans. */
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = otel_ProcessUtility;
 
@@ -159,448 +202,326 @@ otel_trace_install_hooks(void)
 	on_proc_exit(otel_proc_exit_cb, (Datum) 0);
 }
 
-
 /*
- * Generate a fresh 8-byte span id and write it lowercase-hex into out.
- * pg_strong_random is overkill for span IDs but it is the available
- * cryptographic-quality randomness primitive and the per-span cost
- * is irrelevant.
+ * Push a bookkeeping entry.  If the (fixed-size) stack is full, end the
+ * span immediately rather than leak the handle -- this is only meant
+ * to bound pathological recursion depth, not a normal path.
  */
 static void
-generate_span_id(char out[OTEL_SPAN_ID_LEN + 1])
+push_stmt_span(const void *key, OtelSpanRef ref, bool detached)
 {
-	unsigned char buf[OTEL_SPAN_ID_LEN / 2];	/* 8 bytes = 16 hex chars */
-
-	if (!pg_strong_random(buf, sizeof(buf)))
-	{
-		/* Falling back to less-random is acceptable; span IDs only
-		 * need to be unique within a trace, not unguessable.  Use
-		 * the time + pid as a fallback. */
-		uint64		fallback = (uint64) MyProcPid ^ (uint64) GetCurrentTimestamp();
-
-		memcpy(buf, &fallback, sizeof(buf));
-	}
-	bytes_to_lower_hex(buf, sizeof(buf), out);
-}
-
-static void
-bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst)
-{
-	static const char hex[] = "0123456789abcdef";
-	size_t		i;
-
-	for (i = 0; i < n; i++)
-	{
-		dst[i * 2]     = hex[(src[i] >> 4) & 0xf];
-		dst[i * 2 + 1] = hex[src[i] & 0xf];
-	}
-	dst[n * 2] = '\0';
-}
-
-/*
- * Add an attribute to the current span.  Uses inline storage when
- * available; overflows into span_cxt when not.  Best-effort: on
- * allocation failure for overflow, the attribute is silently
- * dropped --- the span still emits with what got captured.
- *
- * key and value MUST remain valid for the lifetime of the span.
- * For borrowed pointers into long-lived backend state (db.system
- * literals, queryDesc->sourceText while the portal is alive, GUC
- * values, etc.) this is fine; for transient strings the caller
- * must arrange a copy itself.
- */
-static void
-span_add_attr(const char *key, const char *value)
-{
-	if (!span_active || value == NULL)
+	if (ref.v == 0)
 		return;
 
-	if (span_storage.n_attrs < OTEL_INLINE_ATTRS)
+	if (stmt_stack_depth >= OTEL_STMT_STACK_MAX)
 	{
-		span_storage.attrs[span_storage.n_attrs].key = key;
-		span_storage.attrs[span_storage.n_attrs].value = value;
-		span_storage.n_attrs++;
+		otel_span_end(ref);
 		return;
 	}
 
-	/* Overflow path - allocate inside span_cxt.  Best-effort: on
-	 * allocation failure, silently drop. */
-	PG_TRY();
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
-		int			newcnt = span_storage.n_overflow_attrs + 1;
-		OtelKeyValue *newarr;
-
-		if (span_storage.overflow_attrs == NULL)
-			newarr = palloc(sizeof(OtelKeyValue) * newcnt);
-		else
-			newarr = repalloc(span_storage.overflow_attrs,
-							  sizeof(OtelKeyValue) * newcnt);
-		newarr[newcnt - 1].key = key;
-		newarr[newcnt - 1].value = value;
-		span_storage.overflow_attrs = newarr;
-		span_storage.n_overflow_attrs = newcnt;
-		MemoryContextSwitchTo(oldcxt);
-	}
-	PG_CATCH();
-	{
-		FlushErrorState();
-	}
-	PG_END_TRY();
+	stmt_stack[stmt_stack_depth].key = key;
+	stmt_stack[stmt_stack_depth].ref = ref;
+	stmt_stack[stmt_stack_depth].subxact_level = GetCurrentTransactionNestLevel();
+	stmt_stack[stmt_stack_depth].detached = detached;
+	stmt_stack_depth++;
 }
 
-/* Phase 3: update_current_span_id_guc and restore_current_span_id_guc
- * are gone.  Their replacement is the per-backend shared-memory slot
- * in otel_parallel.c: start_span calls
- * otel_api->parallel_publish_leader_context, finalize_span calls
- * otel_api->parallel_clear_leader_context. */
+/*
+ * Find and remove the bookkeeping entry for key (searching from the
+ * top, like otel_fdw.c's stack, since ends are expected LIFO but the
+ * search is robust to the rare exception).  Returns OTEL_SPAN_NONE if
+ * not found (e.g. the entry was already dropped by an abort).
+ */
+static OtelSpanRef
+pop_stmt_span(const void *key)
+{
+	int			i;
+
+	for (i = stmt_stack_depth - 1; i >= 0; i--)
+	{
+		if (stmt_stack[i].key == key)
+		{
+			OtelSpanRef ref = stmt_stack[i].ref;
+
+			for (; i < stmt_stack_depth - 1; i++)
+				stmt_stack[i] = stmt_stack[i + 1];
+			stmt_stack_depth--;
+			return ref;
+		}
+	}
+	return OTEL_SPAN_NONE;
+}
 
 /*
- * Initialize span_storage for a new span and populate attributes.
- *
- * Caller should have already confirmed that a span SHOULD be
- * started (early-bail gates passed).  Sets span_active = true on
- * success; on any internal failure, leaves it unset and span_storage
- * in a clean state.
+ * Non-destructive lookup for otel_ExecutorRun(): true and *ref set if
+ * key names a .detached (cursor) entry still on the bookkeeping stack;
+ * false (an ordinary statement, or no entry at all -- e.g. a FETCH's
+ * ExecutorRun when nothing is recording) otherwise.  Does not touch
+ * the entry; it is removed later, at the matching ExecutorEnd.
+ */
+static bool
+peek_cursor_span(const void *key, OtelSpanRef *ref)
+{
+	for (int i = stmt_stack_depth - 1; i >= 0; i--)
+	{
+		if (stmt_stack[i].key == key)
+		{
+			if (!stmt_stack[i].detached)
+				return false;
+			*ref = stmt_stack[i].ref;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * sqlcommenter: try to pick up a traceparent embedded in the SQL text
+ * as a comment, but only when no root context is already set (a client-
+ * supplied 'M' header or otel.traceparent GUC wins).  No-op when
+ * otel_api is absent.
  */
 static void
-start_span(QueryDesc *queryDesc)
+maybe_apply_sqlcommenter(const char *sql)
 {
-	const char *parent;
+	const OtelInternalApi *api = otel_internal_api();
+	OtelRootContext rc;
 
-	Assert(!span_active);
+	if (api == NULL || sql == NULL)
+		return;
 
-	if (span_cxt == NULL)
-	{
-		/* Lazy: create the per-backend context on first use. */
-		span_cxt = AllocSetContextCreate(TopMemoryContext,
-										 "otel_span_cxt",
-										 ALLOCSET_SMALL_SIZES);
-	}
+	api->get_root_context(&rc);
+	if (!rc.is_set)
+		(void) api->try_apply_sqlcommenter_context(sql);
+}
+
+/*
+ * A sqlcommenter-derived root context applies to one statement only;
+ * reset it once that statement's span has ended so it doesn't bleed
+ * into the next.  ('M' / GUC-supplied contexts are unaffected: reset
+ * is a no-op for those.)
+ */
+static void
+maybe_reset_comment_context(void)
+{
+	const OtelInternalApi *api = otel_internal_api();
+	OtelRootContext rc;
+
+	if (api == NULL)
+		return;
+
+	api->get_root_context(&rc);
+	if (rc.from_comment)
+		api->reset_root_context();
+}
+
+/*
+ * Publish this span's context for any parallel workers this backend
+ * spawns while it is the innermost active span.  Cleared at finalize.
+ */
+static void
+publish_leader_context(OtelSpanRef s)
+{
+	const OtelInternalApi *api = otel_internal_api();
+	OtelSpanContext ctx;
+
+	if (api == NULL || s.v == 0)
+		return;
+
+	if (otel_span_context_of(s, &ctx))
+		api->parallel_publish_leader_context(&ctx);
+}
+
+/*
+ * After a statement span ends, publish the enclosing statement span (if
+ * any) again, so parallel workers launched by an outer statement after a
+ * nested one has finished still find their parent.
+ */
+static void
+restore_leader_context(void)
+{
+	const OtelInternalApi *api = otel_internal_api();
+
+	if (api == NULL)
+		return;
+	if (stmt_stack_depth > 0)
+		publish_leader_context(stmt_stack[stmt_stack_depth - 1].ref);
 	else
-	{
-		MemoryContextReset(span_cxt);
-	}
+		api->parallel_clear_leader_context();
+}
 
-	memset(&span_storage, 0, sizeof(span_storage));
-	span_storage.scope = otel_pg_tracer;
+/*
+ * start_stmt_span --- start a statement-level span, or return
+ * OTEL_SPAN_NONE if nothing should be recorded.
+ *
+ * otel_span_start() does its own sampling (at start) and its own
+ * parent resolution (active stack, else parallel-leader context in a
+ * worker, else the backend's root context).  The only gate this file
+ * still applies is trace_all_queries semantics: don't even ask to
+ * start a span when there is no trace context to join and
+ * otel.trace_all_queries is off, since otherwise otel_span_start()
+ * would begin a brand-new (unwanted) root trace.
+ */
+static OtelSpanRef
+start_stmt_span(const char *name, const char *query_text, uint64 query_id,
+				bool detached)
+{
+	OtelSpanContext ctx;
+	bool		have_ctx;
+	OtelSpanRef s;
 
-	/* Snapshot the root context (client-supplied via 'M' header or
-	 * SET otel.traceparent or sqlcommenter parse). */
-	{
-		OtelRootContextSnapshot rc;
-		otel_api->get_root_context_snapshot(&rc);
-
-		/* Identity from propagated trace context if available; otherwise
-		 * synthesize parentless (only happens when trace_all_queries is on).
-		 *
-		 * Parent-span selection:
-		 *	 1. If we're a parallel worker AND our leader has a published
-		 *	    SpanContext, use the leader's span_id as parent.  This
-		 *	    overrides any client-propagated parent because the leader's
-		 *	    current span is closer to us in the trace hierarchy.
-		 *	 2. Otherwise, fall back to the client-propagated parent in
-		 *	    the root context.
-		 */
-		if (rc.is_set)
-		{
-			OtelParallelContext leader_ctx;
-
-			memcpy(span_storage.trace_id, rc.trace_id, sizeof(span_storage.trace_id));
-			memcpy(span_storage.trace_flags, rc.trace_flags, sizeof(span_storage.trace_flags));
-			if (otel_api->parallel_get_leader_context(&leader_ctx))
-				parent = leader_ctx.parent_span_id;
-			else
-				parent = rc.span_id;
-			strlcpy(span_storage.parent_span_id, parent,
-					sizeof(span_storage.parent_span_id));
-		}
-		else
-		{
-			/* trace_all_queries path: synthesize a trace id too. */
-			unsigned char buf[16];
-
-			if (!pg_strong_random(buf, sizeof(buf)))
-				memset(buf, 0xa5, sizeof(buf));
-			bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
-			strcpy(span_storage.trace_flags, "00");
-			span_storage.parent_span_id[0] = '\0';
-		}
-
-		generate_span_id(span_storage.span_id);
-
-		span_storage.tracestate = rc.tracestate;
-	}
-
-	span_storage.name = GetCommandTagName(queryDesc->operation == CMD_UNKNOWN
-										  ? CMDTAG_UNKNOWN
-										  : (CommandTag) queryDesc->operation);
-	/* Note: queryDesc->operation is a CmdType, not a CommandTag enum;
-	 * use a small mapping switch instead.  Fixing below via portal-state
-	 * inspection would be cleaner; for the POC just use a generic name. */
-	span_storage.name = "pgsql.execute";
-	span_storage.kind = OTEL_SPAN_KIND_SERVER;
-	span_storage.status = OTEL_STATUS_UNSET;
-	span_storage.start_time = GetCurrentTimestamp();
+	have_ctx = otel_span_context_of(OTEL_SPAN_NONE, &ctx);
+	if (!have_ctx && !otel_trace_all_queries)
+		return OTEL_SPAN_NONE;
 
 	/*
-	 * TODO: provide a clear, queryable way to distinguish HOOK-based spans
-	 * (this file: ExecutorStart/End -> "pgsql.execute", ProcessUtility ->
-	 * command-tag/"pgsql.utility") from INTERCEPTED-tracepoint spans
-	 * (otel_sdt_bridge.c: pg.query/parse/rewrite/plan/execute/sort/smgr/txn).
-	 * Today the only discriminator is the span-name convention, which is
-	 * fragile and inconsistent:
-	 *   - "pgsql.*" is meant to mean hook-based, but ProcessUtility spans are
-	 *     named by raw command tag ("SET", "BEGIN", "CREATE TABLE AS", ...),
-	 *     so they carry no "pgsql." prefix at all;
-	 *   - the InstrumentationScope is supposed to separate them (otel_pg_tracer
-	 *     here vs sdt_scope in the bridge) but the Rust exporter collapses every
-	 *     span's ScopeName to the crate name ("postgres_otel_tracing_demo"), so
-	 *     scope is useless for filtering downstream (verified in ClickHouse).
-	 * Proposed fix: set an explicit span attribute on every span at creation,
-	 * e.g. pg.otel.span_source = "executor_hook" | "process_utility_hook" |
-	 * "sdt_probe", in BOTH producers; and/or fix the exporter so distinct
-	 * InstrumentationScope names survive export, then document the
-	 * scope->producer mapping. See the companion TODO in otel_sdt_bridge.c.
+	 * The outermost statement span is the server span for the client's
+	 * request: its parent is the client's context (or none), not
+	 * whatever SDT bridge span is open.  Nested statements, and parallel
+	 * workers, take the active parent.
 	 */
-
-	/* Flip the active flag BEFORE populating attributes --- the
-	 * attribute helpers check span_active and would silently no-op
-	 * otherwise. */
-	span_active = true;
-	span_originator = SPAN_ORIGIN_EXECUTOR;
-
-	/* Attributes --- borrowed pointers into long-lived state. */
-	span_add_attr("db.system", "postgresql");
-
-	if (MyDatabaseId != InvalidOid)
+	if (stmt_stack_depth == 0 && !IsParallelWorker())
 	{
-		const char *dbname = get_database_name(MyDatabaseId);
+		const OtelInternalApi *iapi = otel_internal_api();
+		OtelRootContext rc = {0};
 
-		if (dbname)
-			span_add_attr("db.name", dbname);
+		if (iapi)
+			iapi->get_root_context(&rc);
+		s = otel_span_start(.tracer = &otel_pg_tracer,
+							.name = name,
+							.kind = OTEL_SPAN_KIND_SERVER,
+							.parent = rc.is_set ? OTEL_PARENT_CONTEXT : OTEL_PARENT_ROOT,
+							.parent_ctx = rc.is_set ? &rc.ctx : NULL,
+							.detached = detached,
+							.force_sample = otel_trace_all_queries);
 	}
+	else
+		s = otel_span_start(.tracer = &otel_pg_tracer,
+							.name = name,
+							.kind = OTEL_SPAN_KIND_SERVER,
+							.detached = detached,
+							.force_sample = otel_trace_all_queries);
+	if (s.v == 0)
+		return s;
 
-	if (queryDesc->sourceText)
-		span_add_attr("db.statement", queryDesc->sourceText);
+	otel_span_set_str(s, OTEL_SC_DB_SYSTEM_NAME, OTEL_SC_DB_SYSTEM_POSTGRESQL);
+
+	/*
+	 * Never get_database_name(): it reads the catalog and allocates, and
+	 * this span may be starting outside a valid transaction state (e.g.
+	 * the ROLLBACK/ROLLBACK TO SAVEPOINT that recovers from an error --
+	 * get_database_name() asserts IsTransactionState() and would crash a
+	 * cassert backend there). MyProcPort->database_name is the name the
+	 * client connected with, already verified against pg_database by
+	 * InitPostgres, and costs nothing to read. A backend with no Port
+	 * (e.g. a background worker) has no catalog-free source for the
+	 * name; the attribute is just omitted for it. See the proposed core
+	 * MyDatabaseName global in docs/plans/future-core-improvements.md.
+	 */
+	if (MyProcPort && MyProcPort->database_name)
+		otel_span_set_str(s, OTEL_SC_DB_NAMESPACE, MyProcPort->database_name);
+
+	if (OidIsValid(MyDatabaseId))
+		otel_span_set_int(s, OTEL_PG_DATABASE_OID, (int64) MyDatabaseId);
+
+	if (query_text)
+		OTEL_SPAN_SET_STR_IF_RECORDING(s, OTEL_SC_DB_QUERY_TEXT, query_text);
 
 	if (MyProcPort && MyProcPort->user_name)
-		span_add_attr("db.user", MyProcPort->user_name);
+		otel_span_set_str(s, OTEL_PG_SESSION_USER, MyProcPort->user_name);
 
 	if (MyProcPort && MyProcPort->remote_host)
-		span_add_attr("net.peer.addr", MyProcPort->remote_host);
+		otel_span_set_str(s, OTEL_SC_CLIENT_ADDRESS, MyProcPort->remote_host);
 
 	if (application_name && application_name[0])
-		span_add_attr("application_name", application_name);
+		otel_span_set_str(s, OTEL_PG_APPLICATION_NAME, application_name);
 
-	if (queryDesc->plannedstmt->queryId != INT64CONST(0))
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
-		char	   *qid_str = psprintf(INT64_FORMAT, queryDesc->plannedstmt->queryId);
+	if (query_id != UINT64CONST(0))
+		otel_span_set_int(s, OTEL_PG_QUERY_ID, (int64) query_id);
 
-		MemoryContextSwitchTo(oldcxt);
-		span_add_attr("db.postgresql.query_id", qid_str);
-	}
-
-	/* Update the GUC for parallel-worker propagation. */
-	/* Phase 3: publish our span's identity to the per-backend
-	 * shared-memory slot so any parallel workers we spawn during
-	 * this span will pick us up as parent.  Supersedes the
-	 * otel.current_span_id GUC. */
-	otel_api->parallel_publish_leader_context(span_storage.trace_id,
-										 span_storage.span_id,
-										 span_storage.trace_flags);
-
-	/* Phase 2 migration: opt this span into emit-as-ERROR on
-	 * ereport unwind, then push it onto the producer-side active
-	 * stack.  Aborted statements now appear in traces with
-	 * status = ERROR + descriptive reason rather than being
-	 * silently dropped, and external producer-API consumers can
-	 * read this span as their parent via api->span_current_context. */
-	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
-	otel_api->span_push(&span_storage);
+	publish_leader_context(s);
 
 #ifdef PG_HAVE_SDT_PROBE_HOOK
 	/*
-	 * Bidirectionally link this statement span to the enclosing pg.txn span
-	 * (emitted by the SDT bridge in its own trace).  Unlike the bridge's
-	 * pg.query linking, this fires even with no propagated traceparent, so
-	 * statements run by clients that don't inject trace context (e.g.
-	 * cnp_metrics_exporter) are still associated with their transaction.
+	 * Bidirectionally link this statement span to the enclosing pg.txn
+	 * span (emitted by the SDT bridge in its own trace).  Unlike the
+	 * bridge's pg.query linking, this fires even with no propagated
+	 * traceparent, so statements run by clients that don't inject
+	 * trace context are still associated with their transaction.
 	 */
 	{
 		OtelSpanContext txn_ctx;
 
 		if (otel_sdt_get_txn_context(&txn_ctx))
 		{
-			otel_span_add_link(&span_storage, txn_ctx.trace_id,
-							   txn_ctx.span_id, txn_ctx.trace_flags);
-			otel_sdt_link_stmt_to_txn(span_storage.trace_id,
-									  span_storage.span_id,
-									  span_storage.trace_flags);
+			OtelSpanContext my_ctx;
+
+			otel_span_add_link(s, &txn_ctx);
+			if (otel_span_context_of(s, &my_ctx))
+				otel_sdt_link_stmt_to_txn(&my_ctx);
 		}
 	}
 #endif							/* PG_HAVE_SDT_PROBE_HOOK */
+
+	return s;
 }
 
 static void
-finalize_span(OtelSpanStatus status)
+finalize_stmt_span(OtelSpanRef s)
 {
-	if (!span_active)
+	if (s.v == 0)
 		return;
 
-	span_storage.end_time = GetCurrentTimestamp();
-
-	/* If status was already set to ERROR by an event capture, keep
-	 * it; otherwise apply the caller-supplied status. */
-	if (span_storage.status == OTEL_STATUS_UNSET)
-		span_storage.status = status;
-
-	/* Phase 2 migration: emit through the producer-side dispatch
-	 * which pops the stack and calls the registered exporter hook
-	 * + the JSON-log fallback.  Equivalent to the inline dispatch
-	 * this code used to do, but goes through the same path
-	 * external consumers use. */
-	otel_api->span_emit(&span_storage);
-
-	span_active = false;
-	span_originator = SPAN_ORIGIN_NONE;
-	/* Phase 3: clear our published context so any workers spawned
-	 * AFTER this span ends (in a future query) don't read a stale
-	 * value. */
-	otel_api->parallel_clear_leader_context();
-
-	/*
-	 * Statement-scoped scrub for comment-derived context: a
-	 * sqlcommenter traceparent applies to ONE statement and must
-	 * not bleed into the next.  Reset root context now.  ('M' /
-	 * GUC paths are not affected; reset is a no-op for those.)
-	 */
-	{
-		OtelRootContextSnapshot rc;
-		otel_api->get_root_context_snapshot(&rc);
-		if (rc.from_comment)
-			otel_api->reset_root_context();
-	}
+	otel_span_end(s);
+	restore_leader_context();
+	maybe_reset_comment_context();
 }
 
 /*
- * decide_whether_to_record --- the consolidated sampling decision.
- *
- * Returns OTEL_SAMPLE_DROP to skip span creation entirely (the
- * caller MUST NOT allocate after seeing DROP).  Returns
- * RECORD_AND_SAMPLE for the upstream-positively-sampled and
- * trace_all_queries paths.  Returns RECORD_ONLY or
- * RECORD_AND_SAMPLE per the sampler hook for paths where the
- * registered policy delegates to it.
- *
- * Decision order, expressed as gates:
- *
- *	  1. No provider (otel_api absent) -> DROP (silent no-op).
- *	  2. No consumer (no exporter hook AND log emission disabled)
- *		 -> DROP.  Backends not actively tracing pay only the two
- *		 pointer/bool reads at this gate.
- *	  3. otel.trace_all_queries -> RECORD_AND_SAMPLE.  Always-on
- *		 mode bypasses propagated state.
- *	  4. No propagated context (otel_ctx.is_set == false) -> DROP.
- *	  5-7. Policy-dependent.  See OtelSamplerHookPolicy in otel.h
- *		 for the four regimes; the dispatch below applies them.
- *
- * Per W3C TraceContext Level 1 §3.2.2.1 the unset sampled bit is
- * advisory and not a binding directive against recording; OTel SDK
- * convention is stricter.  Our default policy adopts the OTel
- * convention; exporters can override via api->set_sampler_policy.
- */
-static OtelSamplerDecision
-decide_whether_to_record(const char *name_hint)
-{
-	const OtelTracingApi *api;
-	OtelRootContextSnapshot rc;
-
-	/* Gate 1: no provider */
-	api = otel_pg_ensure();
-	if (api == NULL)
-		return OTEL_SAMPLE_DROP;
-
-	/* Gate 2: no consumer */
-	if (!api->any_emit_consumer_present())
-		return OTEL_SAMPLE_DROP;
-
-	/* Gate 3: force-on overrides propagation entirely */
-	if (otel_trace_all_queries)
-		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-
-	/* Gate 4: no propagated context */
-	api->get_root_context_snapshot(&rc);
-	if (!rc.is_set)
-		return OTEL_SAMPLE_DROP;
-
-	/* Gates 5-7: policy-driven dispatch handled inside the api. */
-	{
-		OtelSamplerInput in;
-
-		in.trace_id = rc.trace_id;
-		in.parent_span_id = rc.span_id;
-		in.trace_flags = rc.trace_flags;
-		in.tracestate = rc.tracestate;
-		in.name = name_hint;
-		in.kind = OTEL_SPAN_KIND_SERVER;
-
-		return api->compute_sampler_decision(&in, rc.sampled_flag_set);
-	}
-}
-
-/*
- * ExecutorStart hook.  Gated by the early-bail checks; only starts
- * a span when there's actually a consumer AND something to record.
+ * ExecutorStart hook.
  */
 static void
 otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	OtelSamplerDecision decision;
-	const OtelTracingApi *api;
+	OtelSpanRef s;
+	bool		is_cursor = otel_active_portal_is_declaring_cursor();
+
+	if (queryDesc != NULL)
+		maybe_apply_sqlcommenter(queryDesc->sourceText);
 
 	/*
-	 * If no in-memory context yet (no 'M' header, no SET) AND
-	 * sqlcommenter parsing is enabled (checked inside the api),
-	 * try the SQL text.  No-op when sqlcommenter is disabled or
-	 * the provider is absent.
+	 * The command-tag-derived name is superseded below by a fixed
+	 * "pgsql.execute" (see the historical TODO on span naming in
+	 * otel_postgres_tracing's design notes: a clear HOOK-based vs.
+	 * INTERCEPTED-tracepoint span-source discriminator is still owed;
+	 * OTEL_PG_SPAN_SOURCE is available for that once adopted here).
+	 *
+	 * A cursor's span (ActivePortal matching otel_declaring_cursor_name,
+	 * set by otel_ProcessUtility for DECLARE CURSOR -- not just "are we
+	 * somewhere inside its ProcessUtility call", which would also wrongly
+	 * match a nested statement run while planning the cursor's query) is
+	 * .detached: it must
+	 * outlive this call, staying open across every FETCH up to CLOSE,
+	 * so it cannot sit on otel_api's active stack the way an ordinary
+	 * statement span does.  otel_ExecutorRun() activates it only for
+	 * the duration of each FETCH's run.
 	 */
-	api = otel_pg_ensure();
-	if (api != NULL)
-	{
-		OtelRootContextSnapshot rc_pre;
-		api->get_root_context_snapshot(&rc_pre);
-		if (!rc_pre.is_set && queryDesc != NULL)
-			(void) api->try_apply_sqlcommenter_context(queryDesc->sourceText);
-	}
+	s = start_stmt_span("pgsql.execute",
+						queryDesc ? queryDesc->sourceText : NULL,
+						queryDesc && queryDesc->plannedstmt
+						? (uint64) queryDesc->plannedstmt->queryId : 0,
+						is_cursor);
 
-	decision = decide_whether_to_record("pgsql.execute");
-
-	/* Defensive: never overlap. */
-	if (decision != OTEL_SAMPLE_DROP && !span_active)
-	{
-		PG_TRY();
-		{
-			start_span(queryDesc);
-			span_storage.sampler_decision = decision;
-		}
-		PG_CATCH();
-		{
-			FlushErrorState();
-			span_active = false;
-		}
-		PG_END_TRY();
-	}
+	if (queryDesc != NULL)
+		push_stmt_span(queryDesc, s, is_cursor);
 
 	/*
-	 * Step 2: if any group-A feature is enabled, turn on per-node
-	 * Instrumentation for this query so collectors can read timing/row counts
-	 * at ExecutorEnd.  Must happen BEFORE standard_ExecutorStart so the
-	 * executor allocates Instrumentation nodes; mirrors auto_explain.c's
-	 * explain_ExecutorStart pattern exactly.
+	 * If any group-A feature is enabled, turn on per-node Instrumentation
+	 * for this query so collectors can read timing/row counts at
+	 * ExecutorEnd.  Must happen BEFORE standard_ExecutorStart so the
+	 * executor allocates Instrumentation nodes.
 	 */
-	if (span_active && otel_planwalk_want_instrumentation())
+	if (otel_span_recording(s) && otel_planwalk_want_instrumentation())
 		queryDesc->instrument_options |= INSTRUMENT_TIMER | INSTRUMENT_ROWS |
 			INSTRUMENT_BUFFERS | INSTRUMENT_WAL;
 
@@ -611,209 +532,90 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		standard_ExecutorStart(queryDesc, eflags);
 
 	/*
-	 * Drive the planstate-walker dispatcher now that the planstate tree exists.
-	 * Gated on span_active so unsampled queries skip the walk entirely.
-	 * On PG19+, the FDW collector is not registered (it uses core hooks
-	 * instead), so this dispatcher end-walk is a cheap no-op for FDW-less
-	 * queries on PG19+.  On PG18, the FDW collector registered here handles
-	 * pg.fdw.scan spans.  See otel_planwalk.c and otel_fdw.c.
+	 * Drive the planstate-walker dispatcher now that the planstate tree
+	 * exists.  Gated on the span recording so unsampled queries skip the
+	 * walk entirely.
 	 */
-	if (span_active)
+	if (otel_span_recording(s))
 	{
-		otel_planwalk_executor_start(queryDesc, &span_storage, span_cxt);
+		if (stmt_attr_cxt == NULL)
+			stmt_attr_cxt = AllocSetContextCreate(TopMemoryContext,
+												  "otel_stmt_attr_cxt",
+												  ALLOCSET_SMALL_SIZES);
+		else
+			MemoryContextReset(stmt_attr_cxt);
 
-		/*
-		 * Plan-shape capture (proposal 4): a separate Plan-tree walk that
-		 * stamps the statement span with a shape digest + structural-risk
-		 * flags.  Self-gates on otel.trace_plan_shape.  Runs at start so it is
-		 * captured even for queries that error during execution.
-		 */
-		otel_planshape_executor_start(queryDesc, &span_storage, span_cxt);
+		otel_planwalk_executor_start(queryDesc, s, stmt_attr_cxt);
+		otel_planshape_executor_start(queryDesc, s, stmt_attr_cxt);
 	}
+}
+
+/*
+ * ExecutorRun hook.  For an ordinary statement, its own executor span
+ * is already current (pushed, non-.detached, by otel_ExecutorStart), so
+ * there is nothing to do here.  For a cursor's portal -- its span is
+ * .detached, so it is NOT on the active stack between DECLARE and
+ * CLOSE -- activate it for just this one FETCH's run, so work done
+ * while materialising rows (e.g. a volatile function called from the
+ * target list) parents to the cursor span instead of whatever
+ * unrelated span happens to be current (e.g. the "FETCH" utility
+ * span, or nothing).  Deactivated in PG_FINALLY so a FETCH that
+ * errors still leaves the active stack clean.
+ */
+static void
+otel_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	OtelSpanRef cursor_span = OTEL_SPAN_NONE;
+	OtelActivation act = OTEL_ACTIVATION_NONE;
+	bool		is_cursor;
+
+	is_cursor = queryDesc != NULL && peek_cursor_span(queryDesc, &cursor_span);
+	if (is_cursor)
+		act = otel_span_activate(cursor_span);
+
+	PG_TRY();
+	{
+		if (prev_ExecutorRun_hook)
+			prev_ExecutorRun_hook(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		if (is_cursor)
+			otel_span_deactivate(act);
+	}
+	PG_END_TRY();
 }
 
 static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
+	OtelSpanRef s = pop_stmt_span(queryDesc);
+
 	/*
-	 * Drive the planstate-walker end-walk before standard_ExecutorEnd frees
-	 * the planstate nodes, and before finalize_span emits the parent
-	 * pgsql.execute span (child spans must be emitted first to avoid
-	 * out-of-order-emit warnings from the producer).
-	 *
-	 * On PG18, this runs the FDW collector which emits pg.fdw.scan spans.
-	 * On PG19+, no FDW collector is registered (core ForeignScanEnd hooks
-	 * do that work during standard_ExecutorEnd below), so this is a cheap
-	 * no-op when no other collector is enabled.
+	 * Drive the planstate-walker end-walk before standard_ExecutorEnd
+	 * frees the planstate nodes, and before the span is ended (child
+	 * spans must be emitted first).
 	 */
-	otel_planwalk_executor_end(queryDesc, &span_storage, span_cxt);
+	otel_planwalk_executor_end(queryDesc, s, stmt_attr_cxt);
 
 	if (prev_ExecutorEnd_hook)
 		prev_ExecutorEnd_hook(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
 
-	/* Only finalize if this hook started the active span.  If a
-	 * utility command started the span (CTAS, etc.) and the
-	 * executor is running underneath it, the utility's hook owns
-	 * the span lifecycle and the executor's End should be a no-op
-	 * for the span. */
-	if (span_originator == SPAN_ORIGIN_EXECUTOR)
-		finalize_span(OTEL_STATUS_UNSET);
-}
-
-/*
- * start_utility_span --- populate span_storage for a utility command.
- *
- * Identity / parent-link mechanics are the same as start_span(), but
- * the name is the command tag of the utility statement and we record
- * span_originator = SPAN_ORIGIN_UTILITY so otel_ExecutorEnd knows not
- * to finalize this span when it later runs (e.g. for CTAS's
- * underlying SELECT).
- */
-static void
-start_utility_span(PlannedStmt *pstmt, const char *queryString)
-{
-	const char *parent;
-
-	Assert(!span_active);
-
-	if (span_cxt == NULL)
-		span_cxt = AllocSetContextCreate(TopMemoryContext,
-										 "otel_span_cxt",
-										 ALLOCSET_SMALL_SIZES);
-	else
-		MemoryContextReset(span_cxt);
-
-	memset(&span_storage, 0, sizeof(span_storage));
-	span_storage.scope = otel_pg_tracer;
-
-	{
-		OtelRootContextSnapshot rc;
-		otel_api->get_root_context_snapshot(&rc);
-
-		if (rc.is_set)
-		{
-			OtelParallelContext leader_ctx;
-
-			memcpy(span_storage.trace_id, rc.trace_id, sizeof(span_storage.trace_id));
-			memcpy(span_storage.trace_flags, rc.trace_flags, sizeof(span_storage.trace_flags));
-			if (otel_api->parallel_get_leader_context(&leader_ctx))
-				parent = leader_ctx.parent_span_id;
-			else
-				parent = rc.span_id;
-			strlcpy(span_storage.parent_span_id, parent,
-					sizeof(span_storage.parent_span_id));
-		}
-		else
-		{
-			unsigned char buf[16];
-
-			if (!pg_strong_random(buf, sizeof(buf)))
-				memset(buf, 0xa5, sizeof(buf));
-			bytes_to_lower_hex(buf, sizeof(buf), span_storage.trace_id);
-			strcpy(span_storage.trace_flags, "00");
-			span_storage.parent_span_id[0] = '\0';
-		}
-
-		generate_span_id(span_storage.span_id);
-
-		span_storage.tracestate = rc.tracestate;
-	}
-
-	/*
-	 * TODO: fix span nesting for utility statements that internally run a
-	 * query (e.g. CREATE TABLE AS, EXPLAIN ANALYZE, DECLARE CURSOR). The SDT
-	 * QUERY_* probes for the inner query fire and grab the propagated root as
-	 * their parent BEFORE this ProcessUtility span is pushed onto the active
-	 * span stack, so the probe span (pg.execute) and this hook span end up as
-	 * overlapping SIBLINGS under the root instead of probe-nested-under-hook.
-	 * Observed: trace 30c5b7fd... -- "CREATE TABLE AS" and "pg.execute" both
-	 * parent to the injected root and span the same ~264ms range. Contrast a
-	 * plain SELECT, which nests correctly (ExecutorStart_hook pushes
-	 * pgsql.execute before the executor runs). Fix: push this utility span
-	 * onto the producer active-span stack before calling prev_ProcessUtility
-	 * (which runs the inner query / fires the probes). See the span-stack
-	 * contract in otel_api/otel_producer.c.
-	 */
-	/* Use the utility statement's command tag as the span name.
-	 * GetCommandTagName returns a pointer into rodata --- safe to
-	 * borrow without copying. */
-	span_storage.name = pstmt->utilityStmt
-		? GetCommandTagName(CreateCommandTag(pstmt->utilityStmt))
-		: "pgsql.utility";
-	span_storage.kind = OTEL_SPAN_KIND_SERVER;
-	span_storage.status = OTEL_STATUS_UNSET;
-	span_storage.start_time = GetCurrentTimestamp();
-
-	span_active = true;
-	span_originator = SPAN_ORIGIN_UTILITY;
-
-	span_add_attr("db.system", "postgresql");
-	if (MyDatabaseId != InvalidOid)
-	{
-		const char *dbname = get_database_name(MyDatabaseId);
-
-		if (dbname)
-			span_add_attr("db.name", dbname);
-	}
-	if (queryString)
-		span_add_attr("db.statement", queryString);
-	if (MyProcPort && MyProcPort->user_name)
-		span_add_attr("db.user", MyProcPort->user_name);
-	if (MyProcPort && MyProcPort->remote_host)
-		span_add_attr("net.peer.addr", MyProcPort->remote_host);
-	if (application_name && application_name[0])
-		span_add_attr("application_name", application_name);
-
-	if (pstmt->queryId != INT64CONST(0))
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
-		char	   *qid_str = psprintf(INT64_FORMAT, pstmt->queryId);
-
-		MemoryContextSwitchTo(oldcxt);
-		span_add_attr("db.postgresql.query_id", qid_str);
-	}
-
-	/* Phase 3: publish to per-backend slot for parallel workers
-	 * (see start_span() for the equivalent call). */
-	otel_api->parallel_publish_leader_context(span_storage.trace_id,
-										 span_storage.span_id,
-										 span_storage.trace_flags);
-
-	/* Phase 2 migration: see start_span() above. */
-	span_storage.unwind_policy = OTEL_UNWIND_ERROR;
-	otel_api->span_push(&span_storage);
-
-#ifdef PG_HAVE_SDT_PROBE_HOOK
-	/* Link this utility span to the enclosing pg.txn span; see start_span().
-	 * A utility span is linked when a transaction span is active as its span
-	 * starts -- which includes BEGIN, since the SDT TRANSACTION_START probe
-	 * fires before this ProcessUtility span starts.  A standalone SET/SHOW
-	 * outside any transaction has no active pg.txn and is therefore not
-	 * linked. */
-	{
-		OtelSpanContext txn_ctx;
-
-		if (otel_sdt_get_txn_context(&txn_ctx))
-		{
-			otel_span_add_link(&span_storage, txn_ctx.trace_id,
-							   txn_ctx.span_id, txn_ctx.trace_flags);
-			otel_sdt_link_stmt_to_txn(span_storage.trace_id,
-									  span_storage.span_id,
-									  span_storage.trace_flags);
-		}
-	}
-#endif							/* PG_HAVE_SDT_PROBE_HOOK */
+	finalize_stmt_span(s);
 }
 
 /*
  * ProcessUtility hook --- spans for utility commands (BEGIN, COMMIT,
  * COPY, DDL, EXPLAIN, etc.) that don't go through the executor.
  *
- * Only fires for PROCESS_UTILITY_TOPLEVEL to avoid creating spans
- * for recursive ProcessUtility invocations from inside another
- * utility statement.
+ * Only starts a span for PROCESS_UTILITY_TOPLEVEL invocations; nested
+ * ProcessUtility calls (from another utility statement) get their own
+ * span too now (they're no longer suppressed), nested under the outer
+ * one via the API's active stack.
  */
 static void
 otel_ProcessUtility(PlannedStmt *pstmt,
@@ -825,49 +627,45 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 					DestReceiver *dest,
 					QueryCompletion *qc)
 {
-	OtelSamplerDecision decision;
-	bool		started_here = false;
+	/* Unique per call (including recursive/nested invocations): the
+	 * address of this frame-local variable. */
+	char		call_token;
+	OtelSpanRef s = OTEL_SPAN_NONE;
+	DeclareCursorStmt *cstmt = (pstmt->utilityStmt &&
+								 IsA(pstmt->utilityStmt, DeclareCursorStmt))
+		? (DeclareCursorStmt *) pstmt->utilityStmt : NULL;
+	const char *save_declaring_cursor_name = otel_declaring_cursor_name;
 
-	/* Only consult the sampler for top-level commands; nested utility
-	 * invocations (e.g. from EXPLAIN, CTAS) share the outer span. */
-	if (context == PROCESS_UTILITY_TOPLEVEL && !span_active)
+	if (context == PROCESS_UTILITY_TOPLEVEL)
 	{
-		/* sqlcommenter fallback --- see equivalent block in
-		 * otel_ExecutorStart for rationale.  No-op when provider absent. */
-		{
-			const OtelTracingApi *api2 = otel_pg_ensure();
+		const char *name;
 
-			if (api2 != NULL)
-			{
-				OtelRootContextSnapshot rc_pre;
-				api2->get_root_context_snapshot(&rc_pre);
-				if (!rc_pre.is_set)
-					(void) api2->try_apply_sqlcommenter_context(queryString);
-			}
-		}
+		maybe_apply_sqlcommenter(queryString);
 
-		decision = decide_whether_to_record("pgsql.utility");
-		if (decision != OTEL_SAMPLE_DROP)
-		{
-			PG_TRY();
-			{
-				start_utility_span(pstmt, queryString);
-				span_storage.sampler_decision = decision;
-				started_here = true;
-			}
-			PG_CATCH();
-			{
-				FlushErrorState();
-				span_active = false;
-				span_originator = SPAN_ORIGIN_NONE;
-			}
-			PG_END_TRY();
-		}
+		name = pstmt->utilityStmt
+			? GetCommandTagName(CreateCommandTag(pstmt->utilityStmt))
+			: "pgsql.utility";
+
+		s = start_stmt_span(name, queryString, (uint64) pstmt->queryId, false);
+		push_stmt_span(&call_token, s, false);
 	}
 
-	/* Chain to the previous hook (or standard) and finalize on
-	 * normal return.  On error, XactCallback ABORT handles
-	 * finalization. */
+	/*
+	 * otel_ExecutorStart(), called synchronously below (from
+	 * PerformCursorOpen()'s PortalStart() for a real DECLARE CURSOR,
+	 * but also, earlier in this same call, from planning the cursor's
+	 * query -- constant-folding an IMMUTABLE function that itself runs
+	 * SQL, say -- for any nested statement that runs along the way),
+	 * checks otel_active_portal_is_declaring_cursor() to start the
+	 * cursor's own executor span .detached. Save/restore rather than
+	 * assume it was NULL: a DECLARE CURSOR whose query itself somehow
+	 * re-enters ProcessUtility (not expected, but this keeps a stray
+	 * error path from leaving it stuck) must not clobber an enclosing
+	 * one.
+	 */
+	if (cstmt != NULL)
+		otel_declaring_cursor_name = cstmt->portalname;
+
 	PG_TRY();
 	{
 		if (prev_ProcessUtility_hook)
@@ -881,20 +679,30 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	}
 	PG_CATCH();
 	{
-		/* Re-throw; abort callback will finalize the span. */
+		otel_declaring_cursor_name = save_declaring_cursor_name;
+		/* Re-throw; the span (if any) is ended, and exported with
+		 * ERROR status, by resource-owner release.  Just keep our
+		 * own bookkeeping consistent. */
+		if (context == PROCESS_UTILITY_TOPLEVEL)
+			(void) pop_stmt_span(&call_token);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	otel_declaring_cursor_name = save_declaring_cursor_name;
 
-	/* Success path: only finalize spans we own here. */
-	if (started_here && span_originator == SPAN_ORIGIN_UTILITY)
-		finalize_span(OTEL_STATUS_UNSET);
+	if (context == PROCESS_UTILITY_TOPLEVEL)
+	{
+		OtelSpanRef popped = pop_stmt_span(&call_token);
+
+		finalize_stmt_span(popped);
+	}
 }
 
 /*
- * XactCallback for the error path: if a span survived past where
- * ExecutorEnd would have fired (because the transaction aborted),
- * emit it now with ERROR status.
+ * XactCallback: keep the bookkeeping stack in sync on abort.  The
+ * spans themselves are ended, and exported with ERROR status, by
+ * otel_api's own resource-owner release, so this only needs to drop
+ * stale entries, not emit anything.
  */
 static void
 otel_pgtracing_xact_callback(XactEvent event, void *arg)
@@ -903,10 +711,7 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
-			finalize_span(OTEL_STATUS_ERROR);
-			/* FDW scan spans and curated child spans are dropped by the
-			 * otel_api MemoryContext callbacks on error unwind; reset their
-			 * tracking here. */
+			stmt_stack_depth = 0;
 			otel_fdw_reset();
 			otel_planspans_reset();
 			break;
@@ -921,9 +726,10 @@ otel_pgtracing_xact_callback(XactEvent event, void *arg)
 }
 
 /*
- * SubXactCallback --- on subtransaction abort, hand off to otel_fdw.c to
- * clean up any in-flight pg.fdw.scan spans (ExecEndForeignScan / the
- * ExecutorEnd walk do not run on subxact abort).  See otel_fdw.c.
+ * SubXactCallback --- drop bookkeeping entries pushed at or below the
+ * aborting subtransaction level; their spans are unwound by otel_api's
+ * resource-owner release.  Also hands off to otel_fdw.c / otel_planspans.c
+ * for their own tracking stacks.
  */
 static void
 otel_pgtracing_subxact_callback(SubXactEvent event,
@@ -931,144 +737,35 @@ otel_pgtracing_subxact_callback(SubXactEvent event,
 								SubTransactionId parentSubid,
 								void *arg)
 {
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		int			current_level = GetCurrentTransactionNestLevel();
+		int			new_depth = 0;
+		int			i;
+
+		for (i = 0; i < stmt_stack_depth; i++)
+		{
+			if (stmt_stack[i].subxact_level < current_level)
+			{
+				if (new_depth != i)
+					stmt_stack[new_depth] = stmt_stack[i];
+				new_depth++;
+			}
+		}
+		stmt_stack_depth = new_depth;
+	}
+
 	otel_fdw_subxact_abort(event);
 	otel_planspans_subxact_abort(event);
 }
 
 /*
- * Defensive flush on backend exit.  Span lives in static storage,
- * so this is mainly to invoke the exporter one last time if a span
- * was somehow left active.
+ * Defensive cleanup on backend exit: just drop our bookkeeping.  Any
+ * still-open spans are otel_api's problem (session-span budget /
+ * backend-exit release), not this module's.
  */
 static void
 otel_proc_exit_cb(int code, Datum arg)
 {
-	if (span_active)
-		finalize_span(OTEL_STATUS_ERROR);
-}
-
-
-/* ====================================================================
- * Event capture --- called from the emit_log_hook in otel_log.c.
- * ==================================================================== */
-
-/*
- * Populate the core of the error capture from ErrorData.  Always
- * succeeds; no allocation, no failure modes --- only scalars and
- * pointers to never-freed constants (see OtelErrorCapture).
- */
-static void
-capture_event_core(OtelErrorCapture *ec, ErrorData *edata)
-{
-	const char *sqlstate = unpack_sql_state(edata->sqlerrcode);
-
-	ec->time = GetCurrentTimestamp();
-	ec->elevel = edata->elevel;
-	/* sqlstate is 5 chars + NUL; unpack_sql_state returns a pointer
-	 * to a static buffer.  Copy by value. */
-	memcpy(ec->sqlstate, sqlstate, 6);
-	ec->filename = edata->filename;		/* points at __FILE__ literal */
-	ec->lineno = edata->lineno;
-	ec->funcname = edata->funcname;		/* points at __func__ literal */
-}
-
-/*
- * Populate the optional extended fields of the error capture.
- * Best-effort: any individual field may end up NULL if its allocation
- * fails.  Caller wraps in PG_TRY for the harder failure modes.
- */
-static void
-capture_event_extended(OtelErrorCapture *ec, ErrorData *edata)
-{
-	MemoryContext oldcxt = MemoryContextSwitchTo(span_cxt);
-
-	if (edata->message)
-		ec->message = pstrdup(edata->message);
-	if (edata->detail)
-		ec->detail = pstrdup(edata->detail);
-	if (edata->hint)
-		ec->hint = pstrdup(edata->hint);
-
-	/*
-	 * TODO: full log event capture — add the remaining ErrorData fields that
-	 * the OTel log semantic conventions expect but we currently drop:
-	 *   edata->context       (PL/pgSQL and other call-context chain)
-	 *   edata->internalquery (internal query text, e.g. SPI calls)
-	 *   edata->cursorpos / edata->internalpos  (byte offsets in those queries)
-	 *   edata->schema_name, edata->table_name, edata->column_name,
-	 *   edata->datatype_name, edata->constraint_name  (catalog-object detail)
-	 * These should be stored in event->attrs (OtelKeyValue) using the standard
-	 * OTel log attribute names (exception.stacktrace for context, db.sql.table,
-	 * etc.) and gated on a GUC (otel.log_event_detail_level or similar) so
-	 * operators can cap memory use for high-volume error workloads.
-	 * Also consider: capturing events below WARNING when a trace is active and
-	 * the user has opted in (e.g. otel.log_event_min_level = notice).
-	 */
-
-	MemoryContextSwitchTo(oldcxt);
-}
-
-/*
- * Capture an ereport as an event on the currently-active span (if any).
- * No-op when no span is active, or when elevel is below WARNING.
- *
- * Core fields (sqlstate, filename, lineno) are always captured
- * without allocation.  Extended fields (message, detail, hint) are
- * captured best-effort and skipped under OOM / FATAL+ to avoid
- * re-entering the allocator from the error-handling path.  Span
- * status is set to ERROR on ereport elevel >= ERROR.
- *
- * Exposed via otel_internal.h so otel_log.c can call it without
- * needing visibility into span_storage / span_active.
- */
-void
-otel_span_record_log_event(ErrorData *edata)
-{
-	OtelErrorCapture *ec = &span_storage.error_event;
-
-	if (!span_active || edata->elevel < WARNING)
-		return;
-
-	/*
-	 * The span carries a single producer-private error-capture slot (no
-	 * inline/overflow event array on the error path anymore --- generic
-	 * events go through span_add_event).  When more than one qualifying
-	 * ereport fires on the same span, keep the most severe (ties resolved
-	 * in favour of the latest), so the terminating ERROR always wins over
-	 * a preceding WARNING.  At emit time the producer lowers this into an
-	 * "exception" event in span->events.
-	 */
-	if (!span_storage.error_event_used ||
-		edata->elevel >= ec->elevel)
-	{
-		/* Reset so a lower-severity prior capture's best-effort strings
-		 * don't linger; they live in span_cxt and are freed on reset. */
-		memset(ec, 0, sizeof(*ec));
-		span_storage.error_event_used = true;
-
-		/* Core is always populated --- no allocation needed. */
-		capture_event_core(ec, edata);
-
-		/* Extended capture: skip entirely under OOM/FATAL+ to
-		 * avoid re-entering the allocator from the error path. */
-		if (edata->sqlerrcode != ERRCODE_OUT_OF_MEMORY &&
-			edata->elevel < FATAL)
-		{
-			PG_TRY();
-			{
-				capture_event_extended(ec, edata);
-			}
-			PG_CATCH();
-			{
-				/* Extended fields stay NULL; core is intact. */
-				FlushErrorState();
-			}
-			PG_END_TRY();
-		}
-	}
-
-	/* Span status reflects the error regardless of whether the
-	 * event itself was captured. */
-	if (edata->elevel >= ERROR)
-		span_storage.status = OTEL_STATUS_ERROR;
+	stmt_stack_depth = 0;
 }
