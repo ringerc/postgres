@@ -19,12 +19,13 @@ TAP_TESTS = 1
 REGRESS =
 ISOLATION =
 
-# <otel_api/otel.h> is provided by the otel_api extension.  In-tree we
-# look in contrib/otel_api/ via -I$(top_srcdir)/contrib; under PGXS we
-# pick it up from <pg_config --includedir-server>/extension/otel_api/.
+# <otel_api/otel.h> resolves from the otel_api SOURCE tree (this
+# module's sibling directory), not any installed copy: the P2 API
+# reshape is still in flight and an installed copy may be stale.
+# $(srcdir) is set correctly under VPATH by pgxs.mk.
 ifdef USE_PGXS
 PG_CONFIG = pg_config
-PG_CPPFLAGS = -I$(shell $(PG_CONFIG) --includedir-server)/extension
+PG_CPPFLAGS = -I$(srcdir)/..
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
