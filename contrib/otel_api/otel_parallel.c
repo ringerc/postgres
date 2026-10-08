@@ -69,9 +69,9 @@ typedef struct OtelParallelContextSlot
 {
 	slock_t		lock;
 	bool		set;
-	char		trace_id[OTEL_TRACE_ID_LEN + 1];
-	char		parent_span_id[OTEL_SPAN_ID_LEN + 1];
-	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
+	OtelTraceId trace_id;
+	OtelSpanId	span_id;		/* the workers' parent */
+	uint8		trace_flags;
 } OtelParallelContextSlot;
 
 
@@ -198,21 +198,15 @@ otel_parallel_init(void)
 
 
 /*
- * otel_parallel_publish_leader_context --- the leader calls this
- * when it starts a span, to publish its identity so parallel
- * workers spawned later in this session can attribute to it.
+ * otel_parallel_publish_leader_context --- the leader publishes the
+ * context its parallel workers' spans should use as parent.  An invalid
+ * context clears the slot.  tracestate is not published: workers get it
+ * from the otel_api.tracestate GUC, which parallel query copies.
  *
- * Caller passes the active span's trace_id / span_id / trace_flags
- * as NUL-terminated lowercase-hex strings (same representation as
- * OtelSpan and the OtelContext root state).  NULL or empty
- * trace_id is treated as "clear the slot".
- *
- * No-op if shared memory wasn't initialised (otel not preloaded).
+ * No-op if shared memory wasn't initialised (otel_api not preloaded).
  */
 void
-otel_parallel_publish_leader_context(const char *trace_id,
-									 const char *span_id,
-									 const char *trace_flags)
+otel_parallel_publish_leader_context(const OtelSpanContext *ctx)
 {
 	OtelParallelContextSlot *slot;
 
@@ -224,21 +218,13 @@ otel_parallel_publish_leader_context(const char *trace_id,
 	slot = &otel_parallel_slots[MyProcNumber];
 
 	SpinLockAcquire(&slot->lock);
-	if (trace_id == NULL || trace_id[0] == '\0' ||
-		span_id == NULL || span_id[0] == '\0')
-	{
+	if (ctx == NULL || !otel_span_context_is_valid(ctx))
 		slot->set = false;
-		slot->trace_id[0] = '\0';
-		slot->parent_span_id[0] = '\0';
-		slot->trace_flags[0] = '\0';
-	}
 	else
 	{
-		strlcpy(slot->trace_id, trace_id, sizeof(slot->trace_id));
-		strlcpy(slot->parent_span_id, span_id, sizeof(slot->parent_span_id));
-		strlcpy(slot->trace_flags,
-				(trace_flags && trace_flags[0]) ? trace_flags : "00",
-				sizeof(slot->trace_flags));
+		slot->trace_id = ctx->trace_id;
+		slot->span_id = ctx->span_id;
+		slot->trace_flags = ctx->trace_flags;
 		slot->set = true;
 	}
 	SpinLockRelease(&slot->lock);
@@ -246,49 +232,29 @@ otel_parallel_publish_leader_context(const char *trace_id,
 
 
 /*
- * otel_parallel_clear_leader_context --- the leader calls this when
- * it finishes a span, to mark its slot empty so any workers
- * spawned in a future query don't read a stale value.
+ * otel_parallel_clear_leader_context --- the leader calls this when the
+ * published span ends, so workers of a later query don't read a stale
+ * value.
  */
 void
 otel_parallel_clear_leader_context(void)
 {
-	OtelParallelContextSlot *slot;
-
-	if (otel_parallel_slots == NULL)
-		return;
-	if (MyProcNumber < 0 || MyProcNumber >= MaxBackends)
-		return;
-
-	slot = &otel_parallel_slots[MyProcNumber];
-
-	SpinLockAcquire(&slot->lock);
-	slot->set = false;
-	slot->trace_id[0] = '\0';
-	slot->parent_span_id[0] = '\0';
-	slot->trace_flags[0] = '\0';
-	SpinLockRelease(&slot->lock);
+	otel_parallel_publish_leader_context(NULL);
 }
 
 
 /*
- * otel_parallel_get_leader_context --- workers call this when they
- * start a span, to find the leader's published SpanContext.
- *
- * Returns true and fills *out if we're a parallel worker AND the
- * leader's slot is populated.  Returns false otherwise (we're not
- * a worker, or the leader hasn't published, or the slot is empty).
- *
- * No-op if shared memory wasn't initialised.
+ * otel_parallel_get_leader_context --- in a parallel worker, read the
+ * leader's published context.  Returns false if this isn't a parallel
+ * worker, or the leader published nothing.
  */
 bool
-otel_parallel_get_leader_context(OtelParallelContext *out)
+otel_parallel_get_leader_context(OtelSpanContext *out)
 {
 	OtelParallelContextSlot *slot;
 	ProcNumber	leader;
 
-	if (out == NULL)
-		return false;
+	memset(out, 0, sizeof(*out));
 	if (otel_parallel_slots == NULL)
 		return false;
 
@@ -301,15 +267,12 @@ otel_parallel_get_leader_context(OtelParallelContext *out)
 	slot = &otel_parallel_slots[leader];
 
 	SpinLockAcquire(&slot->lock);
-	if (!slot->set)
+	if (slot->set)
 	{
-		SpinLockRelease(&slot->lock);
-		return false;
+		out->trace_id = slot->trace_id;
+		out->span_id = slot->span_id;
+		out->trace_flags = slot->trace_flags;
 	}
-	out->version = OTEL_PARALLEL_CONTEXT_V1;
-	strlcpy(out->trace_id, slot->trace_id, sizeof(out->trace_id));
-	strlcpy(out->parent_span_id, slot->parent_span_id, sizeof(out->parent_span_id));
-	strlcpy(out->trace_flags, slot->trace_flags, sizeof(out->trace_flags));
 	SpinLockRelease(&slot->lock);
-	return true;
+	return otel_span_context_is_valid(out);
 }

@@ -10,8 +10,8 @@ OBJS = \
 	otel_resource.o
 
 EXTENSION = otel_api
-DATA = otel_api--0.1.1.sql
-HEADERS = otel.h otel_api.h
+DATA = otel_api--0.2.0.sql
+HEADERS = otel.h otel_types.h otel_api.h otel_producer.h otel_producer_stub.h otel_exporter.h otel_internal_api.h otel_semconv.h
 PGFILEDESC = "otel_api - OpenTelemetry trace-context API for extensions"
 
 TAP_TESTS = 1
