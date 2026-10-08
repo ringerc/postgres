@@ -10,37 +10,38 @@
  *
  *   1. Per-statement spans (pg.query / pg.parse / pg.rewrite / pg.plan /
  *      pg.execute / pg.sort / pg.smgr.*).  Each START/DONE pair becomes a
- *      span stored in a fixed static pool (sdt_pool) used as a LIFO stack
- *      (sdt_top) and pushed onto the producer's active stack so it nests
- *      under the propagated query trace.
- *        - START probe: span_init, optional attributes, link+push.
- *        - DONE probe:  pop pool entry, set end_time, emit.
+ *      span.  otel_api owns the span storage; this file keeps only an
+ *      8-byte OtelSpanRef per nested probe depth, in a LIFO stack
+ *      (sdt_top).  Spans are pushed onto the producer's active stack (the
+ *      default) so they nest under the propagated query trace, or under
+ *      whatever else the active stack currently holds (e.g. otel_trace.c's
+ *      own statement span) --- otel_span_start() resolves the parent, so
+ *      this file no longer has to reason about trace-id continuity itself.
+ *        - START probe: otel_span_start, attributes, push onto sdt_stack.
+ *        - DONE probe:  pop sdt_stack, otel_span_end.
  *
- *   2. The transaction span (pg.txn).  It lives in its OWN trace and
- *      spans the whole transaction; it is emitted directly and never
- *      pushed onto the active stack (so it cannot interleave with the
- *      per-statement spans).  The per-statement query traces are tied to
- *      it with bidirectional span links (pg.txn <-> pg.query).
- *        - transaction__start:  span_init + fresh trace_id; mark active.
- *        - transaction__commit: emit (status UNSET); realign sdt_top.
- *        - transaction__abort:  emit (status ERROR);  realign sdt_top.
+ *   2. The transaction span (pg.txn).  It spans the whole transaction and
+ *      is a root of its own trace (kind INTERNAL, parent = ROOT), detached
+ *      (not pushed onto the active stack, so it can never interleave with
+ *      the per-statement spans) and owned by TopTransactionResourceOwner
+ *      so it is force-ended --- as ERROR --- if a transaction aborts
+ *      without going through the TRANSACTION_ABORT probe.  The
+ *      per-statement query traces are tied to it with bidirectional span
+ *      links (pg.txn <-> pg.query).
+ *        - transaction__start:  otel_span_start, detached.
+ *        - transaction__commit: otel_span_end (status UNSET); realign sdt_top.
+ *        - transaction__abort:  status ERROR, otel_span_end; realign sdt_top.
  *
  * Design notes / constraints
  * --------------------------
- *   * sdt_pool / txn_span are static slabs.  Per-statement spans use
- *	   OTEL_UNWIND_DROP so the unwind callback never dereferences the
- *	   OtelSpan pointer (it stores NULL for DROP entries) --- no
- *	   dangling-pointer hazard despite the slab not being per-context.
- *   * commit/abort also realign sdt_top: per-statement DONEs have all
- *	   fired by then, so a nonzero sdt_top means an asymmetric probe
- *	   (e.g. a utility statement that runs an executor) left a pool entry
- *	   dangling; the producer already dropped the active-stack entry.
  *   * Per-statement START/DONE pairing assumes LIFO nesting.  A few
  *	   probe pairs are not strictly nested (interleaved sorts, utility-
- *	   with-executor statements); an out-of-order emit there logs a
- *	   benign producer WARNING and drops a sibling DROP span.  The trace
- *	   stays coherent and the OTEL_UNWIND_ERROR statement span is never
- *	   corrupted.  Acceptable for DEMO-quality instrumentation.
+ *	   with-executor statements); an out-of-order end there is handled by
+ *	   otel_api itself (it unwinds the spans above the one actually being
+ *	   ended, each exported with ERROR status, with a WARNING).  So an
+ *	   out-of-order emit among this bridge's per-statement spans exports
+ *	   the out-of-order sibling(s) with ERROR status and never corrupts
+ *	   the enclosing statement span from otel_trace.c.
  *
  * This is DEMO-quality code.
  *
@@ -85,6 +86,7 @@
 #include "utils/varlena.h"		/* SplitIdentifierString */
 
 #include <otel_api/otel.h>
+#include "otel_pg_attrs.h"
 
 
 /* -----------------------------------------------------------------------
@@ -92,47 +94,13 @@
  * ----------------------------------------------------------------------- */
 
 /*
- * Fixed pool of OtelSpan slabs, one per nested SDT probe depth.
- * Accessed as a LIFO stack via sdt_top.  64 entries mirrors the
- * MAX_SPAN_STACK_DEPTH in otel_producer.c.
+ * LIFO stack of in-flight per-statement span handles, one per nested SDT
+ * probe depth.  64 mirrors the historical MAX_SPAN_STACK_DEPTH.
  */
-#define SDT_POOL_SIZE	64
+#define SDT_STACK_SIZE	64
 
-static OtelSpan			sdt_pool[SDT_POOL_SIZE];
+static OtelSpanRef		sdt_stack[SDT_STACK_SIZE];
 static int				sdt_top = 0;	/* next free slot; 0 == empty */
-
-/*
- * Per-query sampler gate.  Set once at QUERY_START after consulting the
- * sampler policy; cleared at QUERY_DONE and at transaction reset.  When
- * true, every START probe in the current query must skip its push and
- * every DONE probe must skip its pop/emit, keeping sdt_top unchanged and
- * the DONE side a clean no-op.
- *
- * The decision is stable for the lifetime of one query: the trace_id and
- * trace_flags come from the propagated root context, which does not change
- * while a statement is executing.  Computing it once (rather than per-probe)
- * is therefore both correct and cheaper.
- */
-static bool				sdt_query_drop = false;
-
-/*
- * Per-slot scratch storage for integer-valued attributes.
- *
- * span_add_attribute_string does NOT copy its value: the pointer must stay
- * valid until the span is emitted at the matching DONE probe, which happens
- * after the START call frame has returned.  A stack-local format buffer would
- * therefore dangle.  Each pool slot gets a fixed set of small buffers here
- * (lifetime == the slab's), one per integer attribute a START might add.
- * SDT_ATTR_BUFS bounds the number of formatted-int attributes per span (the
- * lock-wait span uses at most 6: type-fallback, mode-fallback, plus up to 4
- * field/target values).
- */
-#define SDT_ATTR_BUFS	6
-#define SDT_ATTR_BUFLEN	32
-static char				sdt_attr_scratch[SDT_POOL_SIZE][SDT_ATTR_BUFS][SDT_ATTR_BUFLEN];
-
-/* InstrumentationScope for this bridge's spans. */
-static const OtelInstrumentationScope *sdt_scope = NULL;
 
 /*
  * Common attribute stamped on every span this bridge emits (pg.txn,
@@ -143,23 +111,21 @@ static const OtelInstrumentationScope *sdt_scope = NULL;
  * this bridge produced from the hook-based spans emitted by otel_trace.c
  * (pgsql.execute / command-tag utility spans), which the exporter can't
  * distinguish via ScopeName (the Rust exporter collapses ScopeName to
- * the crate name).  String literal — safe for the borrowed-pointer
- * contract of span_add_attribute_string.
+ * the crate name).
  */
-#define SDT_SPAN_SOURCE_ATTR_KEY	"pg.otel.span_source"
 #define SDT_SPAN_SOURCE_ATTR_VAL	"sdt_probe"
 
 /*
  * Transaction-lifetime span.  Unlike the per-statement spans, this one
- * lives in its OWN trace (fresh trace_id at transaction__start, emitted
- * at commit/abort) and is NOT pushed onto the producer's active stack,
- * so it can never cause out-of-order emits.  It is associated with the
- * per-statement query traces via span links (added in the START path
- * for the query-root probe).  Stored in its own slab because its
- * lifetime spans many statements.
+ * is the root of its OWN trace and is NOT pushed onto the producer's
+ * active stack, so it can never cause out-of-order emits.  It is
+ * associated with the per-statement query traces via span links (added
+ * in the START path for the query-root probe).  detached + owned by
+ * TopTransactionResourceOwner: if the transaction aborts without the
+ * TRANSACTION_ABORT probe firing, the resource owner release ends it as
+ * ERROR instead of leaving it open forever.
  */
-static OtelSpan			txn_span;
-static bool				txn_active = false;
+static OtelSpanRef		txn_span = OTEL_SPAN_NONE;
 
 /*
  * GUC: which SDT probe FAMILIES are enabled.  This is a GUC_LIST_INPUT
@@ -170,33 +136,6 @@ static bool				txn_active = false;
  * SHOW / pg_settings can echo the configured value.
  */
 static char			   *otel_trace_sdt_probes_str = NULL;
-
-/* smgr (storage manager) spans are off by default because smgr probes fire
- * on every buffer read/write and can be very high-volume; they are enabled
- * by including the smgr / smgr_read / smgr_write token in the list GUC. */
-/*
- * TODO: investigate collapsing rapid sequences of similar spans (e.g. the
- * thousands of per-block pg.smgr.write spans a single CTAS emits -- one trace
- * was observed with 5770 of them) into a single aggregated span carrying a
- * count (and perhaps min/max/total duration, block range). This would make
- * smgr/buffer-level tracing affordable enough to leave on. Evaluate where to do
- * it and the trade-offs:
- *   - span producer (here): cheapest, keeps the exported volume down at source;
- *     coalesce consecutive same-kind probe pairs within a parent into one span
- *     with an attribute like pg.smgr.write.count. Loses per-op timing detail.
- *   - exporter (postgres_otel_tracing_demo): could batch/fold before OTLP send;
- *     more context than the collector but still per-process.
- *   - otel-collector: a transform/groupby or a custom processor downstream;
- *     keeps producers simple and is reconfigurable without a Postgres restart,
- *     but the full span volume still crosses the wire to the collector.
- * Note tracing semantics: an aggregated "span" with a count is closer to a
- * metric/event than a true span -- consider whether a span event or a counter
- * metric is the better representation.
- * Prior art: Elastic APM / EDOT (Elastic Distribution of OpenTelemetry) has
- * "span compression", which folds repeated similar/exact-match spans into one
- * composite span with a count + aggregate duration. Study its model (exact-match
- * vs same-kind compression, the configurable duration threshold) before designing.
- */
 
 
 /* -----------------------------------------------------------------------
@@ -268,29 +207,10 @@ static const SdtFamilyMap sdt_family_map[] = {
 
 static void otel_sdt_hook(int id, const PgSdtArg *args, int nargs);
 static void otel_sdt_xact_cb(XactEvent event, void *arg);
-static void sdt_bytes_to_hex(const unsigned char *src, size_t n, char *dst);
+static void sdt_discard_open_spans(void);
 static bool sdt_probes_parse(const char *value, uint64 *mask_out);
 static bool sdt_probes_check_hook(char **newval, void **extra, GucSource source);
 static void sdt_probes_assign_hook(const char *newval, void *extra);
-
-
-/* -----------------------------------------------------------------------
- * Helper: bytes to lowercase hex (for synthesizing a fresh trace_id)
- * ----------------------------------------------------------------------- */
-
-static void
-sdt_bytes_to_hex(const unsigned char *src, size_t n, char *dst)
-{
-	static const char hex[] = "0123456789abcdef";
-	size_t		i;
-
-	for (i = 0; i < n; i++)
-	{
-		dst[i * 2]     = hex[(src[i] >> 4) & 0xf];
-		dst[i * 2 + 1] = hex[src[i] & 0xf];
-	}
-	dst[n * 2] = '\0';
-}
 
 
 /* -----------------------------------------------------------------------
@@ -488,8 +408,7 @@ sdt_locktag_type_name(int t)
 static void
 otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 {
-	const OtelTracingApi *api;
-	OtelSpan   *s;
+	OtelSpanRef s;
 	const char *span_name;
 	bool		is_start;
 
@@ -506,11 +425,8 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	if (MyProcPort == NULL && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
 		return;
 
-	api = otel_pg_ensure();
-	if (api == NULL)
-		return;
-
-	if (!api->any_emit_consumer_present())
+	/* otel_api refuses every call inside a critical section. */
+	if (CritSectionCount > 0)
 		return;
 
 	/* ---- Classify the probe ---- */
@@ -521,87 +437,52 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	{
 		/* --- Transaction ---
 		 *
-		 * The transaction span lives in its OWN trace and spans the whole
-		 * transaction lifetime.  It is emitted directly (never pushed onto
+		 * The transaction span is the root of its OWN trace and spans the
+		 * whole transaction lifetime.  It is detached (never pushed onto
 		 * the producer's active stack), so it cannot interleave with the
 		 * per-statement query spans and cause out-of-order emits.  The
 		 * per-statement query traces are associated with it via span links
-		 * (added in the START path for the query-root probe), which is the
-		 * correct OTel model for a long-lived span related to many shorter
-		 * traces.
+		 * (added in the START path for the query-root probe).
 		 *
 		 * Both commit and abort are also realign points for the
-		 * per-statement pool: by the time either fires, every per-statement
-		 * SDT span has paired its DONE, so a nonzero sdt_top means an
-		 * asymmetric probe (e.g. a utility statement such as CREATE TABLE AS
-		 * that runs an executor underneath) left a pool entry dangling.  The
-		 * producer already dropped the matching active-stack entry via its
-		 * MemoryContext unwind under OTEL_UNWIND_DROP; we reset our own pool
+		 * per-statement stack: by the time either fires, every
+		 * per-statement SDT span has paired its DONE, so a nonzero sdt_top
+		 * means an asymmetric probe (e.g. a utility statement such as
+		 * CREATE TABLE AS that runs an executor underneath) left an entry
+		 * dangling.  The producer already released its slot via its own
+		 * resource-owner / stack-unwind machinery; we just reset our own
 		 * index so the next transaction starts from a clean baseline.
 		 */
 		case PG_SDT_TRANSACTION_START:
-			if (!txn_active)
+			if (txn_span.v == 0)
 			{
-				unsigned char buf[16];
-
-				/* span_init zeroes the struct, generates a span_id, and
-				 * sets start_time.  We give it a fresh, independent
-				 * trace_id so the transaction is its own trace. */
-				api->span_init(&txn_span, sdt_scope, "pg.txn",
-							   OTEL_SPAN_KIND_INTERNAL);
-				api->span_add_attribute_string(&txn_span,
-											   SDT_SPAN_SOURCE_ATTR_KEY,
-											   SDT_SPAN_SOURCE_ATTR_VAL);
-				if (!pg_strong_random(buf, sizeof(buf)))
-					memset(buf, 0xa5, sizeof(buf));
-				sdt_bytes_to_hex(buf, sizeof(buf), txn_span.trace_id);
-				strcpy(txn_span.trace_flags, "01");
-				/* parent_span_id stays empty: root of its own trace. */
-				txn_active = true;
+				txn_span = otel_span_start(.tracer = &otel_pg_tracer,
+										   .name = "pg.txn",
+										   .kind = OTEL_SPAN_KIND_INTERNAL,
+										   .parent = OTEL_PARENT_ROOT,
+										   .owner = TopTransactionResourceOwner,
+										   .detached = true);
+				otel_span_set_str(txn_span, OTEL_PG_SPAN_SOURCE,
+								  SDT_SPAN_SOURCE_ATTR_VAL);
 			}
 			return;
 		case PG_SDT_TRANSACTION_COMMIT:
-			if (txn_active)
+			if (txn_span.v != 0)
 			{
-				txn_span.end_time = GetCurrentTimestamp();
-				txn_span.status = OTEL_STATUS_UNSET;
-				/* Not on the active stack: span_emit just dispatches it. */
-				api->span_emit(&txn_span);
-				txn_active = false;
+				otel_span_end(txn_span);
+				txn_span = OTEL_SPAN_NONE;
 			}
 			sdt_top = 0;
-			sdt_query_drop = false;
 			return;
 		case PG_SDT_TRANSACTION_ABORT:
-			if (txn_active)
+			if (txn_span.v != 0)
 			{
-				txn_span.end_time = GetCurrentTimestamp();
-				otel_span_set_status(&txn_span, OTEL_STATUS_ERROR,
+				otel_span_set_status(txn_span, OTEL_STATUS_ERROR,
 									 "transaction aborted");
-				api->span_emit(&txn_span);
-				txn_active = false;
+				otel_span_end(txn_span);
+				txn_span = OTEL_SPAN_NONE;
 			}
-			/*
-			 * TODO: on abort, emit the still-open per-statement spans on the
-			 * stack (sdt_top > 0) with ERROR status instead of discarding them
-			 * via the reset below. When a statement errors mid-execution the
-			 * QUERY_EXECUTE_DONE / QUERY_DONE (and on a plan-time error,
-			 * QUERY_PLAN_DONE) probes never fire, so pg.execute / pg.query /
-			 * pg.plan stay open and are dropped here -- an error trace then
-			 * shows only the completed-pair spans plus the executor-hook
-			 * pgsql.execute (which captures the error via the elog hook).
-			 * Observed: trace 2cfc6415... (runtime 1/(i-i)) lost its
-			 * pg.execute/pg.query subtree; trace 01da50ab... (plan-time 1/0)
-			 * captured no server-side error at all because no executor span
-			 * opened and the open pg.plan was discarded. Fix: unwind the stack
-			 * top-down, set each span's end_time + ERROR status, and span_emit
-			 * in LIFO order so the producer's stack contract holds (otherwise
-			 * otel_producer.c logs "span emitted out of stack order; N span(s)
-			 * above will be unwound"). This would also make plan/parse-phase
-			 * errors visible, not just execute-phase ones.
-			 */
-			sdt_top = 0;
-			sdt_query_drop = false;
+			sdt_discard_open_spans();
 			return;
 
 		/* --- Query --- */
@@ -697,16 +578,18 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		 * This probe fires in the startup/recovery process when it replays
 		 * a commit record that carries a W3C trace context embedded by the
 		 * primary.  There is NO active span stack here (recovery runs in a
-		 * single long-lived backend with no statement context), so we build
-		 * a self-contained span directly, set its trace identity from the
-		 * parsed traceparent arg, and emit it immediately.
+		 * single long-lived backend with no statement context), so we
+		 * start a detached, point-in-time span directly parented on the
+		 * parsed traceparent and emit it immediately.
 		 */
 		case PG_SDT_RECOVERY_XACT_COMMIT:
 		{
-			OtelSpan	replica_span;
+			OtelSpanContext parent_ctx;
 			const char *traceparent;
 			long		commit_lsn_long;
 			char		lsn_str[32];
+			TimestampTz now;
+			OtelSpanRef replica_span;
 
 			if (nargs < 2 || args[0].tag != 's' || args[1].tag != 'i')
 				return;
@@ -714,55 +597,30 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			traceparent = args[0].v.s;
 			commit_lsn_long = (long) args[1].v.i;
 
-			/*
-			 * Validate traceparent format: "00-<32hex>-<16hex>-<2hex>".
-			 * Check minimum length and the mandatory hyphen positions.
-			 */
 			if (traceparent == NULL ||
-				strlen(traceparent) < 55 ||
-				traceparent[2] != '-' ||
-				traceparent[35] != '-' ||
-				traceparent[52] != '-')
+				!otel_traceparent_parse(traceparent, &parent_ctx))
 				return;
 
-			if (sdt_scope == NULL && otel_pg_tracer != NULL)
-				sdt_scope = otel_pg_tracer;
+			now = GetCurrentTimestamp();
 
-			/*
-			 * span_init zeroes the struct, generates a fresh span_id, and
-			 * sets start_time.  We then overwrite trace_id, parent_span_id,
-			 * and trace_flags from the propagated traceparent.
-			 */
-			api->span_init(&replica_span, sdt_scope, "pg.replica.apply",
-						   OTEL_SPAN_KIND_CONSUMER);
-			api->span_add_attribute_string(&replica_span,
-										   SDT_SPAN_SOURCE_ATTR_KEY,
-										   SDT_SPAN_SOURCE_ATTR_VAL);
-
-			/* trace_id: 32 hex chars at offset 3 */
-			memcpy(replica_span.trace_id, traceparent + 3, 32);
-			replica_span.trace_id[32] = '\0';
-
-			/* parent_span_id: the primary's span_id at offset 36, 16 hex chars */
-			memcpy(replica_span.parent_span_id, traceparent + 36, 16);
-			replica_span.parent_span_id[16] = '\0';
-
-			/* trace_flags: 2 hex chars at offset 53 */
-			memcpy(replica_span.trace_flags, traceparent + 53, 2);
-			replica_span.trace_flags[2] = '\0';
-
-			/* Point-in-time span: end == start (apply is instantaneous here). */
-			replica_span.end_time = replica_span.start_time;
-			replica_span.status = OTEL_STATUS_UNSET;
+			replica_span = otel_span_start(.tracer = &otel_pg_tracer,
+										   .name = "pg.replica.apply",
+										   .kind = OTEL_SPAN_KIND_CONSUMER,
+										   .parent = OTEL_PARENT_CONTEXT,
+										   .parent_ctx = &parent_ctx,
+										   .detached = true,
+										   .start_time = now);
+			otel_span_set_str(replica_span, OTEL_PG_SPAN_SOURCE,
+							  SDT_SPAN_SOURCE_ATTR_VAL);
 
 			/* Attribute: commit LSN formatted as %X/%08X */
 			snprintf(lsn_str, sizeof(lsn_str), "%lX/%08lX",
 					 (unsigned long) ((unsigned long long) commit_lsn_long >> 32),
 					 (unsigned long) ((unsigned long long) commit_lsn_long & 0xFFFFFFFF));
-			api->span_add_attribute_string(&replica_span, "pg.commit_lsn", lsn_str);
+			otel_span_set_str(replica_span, OTEL_ATTR_PG_COMMIT_LSN, lsn_str);
 
-			/* Emit directly — no stack push; recovery has no active span stack. */
-			api->span_emit(&replica_span);
+			/* Point-in-time span: end == start. */
+			otel_span_end_at(replica_span, now);
 			return;
 		}
 
@@ -773,95 +631,34 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	/* ---- START path ---- */
 	if (is_start)
 	{
-		OtelRootContextSnapshot rc;
+		OtelSpanContext ctx;
 
 		/*
-		 * Only build SDT spans when a propagated/sampled root trace
-		 * context is present.  The producer keeps a single trace_id
-		 * across the active stack "by construction": on every push it
-		 * fills span->trace_id from the root context (otel_ctx) and does
-		 * NOT copy it from the parent stack entry (entries store only
-		 * span_id + trace_flags, see otel_producer.c).  So nesting is only
-		 * coherent when a root context is set.  Without one, the existing
-		 * statement-span path (otel_trace.c) synthesizes its own per-span
-		 * trace and never nests; a bridge span pushed in that state would
-		 * either be an orphan root or, worse, inherit a zeroed trace_id.
-		 *
-		 * Requiring rc.is_set keeps every SDT span on the SAME trace as
-		 * the statement span and the propagated parent.  Consequence:
-		 * otel.trace_all_queries without a propagated context yields only
-		 * the statement span, not the SDT subtree --- to see the SDT tree,
-		 * propagate a context (SET otel.traceparent, the 'M' protocol
-		 * header, or sqlcommenter).
+		 * Only build SDT spans when a child would inherit a context: the
+		 * top of our own active stack (nested under a span this file
+		 * already pushed, or under otel_trace.c's statement span), or the
+		 * backend's root/parallel-leader context.  Without either, this
+		 * would start a brand-new, disconnected root trace, which is not
+		 * what a producer that shouldn't originate traces on its own
+		 * should do.  Since this check is stable for a statement's
+		 * duration and every nested START inherits its parent's context
+		 * (or lack of one), a single check per START suffices --- there is
+		 * no need to cache a once-per-query decision separately.
 		 */
-		api->get_root_context_snapshot(&rc);
-		if (!rc.is_set)
+		if (!otel_span_context_of(OTEL_SPAN_NONE, &ctx))
 			return;
 
-		/*
-		 * Consult the sampler policy.  The decision is computed once per
-		 * query at QUERY_START (the root of the SDT span sub-tree) and
-		 * cached in sdt_query_drop.  Sub-phase probes (parse, rewrite,
-		 * plan, execute) skip this block and rely on the cached flag.
-		 *
-		 * This mirrors the decide_whether_to_record() pattern in
-		 * otel_trace.c: build an OtelSamplerInput from the root context
-		 * and call api->compute_sampler_decision.  Any result other than
-		 * OTEL_SAMPLE_DROP allows the span to proceed.
-		 *
-		 * We only re-evaluate at QUERY_START (id == PG_SDT_QUERY_START).
-		 * For all other START probes the query root has already set
-		 * sdt_query_drop; if it is true we bail out immediately to avoid
-		 * pushing a span that would never be popped.
-		 */
-		if ((PgSdtProbeId) id == PG_SDT_QUERY_START)
-		{
-			OtelSamplerInput in;
+		if (sdt_top >= SDT_STACK_SIZE)
+			return;				/* stack full; drop this probe */
 
-			in.trace_id = rc.trace_id;
-			in.parent_span_id = rc.span_id;
-			in.trace_flags = rc.trace_flags;
-			in.tracestate = rc.tracestate;
-			in.name = span_name;
-			in.kind = OTEL_SPAN_KIND_INTERNAL;
-
-			sdt_query_drop =
-				(api->compute_sampler_decision(&in, rc.sampled_flag_set)
-				 == OTEL_SAMPLE_DROP);
-		}
-
-		if (sdt_query_drop)
-			return;
-
-		if (sdt_top >= SDT_POOL_SIZE)
-			return;				/* pool full; drop this probe */
-
-		s = &sdt_pool[sdt_top];
-
-		/*
-		 * Ensure the scope handle is registered.  otel_pg_ensure() above
-		 * may have populated otel_pg_tracer for us; lazily set sdt_scope
-		 * from it on first use.
-		 */
-		if (sdt_scope == NULL && otel_pg_tracer != NULL)
-			sdt_scope = otel_pg_tracer;
-
-		/*
-		 * span_init zeroes the struct, generates a fresh span_id, and sets
-		 * start_time.  span_link_to_active_and_push then fills trace_id,
-		 * parent_span_id and trace_flags from the top-of-stack span (or the
-		 * root context when the stack is empty).
-		 */
-		api->span_init(s, sdt_scope, span_name, OTEL_SPAN_KIND_INTERNAL);
-		api->span_add_attribute_string(s,
-									   SDT_SPAN_SOURCE_ATTR_KEY,
-									   SDT_SPAN_SOURCE_ATTR_VAL);
+		s = otel_span_start(.tracer = &otel_pg_tracer,
+							.name = span_name,
+							.kind = OTEL_SPAN_KIND_INTERNAL);
+		otel_span_set_str(s, OTEL_PG_SPAN_SOURCE, SDT_SPAN_SOURCE_ATTR_VAL);
 
 		/*
 		 * Add useful attributes for query-level probes.  nargs and arg
-		 * layout are probe-specific; guard carefully.  The query string is
-		 * a borrowed pointer that outlives the span (valid through the
-		 * matching DONE in the same processing phase).
+		 * layout are probe-specific; guard carefully.
 		 */
 		if ((PgSdtProbeId) id == PG_SDT_QUERY_START ||
 			(PgSdtProbeId) id == PG_SDT_QUERY_PARSE_START ||
@@ -869,7 +666,8 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		{
 			/* First arg is the query string ('s') for these probes. */
 			if (nargs >= 1 && args[0].tag == 's' && args[0].v.s != NULL)
-				api->span_add_attribute_string(s, "db.statement", args[0].v.s);
+				OTEL_SPAN_SET_STR_IF_RECORDING(s, OTEL_SC_DB_QUERY_TEXT,
+											   args[0].v.s);
 		}
 
 		if ((PgSdtProbeId) id == PG_SDT_SYNCREP_WAIT_START)
@@ -877,39 +675,24 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			/* First arg is the commit LSN ('i') for this probe. */
 			if (nargs >= 1 && args[0].tag == 'i')
 			{
-				/*
-				 * Format into this slot's persistent scratch (NOT a stack
-				 * local): span_add_attribute_string stores the pointer, and the
-				 * span is not emitted until the matching DONE after this frame
-				 * returns.
-				 */
-				char	   *lsn_str = sdt_attr_scratch[sdt_top][0];
+				char		lsn_str[32];
 				long		lsn_long = (long) args[0].v.i;
 
-				snprintf(lsn_str, SDT_ATTR_BUFLEN, "%lX/%08lX",
+				snprintf(lsn_str, sizeof(lsn_str), "%lX/%08lX",
 						 (unsigned long) ((unsigned long long) lsn_long >> 32),
 						 (unsigned long) ((unsigned long long) lsn_long & 0xFFFFFFFF));
-				api->span_add_attribute_string(s, "pg.commit_lsn", lsn_str);
+				otel_span_set_str(s, OTEL_ATTR_PG_COMMIT_LSN, lsn_str);
 			}
 		}
 
 		if ((PgSdtProbeId) id == PG_SDT_LOCK_WAIT_START)
 		{
-			/*
-			 * Six int64 args: locktag field1..4, locktag_type, lock mode.
-			 * Decode the type/mode to human-readable names and emit the
-			 * type-specific lock target.  Integer values are formatted into
-			 * this slot's persistent scratch buffers (NOT stack locals):
-			 * span_add_attribute_string stores the pointer, and the span is
-			 * not emitted until the matching DONE after this frame returns.
-			 */
+			/* Six int64 args: locktag field1..4, locktag_type, lock mode. */
 			if (nargs >= 6 &&
 				args[0].tag == 'i' && args[1].tag == 'i' &&
 				args[2].tag == 'i' && args[3].tag == 'i' &&
 				args[4].tag == 'i' && args[5].tag == 'i')
 			{
-				char	  (*buf)[SDT_ATTR_BUFLEN] = sdt_attr_scratch[sdt_top];
-				int			nb = 0;		/* next free scratch buffer */
 				int64		field1 = args[0].v.i;
 				int64		field2 = args[1].v.i;
 				int64		field3 = args[2].v.i;
@@ -918,133 +701,53 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				int			mode = (int) args[5].v.i;
 				const char *tname = sdt_locktag_type_name(locktag_type);
 
-				/* pg.lock.type */
 				if (tname != NULL)
-					api->span_add_attribute_string(s, "pg.lock.type", tname);
-				else if (nb < SDT_ATTR_BUFS)
-				{
-					snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT,
-							 (int64) locktag_type);
-					api->span_add_attribute_string(s, "pg.lock.type", buf[nb]);
-					nb++;
-				}
+					otel_span_set_str(s, OTEL_ATTR_PG_LOCK_TYPE, tname);
+				else
+					otel_span_set_int(s, OTEL_ATTR_PG_LOCK_TYPE, locktag_type);
 
-				/* pg.lock.mode */
 				if (mode >= 1 && mode < (int) lengthof(sdt_lockmode_names))
-					api->span_add_attribute_string(s, "pg.lock.mode",
-												   sdt_lockmode_names[mode]);
-				else if (nb < SDT_ATTR_BUFS)
-				{
-					snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, (int64) mode);
-					api->span_add_attribute_string(s, "pg.lock.mode", buf[nb]);
-					nb++;
-				}
+					otel_span_set_str(s, OTEL_ATTR_PG_LOCK_MODE,
+									  sdt_lockmode_names[mode]);
+				else
+					otel_span_set_int(s, OTEL_ATTR_PG_LOCK_MODE, mode);
 
-				/* Type-specific targets. */
 				switch (locktag_type)
 				{
 					case LOCKTAG_RELATION:
 					case LOCKTAG_RELATION_EXTEND:
 					case LOCKTAG_PAGE:
 					case LOCKTAG_TUPLE:
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
-							api->span_add_attribute_string(s, "pg.lock.dboid", buf[nb]);
-							nb++;
-						}
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field2);
-							api->span_add_attribute_string(s, "pg.lock.relid", buf[nb]);
-							nb++;
-						}
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_DBOID, field1);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_RELID, field2);
 						if (locktag_type == LOCKTAG_PAGE ||
 							locktag_type == LOCKTAG_TUPLE)
-						{
-							if (nb < SDT_ATTR_BUFS)
-							{
-								snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field3);
-								api->span_add_attribute_string(s, "pg.lock.block", buf[nb]);
-								nb++;
-							}
-						}
+							otel_span_set_int(s, OTEL_ATTR_PG_LOCK_BLOCK, field3);
 						if (locktag_type == LOCKTAG_TUPLE)
-						{
-							if (nb < SDT_ATTR_BUFS)
-							{
-								snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field4);
-								api->span_add_attribute_string(s, "pg.lock.offset", buf[nb]);
-								nb++;
-							}
-						}
+							otel_span_set_int(s, OTEL_ATTR_PG_LOCK_OFFSET, field4);
 						break;
 
 					case LOCKTAG_TRANSACTION:
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
-							api->span_add_attribute_string(s, "pg.lock.xid", buf[nb]);
-							nb++;
-						}
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_XID, field1);
 						break;
 
 					case LOCKTAG_VIRTUALTRANSACTION:
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
-							api->span_add_attribute_string(s, "pg.lock.procno", buf[nb]);
-							nb++;
-						}
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field2);
-							api->span_add_attribute_string(s, "pg.lock.localxid", buf[nb]);
-							nb++;
-						}
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_PROCNO, field1);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_LOCALXID, field2);
 						break;
 
 					default:
 						/* Generic: emit field1..4 as-is. */
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field1);
-							api->span_add_attribute_string(s, "pg.lock.field1", buf[nb]);
-							nb++;
-						}
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field2);
-							api->span_add_attribute_string(s, "pg.lock.field2", buf[nb]);
-							nb++;
-						}
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field3);
-							api->span_add_attribute_string(s, "pg.lock.field3", buf[nb]);
-							nb++;
-						}
-						if (nb < SDT_ATTR_BUFS)
-						{
-							snprintf(buf[nb], SDT_ATTR_BUFLEN, INT64_FORMAT, field4);
-							api->span_add_attribute_string(s, "pg.lock.field4", buf[nb]);
-							nb++;
-						}
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_FIELD1, field1);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_FIELD2, field2);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_FIELD3, field3);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_FIELD4, field4);
 						break;
 				}
 			}
 		}
 
-		/*
-		 * OTEL_UNWIND_DROP: slab storage is permanent; the unwind
-		 * callback will silently remove the stack entry without
-		 * dereferencing the span pointer.  sdt_top is reset separately
-		 * in the xact callback on ABORT.
-		 */
-		s->unwind_policy = OTEL_UNWIND_DROP;
-
-		api->span_link_to_active_and_push(s);
-		sdt_top++;
+		sdt_stack[sdt_top++] = s;
 
 		/*
 		 * Associate the per-statement query trace with the
@@ -1052,66 +755,66 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		 * root of the per-statement SDT subtree, so we add bidirectional
 		 * span links: the query span links to the transaction, and the
 		 * transaction span accumulates a link to each query that ran in
-		 * it (emitted at commit/abort).  s->trace_id / s->span_id are now
-		 * populated by the push above.
+		 * it.
 		 */
-		if ((PgSdtProbeId) id == PG_SDT_QUERY_START && txn_active)
+		if ((PgSdtProbeId) id == PG_SDT_QUERY_START && txn_span.v != 0)
 		{
-			otel_span_add_link(s, txn_span.trace_id, txn_span.span_id,
-							   txn_span.trace_flags);
-			otel_span_add_link(&txn_span, s->trace_id, s->span_id,
-							   s->trace_flags);
+			OtelSpanContext txn_ctx;
+			OtelSpanContext query_ctx;
+
+			if (otel_span_context_of(txn_span, &txn_ctx))
+				otel_span_add_link(s, &txn_ctx);
+			if (otel_span_context_of(s, &query_ctx))
+				otel_span_add_link(txn_span, &query_ctx);
 		}
 
 		return;
 	}
 
 	/* ---- DONE path ---- */
-
-	/*
-	 * If the query's sampler decision was DROP, every START probe skipped
-	 * its push so sdt_top was not incremented.  Honour the same gate here
-	 * so we never pop a slot that was never pushed.  Clear sdt_query_drop
-	 * at the query root so the next statement starts with a clean state.
-	 */
-	if (sdt_query_drop)
-	{
-		if ((PgSdtProbeId) id == PG_SDT_QUERY_DONE)
-			sdt_query_drop = false;
-		return;
-	}
-
 	if (sdt_top <= 0)
 		return;					/* no matching START on our stack */
 
-	s = &sdt_pool[--sdt_top];
-	s->end_time = GetCurrentTimestamp();
-	s->status = OTEL_STATUS_UNSET;
+	s = sdt_stack[--sdt_top];
 
 	/*
-	 * span_emit locates our span by span_id and pops it.  SDT start/done
-	 * pairs are LIFO in the common case so our span is the top; for the
-	 * few that are not strictly nested (interleaved sorts, or a utility
-	 * statement such as CREATE TABLE AS that runs an executor underneath)
-	 * the producer unwinds the entries above ours, each honouring its own
-	 * unwind_policy.  All bridge spans are OTEL_UNWIND_DROP, so an
-	 * out-of-order emit only drops sibling bridge spans (plus a benign
-	 * WARNING) and never disturbs the lower OTEL_UNWIND_ERROR statement
-	 * span.  The trace stays coherent.
+	 * SDT start/done pairs are LIFO in the common case so our span is the
+	 * top; for the few that are not strictly nested (interleaved sorts, or
+	 * a utility statement such as CREATE TABLE AS that runs an executor
+	 * underneath) otel_api unwinds the entries above ours, each exported
+	 * with ERROR status (plus a benign WARNING).  The out-of-order
+	 * sibling bridge span(s) are exported that way and the lower
+	 * statement span from otel_trace.c is undisturbed.  The trace stays
+	 * coherent.
 	 */
-	api->span_emit(s);
+	otel_span_end(s);
 }
 
+
+/*
+ * Discard the per-statement spans still open on our stack.  On abort their
+ * DONE probes never fire.  pg.query starts before the statement's
+ * transaction, with no resource owner, so it is a session span that
+ * otel_api would otherwise keep on its active stack, and every later span
+ * in the backend would be parented under it.  They have no resource
+ * owner to unwind them on abort, so this bridge discards them itself,
+ * explicitly, rather than exporting them with ERROR status.
+ */
+static void
+sdt_discard_open_spans(void)
+{
+	while (sdt_top > 0)
+		otel_span_discard(sdt_stack[--sdt_top]);
+}
 
 /* -----------------------------------------------------------------------
  * otel_sdt_xact_cb
  *
- * Transaction event callback.  On abort, reset sdt_top so our pool
- * index stays in sync with the producer's active stack (which the
- * MemoryContext callbacks have already drained via OTEL_UNWIND_DROP).
- * On commit we do nothing --- the TRANSACTION_COMMIT probe fires
- * before the xact callback, so the pg.txn span has already been
- * emitted by otel_sdt_hook.
+ * Transaction event callback.  On abort, reset sdt_top so our stack
+ * index stays in sync (spans still open are unwound by otel_api's own
+ * resource-owner release).  On commit we do nothing --- the
+ * TRANSACTION_COMMIT probe fires before the xact callback, so the
+ * pg.txn span has already been ended by otel_sdt_hook.
  * ----------------------------------------------------------------------- */
 
 static void
@@ -1127,10 +830,12 @@ otel_sdt_xact_cb(XactEvent event, void *arg)
 			 * path.  This callback catches aborts that do NOT fire the
 			 * probe (e.g. errors before the probe site, DDL command
 			 * rollbacks, ROLLBACK TO SAVEPOINT at the transaction
-			 * level, parallel-worker failures).
+			 * level, parallel-worker failures).  txn_span itself, if
+			 * still open, is force-ended by its TopTransactionResourceOwner
+			 * being released.
 			 */
-			sdt_top = 0;
-			sdt_query_drop = false;
+			sdt_discard_open_spans();
+			txn_span = OTEL_SPAN_NONE;
 			break;
 
 		default:
@@ -1142,23 +847,18 @@ otel_sdt_xact_cb(XactEvent event, void *arg)
  * otel_sdt_get_txn_context
  *		Snapshot the identity of the currently-active pg.txn span.
  *
- * Returns false when no transaction span is active (txn_active == false),
- * in which case *out is left untouched.  On success *out carries copies of
- * the trace/span ids and flags so the caller's use need not outlive this
- * call.  Used by otel_trace.c to link a statement span to the enclosing
- * transaction even when no traceparent was propagated (the SDT pg.query
- * path is gated on a propagated root context, but pg.txn is always live).
+ * Returns false when no transaction span is active, in which case *out is
+ * left untouched.  Used by otel_trace.c to link a statement span to the
+ * enclosing transaction even when no traceparent was propagated (the SDT
+ * pg.query path is gated on there being *some* context to nest under, but
+ * pg.txn is always live once a transaction has started).
  */
 bool
 otel_sdt_get_txn_context(OtelSpanContext *out)
 {
-	if (!txn_active)
+	if (txn_span.v == 0)
 		return false;
-	strlcpy(out->trace_id, txn_span.trace_id, sizeof(out->trace_id));
-	strlcpy(out->span_id, txn_span.span_id, sizeof(out->span_id));
-	strlcpy(out->trace_flags, txn_span.trace_flags, sizeof(out->trace_flags));
-	out->tracestate = NULL;
-	return true;
+	return otel_span_context_of(txn_span, out);
 }
 
 /*
@@ -1167,16 +867,14 @@ otel_sdt_get_txn_context(OtelSpanContext *out)
  *
  * No-op when no transaction span is active.  Completes the bidirectional
  * link begun by otel_sdt_get_txn_context (the statement span links to the
- * txn; this links the txn back to the statement).  Links past
- * OTEL_INLINE_LINKS are silently dropped (see otel_span_add_link).
+ * txn; this links the txn back to the statement).
  */
 void
-otel_sdt_link_stmt_to_txn(const char *trace_id, const char *span_id,
-						  const char *trace_flags)
+otel_sdt_link_stmt_to_txn(const OtelSpanContext *stmt_ctx)
 {
-	if (!txn_active)
+	if (txn_span.v == 0)
 		return;
-	otel_span_add_link(&txn_span, trace_id, span_id, trace_flags);
+	otel_span_add_link(txn_span, stmt_ctx);
 }
 
 #else							/* !PG_HAVE_SDT_PROBE_HOOK */

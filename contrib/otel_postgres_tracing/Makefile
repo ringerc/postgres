@@ -24,9 +24,13 @@ PGFILEDESC = "otel_postgres_tracing - OpenTelemetry instrumentation for PostgreS
 # NO_INSTALLCHECK suppresses PGXS's installcheck target outright.
 NO_INSTALLCHECK = 1
 
-# <otel_api/otel.h> resolves from:
-#   * in-tree: contrib/otel_api/otel.h via -I$(top_srcdir)/contrib
-#   * out-of-tree (PGXS): <pg_config --includedir-server>/extension/otel_api/otel.h
+# <otel_api/otel.h> resolves from the otel_api SOURCE tree, not any
+# installed copy: the P2 API reshape is still in flight and the
+# installed headers under <includedir-server>/extension may be stale
+# (an older MAJOR).  $(srcdir) is set correctly under VPATH by PGXS /
+# Makefile.global, so "$(srcdir)/.." is this module's sibling
+# directory containing otel_api/*.h regardless of where the build
+# happens out-of-tree.
 #
 # All PG_CPPFLAGS additions (-I and -D feature gates) MUST appear BEFORE
 # include $(PGXS) / Makefile.global because pgxs.mk bakes COMPILE.c at
@@ -34,7 +38,7 @@ NO_INSTALLCHECK = 1
 # compile command line.
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config
-PG_CPPFLAGS = -I$(shell $(PG_CONFIG) --includedir-server)/extension
+PG_CPPFLAGS = -I$(srcdir)/..
 OTEL_PROBE_INC := $(shell $(PG_CONFIG) --includedir-server)
 else
 PG_CPPFLAGS = -I$(top_srcdir)/contrib

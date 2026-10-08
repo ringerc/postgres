@@ -43,9 +43,21 @@
 typedef struct OtelPlanwalkContext
 {
 	QueryDesc  *queryDesc;		/* the active QueryDesc */
-	OtelSpan   *stmt_span;		/* the enclosing pgsql.execute span */
-	MemoryContext attr_cxt;		/* span_cxt: allocate attribute values here */
+	OtelSpanRef stmt_span;		/* the enclosing pgsql.execute span */
+	MemoryContext attr_cxt;		/* scratch context for building attribute
+								 * values; setters copy immediately, so
+								 * this need not outlive the call */
+
+	/*
+	 * The current node's ancestors in the plan tree, root first.  Only
+	 * the top OTEL_PLANWALK_MAX_ANCESTORS levels are recorded; a node
+	 * deeper than that sees only those.
+	 */
+	PlanState  *const *ancestors;
+	int			n_ancestors;
 } OtelPlanwalkContext;
+
+#define OTEL_PLANWALK_MAX_ANCESTORS 64
 
 /*
  * A collector registration entry.  Any callback may be NULL (the dispatcher
@@ -105,10 +117,10 @@ extern void otel_planwalk_install(void);
  *                    Early-outs cheaply when no collector is enabled.
  */
 extern void otel_planwalk_executor_start(QueryDesc *queryDesc,
-										 OtelSpan *stmt_span,
+										 OtelSpanRef stmt_span,
 										 MemoryContext attr_cxt);
 extern void otel_planwalk_executor_end(QueryDesc *queryDesc,
-									   OtelSpan *stmt_span,
+									   OtelSpanRef stmt_span,
 									   MemoryContext attr_cxt);
 
 /*

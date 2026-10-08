@@ -81,6 +81,8 @@ typedef struct
 	OtelPlanwalkContext pub;		/* must be first; passed to collector cbs */
 	unsigned int enabled_mask;	/* bitmask of collectors active this walk */
 	bool		is_end_walk;	/* true -> call node_end, false -> node_begin */
+	PlanState  *ancestors[OTEL_PLANWALK_MAX_ANCESTORS];
+	int			depth;			/* true depth; may exceed the array */
 } PlanwalkInternalCtx;
 
 /*
@@ -93,9 +95,13 @@ otel_planwalk_walker(PlanState *planstate, void *context)
 {
 	PlanwalkInternalCtx *ictx = (PlanwalkInternalCtx *) context;
 	int			i;
+	bool		result;
 
 	if (planstate == NULL)
 		return false;
+
+	ictx->pub.ancestors = ictx->ancestors;
+	ictx->pub.n_ancestors = Min(ictx->depth, OTEL_PLANWALK_MAX_ANCESTORS);
 
 	/* Dispatch to enabled collectors for this node. */
 	for (i = 0; i < n_collectors; i++)
@@ -115,7 +121,13 @@ otel_planwalk_walker(PlanState *planstate, void *context)
 		}
 	}
 
-	return planstate_tree_walker(planstate, otel_planwalk_walker, context);
+	/* Recurse with this node as the children's nearest ancestor. */
+	if (ictx->depth < OTEL_PLANWALK_MAX_ANCESTORS)
+		ictx->ancestors[ictx->depth] = planstate;
+	ictx->depth++;
+	result = planstate_tree_walker(planstate, otel_planwalk_walker, context);
+	ictx->depth--;
+	return result;
 }
 
 /*
@@ -163,7 +175,7 @@ otel_planwalk_register_collector(const OtelPlanwalkCollector *c)
 }
 
 void
-otel_planwalk_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
+otel_planwalk_executor_start(QueryDesc *queryDesc, OtelSpanRef stmt_span,
 							 MemoryContext attr_cxt)
 {
 	PlanwalkInternalCtx ictx;
@@ -182,13 +194,14 @@ otel_planwalk_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
 	ictx.pub.attr_cxt = attr_cxt;
 	ictx.enabled_mask = mask;
 	ictx.is_end_walk = false;
+	ictx.depth = 0;
 
 	/* Process the root node too, then recurse; mirrors otel_fdw.c:262. */
 	(void) otel_planwalk_walker(queryDesc->planstate, &ictx);
 }
 
 void
-otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpan *stmt_span,
+otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpanRef stmt_span,
 						   MemoryContext attr_cxt)
 {
 	PlanwalkInternalCtx ictx;
@@ -208,6 +221,7 @@ otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpan *stmt_span,
 	ictx.pub.attr_cxt = attr_cxt;
 	ictx.enabled_mask = mask;
 	ictx.is_end_walk = true;
+	ictx.depth = 0;
 
 	/* Framing: reset accumulators before the traversal. */
 	for (i = 0; i < n_collectors; i++)

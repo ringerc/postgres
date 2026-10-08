@@ -65,7 +65,8 @@
 #include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
 
-#include <otel_api/otel_api.h>
+#include <otel_api/otel.h>
+#include "otel_pg_attrs.h"
 #include "otel_planpath.h"
 #include "otel_planwalk.h"
 
@@ -601,56 +602,27 @@ planpath_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 	 * with psprintf; the generic event API COPIES name + attrs into the span's
 	 * context, so they may go out of scope immediately after the call.
 	 * ---------------------------------------------------------------- */
-	if (otel_trace_plan_node_events)
+	if (otel_trace_plan_node_events && otel_span_recording(ctx->stmt_span))
 	{
-		const OtelTracingApi *api = otel_api_get();
+		OtelAttribute attrs[8];
+		int			n = 0;
+		double		startup_ms = OTEL_NI_STARTUP_MS(ni) / ni->nloops;
+		double		total_ms = OTEL_NI_TOTAL_MS(ni) / ni->nloops;
+		double		rows = ni->ntuples / ni->nloops;
 
-		if (api != NULL && ctx->stmt_span != NULL && api->span_add_event != NULL)
-		{
-			OtelKeyValue attrs[8];
-			int			n = 0;
-			MemoryContext old = MemoryContextSwitchTo(ctx->attr_cxt);
-			double		startup_ms = OTEL_NI_STARTUP_MS(ni) / ni->nloops;
-			double		total_ms = OTEL_NI_TOTAL_MS(ni) / ni->nloops;
-			double		rows = ni->ntuples / ni->nloops;
+		attrs[n++] = OTEL_ATTR_STR(OTEL_ATTR_PG_PLAN_NODE_TYPE, tag_name);
+		attrs[n++] = OTEL_ATTR_F64(OTEL_ATTR_PG_PLAN_NODE_ACTUAL_STARTUP_MS, startup_ms);
+		attrs[n++] = OTEL_ATTR_F64(OTEL_ATTR_PG_PLAN_NODE_ACTUAL_TOTAL_MS, total_ms);
+		attrs[n++] = OTEL_ATTR_F64(OTEL_ATTR_PG_PLAN_NODE_ROWS, rows);
+		attrs[n++] = OTEL_ATTR_F64(OTEL_ATTR_PG_PLAN_NODE_LOOPS, ni->nloops);
+		attrs[n++] = OTEL_ATTR_I64(OTEL_ATTR_PG_PLAN_NODE_BUFFERS_READ,
+								  (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_read);
+		attrs[n++] = OTEL_ATTR_I64(OTEL_ATTR_PG_PLAN_NODE_BUFFERS_HIT,
+								  (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_hit);
+		attrs[n++] = OTEL_ATTR_I64(OTEL_ATTR_PG_PLAN_NODE_BUFFERS_DIRTIED,
+								  (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_dirtied);
 
-			/* Node type: string literal from nodetag_name(), no psprintf. */
-			attrs[n].key = "pg.plan.node.type";
-			attrs[n].value = tag_name;
-			n++;
-
-			attrs[n].key = "pg.plan.node.actual_startup_ms";
-			attrs[n].value = psprintf("%.3f", startup_ms); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			attrs[n].key = "pg.plan.node.actual_total_ms";
-			attrs[n].value = psprintf("%.3f", total_ms); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			attrs[n].key = "pg.plan.node.rows";
-			attrs[n].value = psprintf("%.0f", rows); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			attrs[n].key = "pg.plan.node.loops";
-			attrs[n].value = psprintf("%.0f", ni->nloops); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			attrs[n].key = "pg.plan.node.buffers_read";
-			attrs[n].value = psprintf(INT64_FORMAT, (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_read); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			attrs[n].key = "pg.plan.node.buffers_hit";
-			attrs[n].value = psprintf(INT64_FORMAT, (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_hit); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			attrs[n].key = "pg.plan.node.buffers_dirtied";
-			attrs[n].value = psprintf(INT64_FORMAT, (int64) OTEL_NI_BUFUSAGE(ni).shared_blks_dirtied); /* TODO(native-attr): emit as int64/double once the API grows typed attribute setters */
-			n++;
-
-			api->span_add_event(ctx->stmt_span, "pg.plan.node", 0, attrs, n);
-
-			MemoryContextSwitchTo(old);
-		}
+		otel_span_add_event(ctx->stmt_span, OTEL_ATTR_PG_PLAN_NODE_EVENT, 0, attrs, n);
 	}
 }
 
@@ -674,11 +646,9 @@ planpath_check_misestimate(void)
 static void
 planpath_end_walk_end(OtelPlanwalkContext *ctx)
 {
-	const OtelTracingApi *api;
 	MemoryContext old;
 
-	api = otel_api_get();
-	if (api == NULL || ctx->stmt_span == NULL)
+	if (!otel_span_recording(ctx->stmt_span))
 		return;
 
 	old = MemoryContextSwitchTo(ctx->attr_cxt);
@@ -690,111 +660,57 @@ planpath_end_walk_end(OtelPlanwalkContext *ctx)
 	/* Spill to disk */
 	if (accum.any_spill)
 	{
-		char	   *v;
-
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.spilled",
-									   "true"); /* TODO(native-attr): emit as bool once the API grows typed attribute setters */
-
-		v = psprintf(INT64_FORMAT, accum.spill_kb);
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.spill_kb",
-									   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
+		otel_span_set_bool(ctx->stmt_span, OTEL_ATTR_PG_EXEC_SPILLED, true);
+		otel_span_set_int(ctx->stmt_span, OTEL_ATTR_PG_EXEC_SPILL_KB, accum.spill_kb);
 	}
 
 	/* Parallel worker shortfall */
 	if (accum.have_shortfall)
 	{
-		char	   *vp;
-		char	   *vl;
-
-		vp = psprintf("%d", accum.shortfall_planned);
-		vl = psprintf("%d", accum.shortfall_launched);
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.parallel.workers_planned",
-									   vp); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.parallel.workers_launched",
-									   vl); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
+		otel_span_set_int(ctx->stmt_span, OTEL_PG_PARALLEL_WORKERS_PLANNED,
+						  accum.shortfall_planned);
+		otel_span_set_int(ctx->stmt_span, OTEL_PG_PARALLEL_WORKERS_LAUNCHED,
+						  accum.shortfall_launched);
 	}
 
 	/* Bad row estimate */
 	if (planpath_check_misestimate())
 	{
-		char	   *vr;
-
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.misestimate",
-									   "true"); /* TODO(native-attr): emit as bool once the API grows typed attribute setters */
-
-		vr = psprintf("%.1f", accum.worst_ratio);
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.misestimate_ratio",
-									   vr); /* TODO(native-attr): emit as double once the API grows typed attribute setters */
-
-		/* worst_node_tag is a string literal — no psprintf needed */
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.misestimate_node",
-									   accum.worst_node_tag);
+		otel_span_set_bool(ctx->stmt_span, OTEL_ATTR_PG_EXEC_MISESTIMATE, true);
+		otel_span_set_double(ctx->stmt_span, OTEL_ATTR_PG_EXEC_MISESTIMATE_RATIO,
+							 accum.worst_ratio);
+		otel_span_set_str(ctx->stmt_span, OTEL_ATTR_PG_EXEC_MISESTIMATE_NODE,
+						  accum.worst_node_tag);
 	}
 
 	/* Lossy bitmap pages */
 	if (accum.bitmap_lossy_pages > 0)
-	{
-		char	   *v;
-
-		v = psprintf(UINT64_FORMAT, accum.bitmap_lossy_pages);
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.bitmap_lossy_pages",
-									   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-	}
+		otel_span_set_int(ctx->stmt_span, OTEL_ATTR_PG_EXEC_BITMAP_LOSSY_PAGES,
+						  (int64) accum.bitmap_lossy_pages);
 
 	/* ----------------------------------------------------------------
 	 * Step 4: compact-actuals attributes
 	 * ---------------------------------------------------------------- */
 
-	/* Buffer usage */
 	if (accum.buffers_read > 0)
-	{
-		char	   *v = psprintf(INT64_FORMAT, accum.buffers_read);
-
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.buffers_read",
-									   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-	}
+		otel_span_set_int(ctx->stmt_span, OTEL_ATTR_PG_EXEC_BUFFERS_READ,
+						  accum.buffers_read);
 
 	if (accum.buffers_hit > 0)
-	{
-		char	   *v = psprintf(INT64_FORMAT, accum.buffers_hit);
-
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.buffers_hit",
-									   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-	}
+		otel_span_set_int(ctx->stmt_span, OTEL_ATTR_PG_EXEC_BUFFERS_HIT,
+						  accum.buffers_hit);
 
 	if (accum.buffers_dirtied > 0)
-	{
-		char	   *v = psprintf(INT64_FORMAT, accum.buffers_dirtied);
+		otel_span_set_int(ctx->stmt_span, OTEL_ATTR_PG_EXEC_BUFFERS_DIRTIED,
+						  accum.buffers_dirtied);
 
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.buffers_dirtied",
-									   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-	}
+	otel_span_set_int(ctx->stmt_span, OTEL_ATTR_PG_EXEC_NODE_COUNT,
+					  accum.node_count);
 
-	/* Node count */
-	{
-		char	   *v = psprintf("%d", accum.node_count);
-
-		api->span_add_attribute_string(ctx->stmt_span,
-									   "pg.exec.node_count",
-									   v); /* TODO(native-attr): emit as int64 once the API grows typed attribute setters */
-	}
-
-	/* Top-3 slowest nodes — pure string, no native-attr TODO needed */
+	/* Top-3 slowest nodes — kept as a comma-joined string. */
 	{
 		int			i;
 		bool		have_any = false;
-		char	   *buf = NULL;
 
 		for (i = 0; i < N_SLOWEST; i++)
 		{
@@ -818,10 +734,8 @@ planpath_end_walk_end(OtelPlanwalkContext *ctx)
 								 accum.slowest[i].tag,
 								 accum.slowest[i].total_ms);
 			}
-			buf = si.data;		/* allocated in attr_cxt already (via initStringInfo) */
-			api->span_add_attribute_string(ctx->stmt_span,
-										   "pg.exec.slowest_nodes",
-										   buf);
+			otel_span_set_str(ctx->stmt_span, OTEL_ATTR_PG_EXEC_SLOWEST_NODES,
+							  si.data);
 		}
 	}
 
