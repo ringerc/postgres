@@ -103,6 +103,33 @@ static OtelSpanRef		sdt_stack[SDT_STACK_SIZE];
 static int				sdt_top = 0;	/* next free slot; 0 == empty */
 
 /*
+ * Separate LIFO for in-flight pg.sort spans, kept OUT of sdt_stack[].
+ *
+ * sdt_stack[]'s DONE path matches a probe's END to its START purely by
+ * stack position (sdt_stack[--sdt_top]), trusting that every family nests
+ * LIFO with every other.  That holds for query/parse/rewrite/plan/execute/
+ * smgr/syncrep/lock_wait, whose START/DONE always fire within one call
+ * frame.  It does not hold for sort (see the PG_SDT_SORT_START case
+ * below): once pg.sort can still be open when later, unrelated probes on
+ * the SAME statement -- or whole later statements, across a cursor's
+ * FETCHes -- run their own complete START/DONE pairs, a generic DONE for
+ * one of THOSE would blindly pop whatever is on top of a shared stack,
+ * which can be the dangling pg.sort entry instead of its own matching
+ * START. That silently mis-ends the wrong span (not a crash, since both
+ * are valid handles, but wrong span boundaries) and then leaves the
+ * probe's own START dangling for some later, unrelated DONE to
+ * mis-pop in turn. Routing sort through its own stack keeps that
+ * cross-family corruption from happening; sort-vs-sort is still matched
+ * by position only (two concurrently open sorts, e.g. both sides of a
+ * merge join, are matched in whatever order their DONEs fire), the same
+ * "interleaved sorts" limitation documented at the top of this file --
+ * core's SORT_DONE probe carries no tuplesort identity to do better.
+ */
+#define SORT_STACK_SIZE	16
+static OtelSpanRef		sort_stack[SORT_STACK_SIZE];
+static int				sort_top = 0;
+
+/*
  * Common attribute stamped on every span this bridge emits (pg.txn,
  * pg.replica.apply, and every per-statement span: pg.query, pg.parse,
  * pg.rewrite, pg.plan, pg.execute, pg.sort, pg.smgr.read, pg.smgr.write,
@@ -411,6 +438,7 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	OtelSpanRef s;
 	const char *span_name;
 	bool		is_start;
+	bool		detached;
 
 	/*
 	 * No master enable gate here any more: pg_sdt_probe_enabled_mask gates
@@ -432,6 +460,7 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	/* ---- Classify the probe ---- */
 	is_start = false;
 	span_name = NULL;
+	detached = false;
 
 	switch ((PgSdtProbeId) id)
 	{
@@ -473,6 +502,21 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				txn_span = OTEL_SPAN_NONE;
 			}
 			sdt_top = 0;
+
+			/*
+			 * Unlike sdt_stack[], a nonzero sort_top here is not
+			 * necessarily stale bookkeeping for an already-finished span:
+			 * a WITH HOLD cursor's Sort node can still genuinely be open
+			 * (tuplesort_end() not yet called) across the commit that
+			 * makes it holdable.  Forgetting the index here does not end
+			 * the span -- unlike sdt_discard_open_spans(), this is a
+			 * counter reset, not a discard -- so a still-open one is left
+			 * alone to reach its own SORT_DONE, or otel_api's resource-
+			 * owner release, later; only the local bookkeeping slot is
+			 * reclaimed so a later sort in the next transaction does not
+			 * run off the end of sort_stack[].
+			 */
+			sort_top = 0;
 			return;
 		case PG_SDT_TRANSACTION_ABORT:
 			if (txn_span.v != 0)
@@ -530,10 +574,44 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			span_name = "pg.execute";
 			break;
 
-		/* --- Sort --- */
+		/* --- Sort ---
+		 *
+		 * Unlike every other START/DONE pair here, PG_SDT_SORT_START and
+		 * PG_SDT_SORT_DONE do not bracket one bounded operation: core fires
+		 * SORT_START from tuplesort_begin_*() (the Sort node's first
+		 * ExecProcNode call, i.e. lazily -- see nodeSort.c ExecSort()) and
+		 * SORT_DONE only from tuplesort_end() at node shutdown
+		 * (ExecEndSort()), which for a portal that is driven across more
+		 * than one top-level statement (a cursor's FETCH, an extended-
+		 * protocol Execute suspended by a row limit, a WITH HOLD cursor
+		 * fetched after COMMIT, ...) can be many statements -- and
+		 * therefore many otel_trace.c activate/deactivate cycles -- after
+		 * the START.  Pushed onto the active stack like an ordinary SDT
+		 * span, pg.sort would then still be sitting there when the
+		 * enclosing (possibly .detached, reactivated-per-FETCH) statement
+		 * span is deactivated or ended, tripping the producer's LIFO check
+		 * (WARNING, Assert in a cassert build -- see postgres-cdq.39).
+		 * Mark it .detached, exactly like pg.txn's own lifetime-crossing-
+		 * statements span: its parent is still resolved from the active
+		 * stack at START time (otel_span_start()'s default
+		 * OTEL_PARENT_ACTIVE, unaffected by .detached), but it is never
+		 * itself pushed, so whenever DONE eventually fires -- in the same
+		 * statement, a later one, or via resource-owner release on abort
+		 * -- otel_span_end() finds it off the stack and ends it with no
+		 * LIFO interaction at all. Trade-off: any span this bridge or a
+		 * consumer starts *while the sort is doing work that is not
+		 * surfaced as its own probe (e.g. smgr I/O during an external
+		 * merge) no longer automatically nests under pg.sort, since a
+		 * detached span is not an active-stack parent; it nests one level
+		 * up instead. Fixing that without this trade-off needs a core
+		 * probe that fires at the end of the actual sort work (tuplesort_
+		 * performsort()) rather than at node shutdown -- a core change,
+		 * not made here.
+		 */
 		case PG_SDT_SORT_START:
 			span_name = "pg.sort";
 			is_start = true;
+			detached = true;
 			break;
 		case PG_SDT_SORT_DONE:
 			span_name = "pg.sort";
@@ -648,12 +726,18 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		if (!otel_span_context_of(OTEL_SPAN_NONE, &ctx))
 			return;
 
-		if (sdt_top >= SDT_STACK_SIZE)
+		if ((PgSdtProbeId) id == PG_SDT_SORT_START)
+		{
+			if (sort_top >= SORT_STACK_SIZE)
+				return;			/* stack full; drop this probe */
+		}
+		else if (sdt_top >= SDT_STACK_SIZE)
 			return;				/* stack full; drop this probe */
 
 		s = otel_span_start(.tracer = &otel_pg_tracer,
 							.name = span_name,
-							.kind = OTEL_SPAN_KIND_INTERNAL);
+							.kind = OTEL_SPAN_KIND_INTERNAL,
+							.detached = detached);
 		otel_span_set_str(s, OTEL_PG_SPAN_SOURCE, SDT_SPAN_SOURCE_ATTR_VAL);
 
 		/*
@@ -747,7 +831,10 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			}
 		}
 
-		sdt_stack[sdt_top++] = s;
+		if ((PgSdtProbeId) id == PG_SDT_SORT_START)
+			sort_stack[sort_top++] = s;
+		else
+			sdt_stack[sdt_top++] = s;
 
 		/*
 		 * Associate the per-statement query trace with the
@@ -772,39 +859,60 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	}
 
 	/* ---- DONE path ---- */
-	if (sdt_top <= 0)
-		return;					/* no matching START on our stack */
-
-	s = sdt_stack[--sdt_top];
+	if ((PgSdtProbeId) id == PG_SDT_SORT_DONE)
+	{
+		if (sort_top <= 0)
+			return;				/* no matching START on our stack */
+		s = sort_stack[--sort_top];
+	}
+	else
+	{
+		if (sdt_top <= 0)
+			return;				/* no matching START on our stack */
+		s = sdt_stack[--sdt_top];
+	}
 
 	/*
 	 * SDT start/done pairs are LIFO in the common case so our span is the
-	 * top; for the few that are not strictly nested (interleaved sorts, or
-	 * a utility statement such as CREATE TABLE AS that runs an executor
-	 * underneath) otel_api unwinds the entries above ours, each exported
-	 * with ERROR status (plus a benign WARNING).  The out-of-order
-	 * sibling bridge span(s) are exported that way and the lower
-	 * statement span from otel_trace.c is undisturbed.  The trace stays
-	 * coherent.
+	 * top of its stack; for the few that are not strictly nested relative
+	 * to EACH OTHER (two sorts open at once, e.g. both sides of a merge
+	 * join -- see the sort_stack[] comment above) otel_api unwinds the
+	 * producer-stack entries above ours, each exported with ERROR status
+	 * (plus a benign WARNING).  The out-of-order sibling bridge span(s)
+	 * are exported that way and the lower statement span from otel_trace.c
+	 * is undisturbed.  The trace stays coherent.  pg.sort itself is
+	 * .detached (see PG_SDT_SORT_START above), so this otel_span_end() has
+	 * no producer-stack interaction to unwind at all when it fires.
 	 */
 	otel_span_end(s);
 }
 
 
 /*
- * Discard the per-statement spans still open on our stack.  On abort their
- * DONE probes never fire.  pg.query starts before the statement's
+ * Discard the per-statement spans still open on our stacks.  On abort
+ * their DONE probes never fire.  pg.query starts before the statement's
  * transaction, with no resource owner, so it is a session span that
  * otel_api would otherwise keep on its active stack, and every later span
  * in the backend would be parented under it.  They have no resource
  * owner to unwind them on abort, so this bridge discards them itself,
  * explicitly, rather than exporting them with ERROR status.
+ *
+ * pg.sort (sort_stack[]) does have a resource owner (unlike pg.query, it
+ * never starts before one exists) and, being .detached, was never on the
+ * producer's active stack in the first place -- otel_api's own owner
+ * release would unwind it on its own.  otel_span_discard() forgets the
+ * owner registration before releasing the slot either way, so discarding
+ * it here too is just as safe and keeps this function's job the same for
+ * both stacks: whatever this bridge still thinks is open, it no longer
+ * is.
  */
 static void
 sdt_discard_open_spans(void)
 {
 	while (sdt_top > 0)
 		otel_span_discard(sdt_stack[--sdt_top]);
+	while (sort_top > 0)
+		otel_span_discard(sort_stack[--sort_top]);
 }
 
 /* -----------------------------------------------------------------------
