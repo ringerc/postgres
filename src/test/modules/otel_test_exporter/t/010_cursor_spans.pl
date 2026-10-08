@@ -391,4 +391,135 @@ note("debug_assertions = $cassert");
 	}
 }
 
+# ----------------------------------------------------------------------
+# Scenario 8 (postgres-cdq.39): a Sort node whose plan is driven across
+# more than one top-level statement -- a cursor's FETCH, here -- used to
+# crash a cassert backend / WARN on a non-assert one.
+#
+# Root cause: core fires PG_SDT_SORT_START lazily, from the Sort node's
+# first ExecProcNode call (nodeSort.c ExecSort(), via
+# tuplesort_begin_heap()) -- which, for a cursor, is the FIRST FETCH, not
+# DECLARE. PG_SDT_SORT_DONE only fires from tuplesort_end() at node
+# shutdown (ExecEndSort()), which for a cursor is CLOSE (or the implicit
+# ExecutorEnd a WITH HOLD cursor's PersistHoldablePortal() runs at
+# COMMIT) -- many statements, and many otel_trace.c
+# activate()/deactivate() cycles around the cursor's own detached
+# "pgsql.execute" span, after the START. Pushed onto the producer's
+# active stack like every other SDT span, pg.sort would still be sitting
+# there when the first FETCH's otel_span_deactivate() tried to pop the
+# cursor span out from under it: "ended with spans still open above it"
+# (Assert(false) in a cassert build).
+#
+# Fixed in two parts (otel_sdt_bridge.c): pg.sort is now .detached (like
+# pg.txn), so it is never on the producer's active stack for a
+# deactivate/end elsewhere to trip over; and it is tracked in its own
+# sort_stack[], separate from the shared sdt_stack[] used for every
+# other probe family, so a later, unrelated probe's DONE (e.g. the next
+# FETCH's own pg.query) can no longer blindly pop the still-open pg.sort
+# entry instead of its own matching START.
+#
+# This is also the minimal, non-postgres_fdw repro for the bug found via
+# contrib/postgres_fdw/t/002_otel_spans.pl (a foreign scan with ORDER BY
+# pushed down to a remote with no index, fetched via DECLARE CURSOR +
+# FETCH): no FDW is involved, just a plain SQL cursor over a Sort.
+# ----------------------------------------------------------------------
+
+{
+	$node->safe_psql(
+		'postgres', q{
+			CREATE TABLE sort_cursor_src AS
+				SELECT i, (i * 7919) % 997 AS k FROM generate_series(1, 500) i;
+		});
+
+	my $log_start = -s $node->logfile;
+	my $out = $node->safe_psql(
+		'postgres', q{
+			SET otel.trace_all_queries = on;
+			SET otel.trace_sdt_probes = 'query,sort';
+			SELECT test_otel_clear();
+			BEGIN;
+			DECLARE s CURSOR FOR SELECT i, k FROM sort_cursor_src ORDER BY k;
+			FETCH 10 FROM s;
+			FETCH 10 FROM s;
+			FETCH 10 FROM s;
+			CLOSE s;
+			COMMIT;
+			SELECT test_otel_pop_span() FROM generate_series(1, 60);
+		});
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
+	unlike(
+		$log,
+		qr/otel_api: span .* still open above it/,
+		'postgres-cdq.39: a Sort node crossing a cursor FETCH boundary: no non-LIFO WARNING'
+	);
+	unlike($log, qr/TRAP:|Assert/,
+		'postgres-cdq.39: ...and no crash (cassert build)');
+
+	# The postmaster, and other backends, are unaffected (this is the
+	# strongest evidence on a non-assert build, where the bug otherwise
+	# manifests as only a WARNING plus a dropped sibling span, not a
+	# crash).
+	is($node->safe_psql('postgres', 'SELECT 1'), '1',
+		'postgres-cdq.39: the postmaster is healthy afterwards');
+
+	my ($cursor_span) = grep {
+		/name=pgsql\.execute\n/ && /db\.query\.text=DECLARE s CURSOR/
+	} split /(?=scope\.name=)/, $out;
+	ok(defined $cursor_span,
+		'postgres-cdq.39: found the cursor\'s own span (pgsql.execute, not the '
+		  . 'DECLARE CURSOR utility span) in the ring');
+
+	my ($sort_span) = grep { /name=pg\.sort\n/ } split /(?=scope\.name=)/,
+	  $out;
+	ok(defined $sort_span, 'postgres-cdq.39: found the pg.sort span in the ring');
+
+	like($sort_span, qr/status=0\n/,
+		'postgres-cdq.39: pg.sort ends normally (UNSET), not unwound with ERROR'
+	) if defined $sort_span;
+
+	SKIP:
+	{
+		skip 'spans not found', 1 unless $cursor_span && $sort_span;
+		my ($cursor_id) = $cursor_span =~ /span_id=([0-9a-f]+)/;
+		my ($sort_parent) = $sort_span =~ /parent_span_id=([0-9a-f]+)/;
+		is($sort_parent, $cursor_id,
+			'postgres-cdq.39: pg.sort correctly nests under the cursor\'s own span, '
+			  . 'not some later/unrelated span');
+	}
+}
+
+# ----------------------------------------------------------------------
+# Scenario 9 (postgres-cdq.39): the same Sort-across-FETCH crash, but for
+# a WITH HOLD cursor whose Sort node is still open (tuplesort_end() not
+# yet called) when COMMIT runs PersistHoldablePortal() -- the related
+# case flagged in the bug report alongside the plain-cursor one above.
+# ----------------------------------------------------------------------
+
+{
+	my $log_start = -s $node->logfile;
+	my ($ret, $stdout, $stderr) = $node->psql(
+		'postgres', q{
+			SET otel.trace_all_queries = on;
+			SET otel.trace_sdt_probes = 'query,sort';
+			BEGIN;
+			DECLARE h CURSOR WITH HOLD FOR
+				SELECT i, k FROM sort_cursor_src ORDER BY k;
+			FETCH 10 FROM h;
+			COMMIT;
+			FETCH 10 FROM h;
+			CLOSE h;
+		},
+		on_error_stop => 0);
+	is($ret, 0,
+		'postgres-cdq.39: WITH HOLD cursor over a Sort, fetched across COMMIT, succeeds'
+	);
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
+	unlike(
+		$log,
+		qr/otel_api: span .* still open above it/,
+		'postgres-cdq.39: WITH HOLD cursor over a Sort: no non-LIFO WARNING');
+	unlike($log, qr/TRAP:|Assert/,
+		'postgres-cdq.39: WITH HOLD cursor over a Sort: no crash');
+}
+
 done_testing();
