@@ -1,17 +1,15 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
-# Walks the sampler-hook invocation policy matrix exposed by
-# contrib/otel's v2 OtelTracingApi.set_sampler_policy.  For each
-# (policy, wire-bit, sampler-decision) triple, sends a single
-# query with a chosen traceparent flag and asserts the captured
-# span count matches contrib/otel's documented behaviour.
-#
-# The control surface comes from this test exporter:
-#   * SQL fn  test_otel_set_policy('hook_on_unsampled_bit' | ...)
-#     plumbs through to api->set_sampler_policy.
-#   * GUC test_otel_exporter.sampler_decision (drop | record_only |
-#     record_and_sample) controls what our sampler hook returns
-#     when contrib/otel decides to call it.
+# Smoke test: otel_api owns the sampler policy (otel_api.sampler /
+# otel_api.sampler_arg, postgres-cdq.18) rather than an exporter hook.
+# For each (sampler, wire-bit) pair, sends a single query with a
+# chosen traceparent flag over the 'M' header (a remote parent) and
+# asserts the captured span count matches the documented behaviour.
+# The exhaustive new-root / remote-sampled / remote-unsampled /
+# traceidratio matrix lives in tests/otel_api_conformance (it can
+# fabricate exact trace IDs and parent kinds over plain SQL); this
+# file only confirms the two GUCs actually reach a real exporter
+# through a real 'M' header.
 #
 # The captured-span count comes from the existing
 # test_otel_span_count() introspection.
@@ -153,23 +151,20 @@ drain_to_rfq($sock);
 #
 # Each cell:
 #   1. test_otel_clear()  -- empty the per-backend ring
-#   2. SET test_otel_exporter.sampler_decision -- what hook returns
-#   3. test_otel_set_policy(...)  -- which policy gates apply
-#   4. 'M' header with otel.traceparent carrying the chosen flag
-#   5. SELECT 1
-#   6. read test_otel_span_count()
+#   2. SET otel_api.sampler (+ otel_api.sampler_arg for the ratio ones)
+#   3. 'M' header with otel.traceparent carrying the chosen flag
+#   4. SELECT 1
+#   5. read test_otel_span_count()
 #
-# All on the same backend so per-session GUC + policy state holds.
+# All on the same backend so per-session GUC state holds.
 
 sub run_cell
 {
-	my ($label, $policy, $decision, $flag, $expected) = @_;
+	my ($label, $sampler, $arg, $flag, $expected) = @_;
 
 	run_query($sock, 'SELECT test_otel_clear()');
-	run_query($sock,
-		"SET test_otel_exporter.sampler_decision = '$decision'");
-	run_query($sock,
-		"SELECT test_otel_set_policy('$policy')");
+	run_query($sock, "SET otel_api.sampler = '$sampler'");
+	run_query($sock, "SET otel_api.sampler_arg = $arg");
 
 	my $tp = "00-$TRACE_ID-$SPAN_ID-$flag";
 	send_msg($sock, 'M', headers_body('otel.traceparent' => $tp));
@@ -182,60 +177,35 @@ sub run_cell
 }
 
 # ----------------------------------------------------------------------
-# The matrix.  Mirrors TESTING.md in the rust-demo repo; each row
-# encodes (policy, wire-bit, sampler-decision) -> expected span count.
-#
-# Wire bit '01' means sampled=1; '00' means unsampled.  The
-# test_otel_exporter sampler hook returns the configured decision
-# whenever contrib/otel chooses to call it under the active policy.
+# otel_api.sampler x remote-parent wire bit.  Wire bit '01' means
+# sampled=1; '00' means unsampled.  sampler_arg is irrelevant except
+# for the traceidratio rows.
 # ----------------------------------------------------------------------
 
-# Wire bit = 1 (sampled)
-run_cell(
-	'wire=1, hook_on_unsampled_bit, decision=drop: W3C wins (gate 4 short-circuits)',
-	'hook_on_unsampled_bit', 'drop', '01', 1);
-run_cell(
-	'wire=1, hook_always, decision=drop: sampler overrides W3C, span dropped',
-	'hook_always', 'drop', '01', 0);
-run_cell(
-	'wire=1, hook_always, decision=record_and_sample: sampler agrees with W3C',
-	'hook_always', 'record_and_sample', '01', 1);
-run_cell(
-	'wire=1, never_respect_bit, decision=drop: hook ignored, bit wins',
-	'never_respect_bit', 'drop', '01', 1);
+# Wire bit = 1 (sampled remote parent)
+run_cell('wire=1, always_on: recorded', 'always_on', 1.0, '01', 1);
+run_cell('wire=1, always_off: ignores the remote bit, dropped',
+	'always_off', 1.0, '01', 0);
+run_cell('wire=1, parentbased_always_on: follows the remote bit',
+	'parentbased_always_on', 1.0, '01', 1);
+run_cell('wire=1, parentbased_always_off: still follows the remote bit',
+	'parentbased_always_off', 1.0, '01', 1);
 
-# Wire bit = 0 (unsampled)
-run_cell(
-	'wire=0, hook_on_unsampled_bit, decision=drop: SDK ParentBased default',
-	'hook_on_unsampled_bit', 'drop', '00', 0);
-run_cell(
-	'wire=0, hook_on_unsampled_bit, decision=record_and_sample: hook promotes',
-	'hook_on_unsampled_bit', 'record_and_sample', '00', 1);
-run_cell(
-	'wire=0, hook_always, decision=record_and_sample: hook called, records',
-	'hook_always', 'record_and_sample', '00', 1);
-run_cell(
-	'wire=0, never_respect_bit, decision=record_and_sample: hook ignored, bit wins (drop)',
-	'never_respect_bit', 'record_and_sample', '00', 0);
-run_cell(
-	'wire=0, never_always_sample, decision=drop: hook ignored, force record',
-	'never_always_sample', 'drop', '00', 1);
-run_cell(
-	'wire=0, never_always_sample, decision=record_and_sample: hook ignored, force record',
-	'never_always_sample', 'record_and_sample', '00', 1);
+# Wire bit = 0 (unsampled remote parent)
+run_cell('wire=0, always_on: ignores the remote bit, recorded',
+	'always_on', 1.0, '00', 1);
+run_cell('wire=0, always_off: dropped', 'always_off', 1.0, '00', 0);
+run_cell('wire=0, parentbased_always_on: follows the remote bit, dropped',
+	'parentbased_always_on', 1.0, '00', 0);
+run_cell('wire=0, parentbased_always_off: follows the remote bit, dropped',
+	'parentbased_always_off', 1.0, '00', 0);
 
-# ----------------------------------------------------------------------
-# RECORD_ONLY: contrib/otel records the span, but the sampler tells
-# downstream "this is not part of a globally-sampled trace."  The
-# captured-span count from test_otel_span_count goes up just like
-# RECORD_AND_SAMPLE because the test exporter doesn't distinguish.
-# Worth a test anyway to prove the decision is plumbed through
-# without contrib/otel re-mapping it to DROP.
-# ----------------------------------------------------------------------
-
-run_cell(
-	'wire=0, hook_on_unsampled_bit, decision=record_only: still recorded',
-	'hook_on_unsampled_bit', 'record_only', '00', 1);
+# traceidratio: ignores the remote bit entirely; ratio=1.0 always
+# samples, ratio=0.0 never does, regardless of the wire bit.
+run_cell('traceidratio ratio=1.0, wire=0: always samples',
+	'traceidratio', 1.0, '00', 1);
+run_cell('traceidratio ratio=0.0, wire=1: never samples',
+	'traceidratio', 0.0, '01', 0);
 
 # ----------------------------------------------------------------------
 # Tidy up.

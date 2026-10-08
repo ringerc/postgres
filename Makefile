@@ -27,10 +27,13 @@ TAP_TESTS = 1
 REGRESS =
 ISOLATION =
 
-# <otel_api/otel.h> --- same in-tree vs PGXS paths as the consumers.
+# <otel_api/otel.h> resolves from the otel_api SOURCE tree (this
+# module's sibling directory, two levels up: tests/otel_test_exporter
+# -> tests -> postgres_otel_api), not any installed copy.  $(srcdir)
+# is set correctly under VPATH by pgxs.mk.
 ifdef USE_PGXS
 PG_CONFIG = pg_config
-PG_CPPFLAGS = -I$(shell $(PG_CONFIG) --includedir-server)/extension
+PG_CPPFLAGS = -I$(srcdir)/../..
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else

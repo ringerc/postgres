@@ -12,7 +12,10 @@ endif
 
 test_otel_exporter = shared_module('test_otel_exporter',
   test_otel_exporter_sources,
-  c_args: ['-I' + meson.project_source_root() / 'contrib'],
+  # <otel_api/otel.h> resolves from the otel_api SOURCE tree (this
+  # module's ancestor two levels up: tests/otel_test_exporter ->
+  # tests -> postgres_otel_api), not any installed copy.
+  c_args: ['-I' + meson.current_source_dir() / '../..'],
   kwargs: pg_test_mod_args,
 )
 test_install_libs += test_otel_exporter

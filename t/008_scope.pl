@@ -21,6 +21,9 @@ $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
+# The producer-API span starts a new trace; new traces go to the sampler
+# hook, which drops by default in this exporter.
+test_otel_exporter.sampler_decision = record_and_sample
 EOCONF
 $node->start;
 $node->safe_psql('postgres',
@@ -41,7 +44,7 @@ my $exec_span = $node->safe_psql('postgres', qq{
 	SELECT test_otel_pop_span();
 });
 
-like($exec_span, qr/^scope\.name=contrib\/otel_postgres_tracing$/m,
+like($exec_span, qr/^scope\.name=otel_postgres_tracing$/m,
 	'executor span: scope.name identifies the trace module');
 like($exec_span, qr/^scope\.version=\d/m,
 	'executor span: scope.version is populated (PG_VERSION)');
