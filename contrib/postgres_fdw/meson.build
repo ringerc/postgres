@@ -16,9 +16,16 @@ endif
 
 postgres_fdw = shared_module('postgres_fdw',
   postgres_fdw_sources,
-  # No HAVE_OTEL_API here: postgres_fdw.c falls back to the vendored
-  # otel_producer_stub.h in this directory, so no otel_api include path
-  # is needed for the in-tree build.
+  # The in-tree build defines HAVE_OTEL_API unconditionally: contrib/otel_api
+  # is always present in-tree, so postgres_fdw.c uses the real
+  # otel_api/otel_producer.h instead of falling back to the vendored
+  # no-op otel_producer_stub.h.  <otel_api/otel_producer.h> resolves from
+  # the otel_api SOURCE tree (this module's sibling directory under
+  # contrib/), same as contrib/otel_postgres_tracing.  All functions used
+  # from it are "static inline" (no extern symbols), so no link
+  # dependency on otel_api is needed here, only the include path.
+  # Out-of-tree PGXS builds keep HAVE_OTEL_API opt-in (see the Makefile).
+  c_args: ['-DHAVE_OTEL_API', '-I' + meson.current_source_dir() / '..'],
   kwargs: contrib_mod_args + {
     'dependencies': contrib_mod_args['dependencies'] + [libpq],
   },
@@ -54,6 +61,7 @@ tests += {
   'tap': {
     'tests': [
       't/001_auth_scram.pl',
+      't/002_otel_spans.pl',
       't/010_subscription.pl',
     ],
   },
