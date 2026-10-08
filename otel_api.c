@@ -1,71 +1,51 @@
 /*-------------------------------------------------------------------------
  *
  * otel_api.c
- *	  Extension API surface for contrib/otel.
+ *	  The published API tables, hook registration and sampling policy.
  *
- * Out-of-tree exporter / SDK modules consume contrib/otel via the
- * OtelTracingApi struct, looked up at _PG_init time through the
- * rendezvous variable named OTEL_TRACING_API_RENDEZVOUS_NAME.  See
- * the public API documentation in otel.h.
- *
- * This translation unit owns:
- *	  * the storage for the registered hooks
- *		(otel_span_emit_hook, otel_sampler_hook);
- *	  * the api_register_* functions plumbed through the
- *		OtelTracingApi struct;
- *	  * the OtelTracingApi singleton and its publication into the
- *		rendezvous slot.
- *
- * Internal getters (otel_get_*) are exposed via otel_internal.h so
- * otel_trace.c can read the currently-registered hooks on the hot
- * path without taking a direct symbol dependency on this file's
- * static state.
- *
+ * otel_api publishes one root table (OtelApi) through a rendezvous
+ * variable, pointing to one table per audience.  The producer table
+ * lives in otel_producer.c with the span machinery; the exporter and
+ * internal tables are here.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
- * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  contrib/otel/otel_api.c
+ *	  otel_api/otel_api.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "fmgr.h"
 
-#include "otel.h"
-#include "otel_api.h"
 #include "otel_internal.h"
+
 #ifdef PG_HAVE_XACT_TRACE_CONTEXT
 #include "access/xact.h"
 #endif
 
-/*
- * Internal storage for the registered hooks.  External modules do
- * NOT touch these directly; they call through the OtelTracingApi
- * function pointers.  file-static --- these are not part of the
- * contrib/otel ABI.
- */
 static otel_span_emit_hook_type otel_span_emit_hook = NULL;
-static otel_sampler_hook_type	otel_sampler_hook = NULL;
 
 /*
- * Sampler-hook invocation policy.  Default is OTel-SDK-ParentBased
- * compliant: call the hook only when the propagated W3C sampled bit
- * is unset.  Exporters that want different semantics override via
- * api->set_sampler_policy.  See OtelSamplerHookPolicy in otel.h for
- * the four allowed values + their rationale.
+ * True when a finished span has somewhere to go: an emit hook, or log
+ * emission --- and otel_api.sampler isn't always_off, folded in on
+ * purpose as a full off switch.  See README "Sampling".  Producers
+ * read it inline through the producer table, so the untraced case
+ * costs no call per span.
  */
-static OtelSamplerHookPolicy otel_sampler_hook_policy =
-	OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT;
+bool		otel_recording_possible_flag = false;
 
+void
+otel_update_recording_possible(void)
+{
+	otel_recording_possible_flag = (otel_span_emit_hook != NULL ||
+									otel_emit_spans_to_log) &&
+		otel_sampler_mode != OTEL_SAMPLER_ALWAYS_OFF;
+}
 
-/*
- * Registration functions exposed via OtelTracingApi.  They record
- * the previously-registered hook into *prev_out (if non-NULL) and
- * install the new one.  Not thread-safe; documented as _PG_init only.
- */
 static void
 api_register_emit_hook(otel_span_emit_hook_type new_hook,
 					   otel_span_emit_hook_type *prev_out)
@@ -73,285 +53,8 @@ api_register_emit_hook(otel_span_emit_hook_type new_hook,
 	if (prev_out)
 		*prev_out = otel_span_emit_hook;
 	otel_span_emit_hook = new_hook;
+	otel_update_recording_possible();
 }
-
-static void
-api_register_sampler_hook(otel_sampler_hook_type new_hook,
-						  otel_sampler_hook_type *prev_out)
-{
-	if (prev_out)
-		*prev_out = otel_sampler_hook;
-	otel_sampler_hook = new_hook;
-}
-
-static void
-api_set_sampler_policy(OtelSamplerHookPolicy policy)
-{
-	otel_sampler_hook_policy = policy;
-}
-
-
-/* ----------------------------------------------------------------
- * Phase 4 helpers --- expose the bits the split-out query-tracing
- * module needs to reach back into contrib/otel.  All thin wrappers
- * around existing internal state / functions.
- * ----------------------------------------------------------------
- */
-
-static void
-api_get_root_context_snapshot(OtelRootContextSnapshot *out)
-{
-	if (out == NULL)
-		return;
-
-	out->is_set = otel_ctx.is_set;
-	out->sampled_flag_set = otel_ctx.sampled_flag_set;
-	out->from_comment = otel_ctx_from_comment;
-	memcpy(out->trace_id, otel_ctx.trace_id, sizeof(out->trace_id));
-	memcpy(out->span_id, otel_ctx.span_id, sizeof(out->span_id));
-	memcpy(out->trace_flags, otel_ctx.trace_flags, sizeof(out->trace_flags));
-	out->tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
-		? otel_tracestate_guc : NULL;
-}
-
-static void
-api_reset_root_context(void)
-{
-	otel_ctx_reset();
-	otel_ctx_from_comment = false;
-}
-
-static bool
-api_try_apply_sqlcommenter_context(const char *sql)
-{
-	/* Gated by the otel_api.parse_sqlcommenter GUC.  Returning false
-	 * without parsing matches the behaviour of "no comment
-	 * contained a traceparent" --- the caller can safely treat both
-	 * cases identically. */
-	if (!otel_parse_sqlcommenter)
-		return false;
-	return try_apply_sqlcommenter_context(sql);
-}
-
-/*
- * Apply the registered sampler hook + the configured invocation
- * policy and return a decision.  Caller has already done the
- * "any consumer present?" + "trace_all_queries?" gates --- this
- * function is invoked only when those gates passed.
- */
-static OtelSamplerDecision
-api_compute_sampler_decision(const OtelSamplerInput *in, bool sampled_flag_set)
-{
-	otel_sampler_hook_type sampler_hook = otel_sampler_hook;
-	OtelSamplerHookPolicy policy = otel_sampler_hook_policy;
-
-	switch (policy)
-	{
-		case OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE:
-			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-
-		case OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT:
-			return sampled_flag_set
-				? OTEL_SAMPLE_RECORD_AND_SAMPLE
-				: OTEL_SAMPLE_DROP;
-
-		case OTEL_SAMPLER_HOOK_ALWAYS:
-			if (sampler_hook == NULL)
-				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-			break;					/* fall through to the hook call */
-
-		case OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT:
-		default:
-			if (sampled_flag_set)
-				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-			if (sampler_hook == NULL)
-				return OTEL_SAMPLE_DROP;
-			break;					/* fall through to the hook call */
-	}
-
-	/* Hook-call path. */
-	return sampler_hook(in);
-}
-
-static bool
-api_any_emit_consumer_present(void)
-{
-	return otel_span_emit_hook != NULL || otel_emit_spans_to_log;
-}
-
-#ifdef PG_HAVE_XACT_TRACE_CONTEXT
-
-/*
- * Decode exactly two hex characters at src into a byte.  Both uppercase
- * (A-F) and lowercase (a-f) digits are accepted.
- */
-static inline uint8
-hex2byte(const char *src)
-{
-	uint8		hi,
-				lo;
-
-	hi = src[0] <= '9' ? src[0] - '0' : (src[0] | 0x20) - 'a' + 10;
-	lo = src[1] <= '9' ? src[1] - '0' : (src[1] | 0x20) - 'a' + 10;
-	return (hi << 4) | lo;
-}
-
-/*
- * commit_trace_context_hook callback: fills *tc from the current root
- * context and returns true iff a sampled context is active.  Called
- * from XactLogCommitRecord() before the WAL record is built; core
- * never interprets the bytes --- it just appends them if we return true.
- */
-static bool
-otel_commit_trace_context_cb(xl_xact_trace_context *tc)
-{
-	int			i;
-
-	if (!otel_ctx.is_set || !otel_ctx.sampled_flag_set)
-		return false;
-
-	/* Decode 32 hex chars -> 16 bytes for trace_id */
-	for (i = 0; i < 16; i++)
-		tc->trace_id[i] = hex2byte(otel_ctx.trace_id + i * 2);
-
-	/* Decode 16 hex chars -> 8 bytes for span_id */
-	for (i = 0; i < 8; i++)
-		tc->span_id[i] = hex2byte(otel_ctx.span_id + i * 2);
-
-	/* Decode 2 hex chars -> 1 byte for trace_flags */
-	tc->trace_flags = hex2byte(otel_ctx.trace_flags);
-
-	memset(tc->pad, 0, sizeof(tc->pad));
-	return true;
-}
-
-#endif							/* PG_HAVE_XACT_TRACE_CONTEXT */
-
-/*
- * The api table installed into the rendezvous slot.  Static storage
- * duration means it lives forever and external consumers can cache
- * the pointer.
- */
-static const OtelTracingApi otel_tracing_api = {
-	.version = OTEL_TRACING_API_VERSION,
-	.struct_size = sizeof(OtelTracingApi),
-	.register_emit_hook = api_register_emit_hook,
-	.register_sampler_hook = api_register_sampler_hook,
-	.set_sampler_policy = api_set_sampler_policy,
-
-	/* Producer-side API; implementations live in otel_producer.c. */
-	.span_link_to_active_and_push = otel_producer_span_link_to_active_and_push,
-	.span_set_parent_explicit = otel_producer_span_set_parent_explicit,
-	.span_current_context = otel_producer_span_current_context,
-	.span_root_context = otel_producer_span_root_context,
-	.span_stack_depth = otel_producer_span_stack_depth,
-	.span_emit = otel_producer_span_emit,
-
-	/* Producer-side convenience helpers, routed through the
-	 * rendezvous-struct so they remain reachable across the
-	 * cross-extension symbol-resolution boundary. */
-	.span_init = otel_span_init,
-	.span_add_attribute_string = otel_span_add_attribute_string,
-	.span_add_attribute_string_to_active = otel_producer_span_add_attribute_string_to_active,
-
-	/* Generic span-event API (MINOR 3). */
-	.span_add_event = otel_producer_span_add_event,
-	.span_add_event_to_active = otel_producer_span_add_event_to_active,
-
-	/* Explicit-parent-and-push constructors + SpanContext extractor (MINOR 4). */
-	.span_link_to_ctx_and_push = otel_producer_span_link_to_ctx_and_push,
-	.span_link_to_span_and_push = otel_producer_span_link_to_span_and_push,
-	.span_context_of = otel_producer_span_context_of,
-
-	/* Phase 4: surface needed by the split-out query-tracing
-	 * module. */
-	.span_push = otel_producer_span_push,
-	.parallel_publish_leader_context = otel_parallel_publish_leader_context,
-	.parallel_clear_leader_context = otel_parallel_clear_leader_context,
-	.parallel_get_leader_context = otel_parallel_get_leader_context,
-	.get_root_context_snapshot = api_get_root_context_snapshot,
-	.reset_root_context = api_reset_root_context,
-	.try_apply_sqlcommenter_context = api_try_apply_sqlcommenter_context,
-	.compute_sampler_decision = api_compute_sampler_decision,
-	.any_emit_consumer_present = api_any_emit_consumer_present,
-
-	/* Resource attributes for the postmaster process + per-producer
-	 * InstrumentationScope registration. */
-	.get_resource_attributes = otel_resource_attrs_get,
-	.tracer_register = otel_tracer_register,
-
-	/* Late-add resource attribute (MINOR 5). */
-	.resource_add = otel_resource_add,
-};
-
-
-/*
- * Publish the OtelTracingApi via a rendezvous variable so that
- * out-of-tree exporter / SDK modules can register callbacks without
- * taking a direct symbol-level link dependency on contrib/otel.
- * Called once from _PG_init.
- *
- * After publishing the main slot, drain the pending-registration list
- * (OTEL_TRACING_API_PENDING_NAME) accumulated by exporters and
- * producers that loaded before us.  This handles the
- * "exporter first, provider second" ordering without requiring any
- * particular position in shared_preload_libraries.
- */
-void
-otel_api_publish_rendezvous(void)
-{
-	void	  **slot;
-	void	  **pending_slot;
-	OtelPendingRegistration *req;
-
-	slot = find_rendezvous_variable(OTEL_TRACING_API_RENDEZVOUS_NAME);
-	Assert(slot != NULL);		/* HASH_ENTER ereports on OOM, never returns NULL */
-	*slot = (void *) &otel_tracing_api;
-
-	/*
-	 * Drain the pending list.  Each node was pushed by an exporter or
-	 * producer whose _PG_init ran before ours.  Process in push order
-	 * (which is LIFO from the list head): this matches the "last
-	 * registered wins" semantic already established by the hook chain.
-	 */
-	pending_slot = find_rendezvous_variable(OTEL_TRACING_API_PENDING_NAME);
-	Assert(pending_slot != NULL);
-	req = (OtelPendingRegistration *) *pending_slot;
-	/* Clear the slot so any late-loading modules that check it see NULL. */
-	*pending_slot = NULL;
-
-	while (req != NULL)
-	{
-		OtelPendingRegistration *next = req->next;
-
-		if (req->emit_hook)
-			otel_tracing_api.register_emit_hook(req->emit_hook,
-												req->emit_prev_out);
-		if (req->sampler_hook)
-			otel_tracing_api.register_sampler_hook(req->sampler_hook,
-												   req->sampler_prev_out);
-		if (req->tracer_name)
-		{
-			const OtelInstrumentationScope *scope =
-				otel_tracing_api.tracer_register(req->tracer_name,
-												 req->tracer_version,
-												 req->tracer_schema_url);
-
-			if (req->tracer_out)
-				*req->tracer_out = scope;
-		}
-
-		req = next;
-	}
-
-#ifdef PG_HAVE_XACT_TRACE_CONTEXT
-	/* Register the commit trace-context hook. */
-	commit_trace_context_hook = otel_commit_trace_context_cb;
-#endif
-}
-
-
-/* ---- Internal getters used by otel_trace.c -------------------- */
 
 otel_span_emit_hook_type
 otel_get_span_emit_hook(void)
@@ -359,14 +62,166 @@ otel_get_span_emit_hook(void)
 	return otel_span_emit_hook;
 }
 
-otel_sampler_hook_type
-otel_get_sampler_hook(void)
+/*
+ * OTel consistent probability sampling (W3C Trace Context level 2):
+ * randomness R is the trace ID's low 56 bits (the last 7 bytes, taken
+ * as a big-endian uint56); the rejection threshold T is
+ * round((1 - ratio) * 2^56).  Sample iff R >= T.  ratio <= 0 always
+ * rejects; ratio >= 1 always samples (T == 0, and R >= 0 always holds).
+ */
+static bool
+otel_traceidratio_sample(const OtelTraceId *trace_id, double ratio)
 {
-	return otel_sampler_hook;
+	uint64		r = 0;
+	uint64		threshold;
+
+	if (ratio >= 1.0)
+		return true;
+	if (ratio <= 0.0)
+		return false;
+
+	for (int i = OTEL_TRACE_ID_BYTES - 7; i < OTEL_TRACE_ID_BYTES; i++)
+		r = (r << 8) | trace_id->b[i];
+
+	/* 2^56, as a double; round-half-to-even is fine here. */
+	threshold = (uint64) rint((1.0 - ratio) * 72057594037927936.0);
+	return r >= threshold;
 }
 
-OtelSamplerHookPolicy
-otel_get_sampler_hook_policy(void)
+/*
+ * otel_api's own sampling policy (otel_api.sampler / otel_api.sampler_arg).
+ * Called only where otel_producer.c has no local parent to inherit a
+ * decision from: a brand-new root (new_root = true, remote_sampled
+ * ignored) or a remote parent (new_root = false, remote_sampled is that
+ * parent's W3C sampled bit).  trace_id is the span's own trace ID (the
+ * freshly generated one for a new root, or the remote parent's for a
+ * remote parent) --- the only input traceidratio needs.
+ */
+OtelSamplerDecision
+otel_run_sampler(const OtelTraceId *trace_id, bool new_root, bool remote_sampled)
 {
-	return otel_sampler_hook_policy;
+	switch (otel_sampler_mode)
+	{
+		case OTEL_SAMPLER_ALWAYS_ON:
+			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+		case OTEL_SAMPLER_ALWAYS_OFF:
+			return OTEL_SAMPLE_DROP;
+		case OTEL_SAMPLER_TRACEIDRATIO:
+			return otel_traceidratio_sample(trace_id, otel_sampler_arg)
+				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+		case OTEL_SAMPLER_PARENTBASED_ALWAYS_ON:
+			if (!new_root)
+				return remote_sampled
+					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+		case OTEL_SAMPLER_PARENTBASED_ALWAYS_OFF:
+			if (!new_root)
+				return remote_sampled
+					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+			return OTEL_SAMPLE_DROP;
+		case OTEL_SAMPLER_PARENTBASED_TRACEIDRATIO:
+			if (!new_root)
+				return remote_sampled
+					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+			return otel_traceidratio_sample(trace_id, otel_sampler_arg)
+				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+	}
+	return OTEL_SAMPLE_RECORD_AND_SAMPLE;	/* unreachable */
+}
+
+static void
+api_get_root_context(OtelRootContext *out)
+{
+	*out = otel_root_ctx;
+	out->ctx.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
+		? otel_tracestate_guc : NULL;
+}
+
+static void
+api_reset_root_context(void)
+{
+	otel_root_ctx_reset();
+}
+
+static void
+api_get_counters(OtelApiCounters *out)
+{
+	*out = otel_counters;
+}
+
+#ifdef PG_HAVE_XACT_TRACE_CONTEXT
+/*
+ * Commit-record trace context: record the context of the span active at
+ * commit, if it is sampled.
+ */
+static bool
+otel_commit_trace_context_cb(xl_xact_trace_context *tc)
+{
+	OtelSpanContext ctx;
+
+	if (!otel_span_context_of_internal(OTEL_SPAN_NONE, &ctx) ||
+		!otel_span_context_sampled(&ctx))
+		return false;
+	StaticAssertStmt(sizeof(tc->trace_id) == OTEL_TRACE_ID_BYTES &&
+					 sizeof(tc->span_id) == OTEL_SPAN_ID_BYTES,
+					 "xl_xact_trace_context ID sizes");
+	memcpy(tc->trace_id, ctx.trace_id.b, OTEL_TRACE_ID_BYTES);
+	memcpy(tc->span_id, ctx.span_id.b, OTEL_SPAN_ID_BYTES);
+	tc->trace_flags = ctx.trace_flags;
+	memset(tc->pad, 0, sizeof(tc->pad));
+	return true;
+}
+#endif							/* PG_HAVE_XACT_TRACE_CONTEXT */
+
+static const OtelExporterApi otel_exporter_api_table = {
+	.version = OTEL_EXPORTER_API_VERSION,
+	.struct_size = sizeof(OtelExporterApi),
+	.register_emit_hook = api_register_emit_hook,
+	.get_resource_attributes = otel_resource_attrs_get,
+};
+
+static const OtelInternalApi otel_internal_api_table = {
+	.version = OTEL_INTERNAL_API_VERSION,
+	.struct_size = sizeof(OtelInternalApi),
+	.get_root_context = api_get_root_context,
+	.reset_root_context = api_reset_root_context,
+	.try_apply_sqlcommenter_context = otel_try_apply_sqlcommenter_context,
+	.parallel_publish_leader_context = otel_parallel_publish_leader_context,
+	.parallel_clear_leader_context = otel_parallel_clear_leader_context,
+	.parallel_get_leader_context = otel_parallel_get_leader_context,
+	.get_counters = api_get_counters,
+};
+
+static const OtelApi otel_api_root = {
+	.version = OTEL_ROOT_API_VERSION,
+	.struct_size = sizeof(OtelApi),
+	.producer = &otel_producer_api_table,
+	.exporter = &otel_exporter_api_table,
+	.internal = &otel_internal_api_table,
+};
+
+/*
+ * Publish the root table and register everything exporters queued
+ * before otel_api loaded.  Called from _PG_init.
+ */
+void
+otel_api_publish_rendezvous(void)
+{
+	void	  **slot = find_rendezvous_variable(OTEL_API_RENDEZVOUS_NAME);
+	void	  **pending = find_rendezvous_variable(OTEL_EXPORTER_PENDING_NAME);
+	OtelPendingRegistration *req = (OtelPendingRegistration *) *pending;
+
+	*slot = (void *) &otel_api_root;
+	*pending = NULL;
+
+	/* The list is LIFO; the last-queued registration ends up outermost. */
+	for (; req != NULL; req = req->next)
+	{
+		if (req->emit_hook)
+			api_register_emit_hook(req->emit_hook, req->emit_prev_out);
+	}
+
+#ifdef PG_HAVE_XACT_TRACE_CONTEXT
+	commit_trace_context_hook = otel_commit_trace_context_cb;
+#endif
 }

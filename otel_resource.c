@@ -68,7 +68,7 @@ char	   *otel_service_instance_id_guc = NULL;
  * Resource attribute storage.  Populated at _PG_init under
  * TopMemoryContext so the strings outlive every per-statement context.
  * Sized generously so that extensions can add attributes via
- * otel_resource_add() after _PG_init completes.
+ * otel_resource_attr_add() after _PG_init completes.
  */
 #define OTEL_RESOURCE_ATTR_CAPACITY		16
 static OtelResourceAttribute otel_resource_attrs[OTEL_RESOURCE_ATTR_CAPACITY];
@@ -84,7 +84,7 @@ push_resource_attr(const char *key, const char *value)
 }
 
 /*
- * otel_resource_add --- add or replace a resource attribute.
+ * otel_resource_attr_add --- add or replace a resource attribute.
  *
  * Safe to call after _PG_init completes, before the first span is emitted
  * in a backend.  Strings are pstrdup'd into TopMemoryContext so they
@@ -97,7 +97,7 @@ push_resource_attr(const char *key, const char *value)
  * identity after catalog data becomes accessible.
  */
 void
-otel_resource_add(const char *key, const char *value)
+otel_resource_attr_add(const char *key, const char *value)
 {
 	MemoryContext oldcxt;
 	int			i;
@@ -123,7 +123,7 @@ otel_resource_add(const char *key, const char *value)
 	if (otel_resource_n_attrs >= OTEL_RESOURCE_ATTR_CAPACITY)
 	{
 		ereport(WARNING,
-				(errmsg("otel_resource_add: resource attribute capacity (%d) exceeded; ignoring key \"%s\"",
+				(errmsg("otel_resource_attr_add: resource attribute capacity (%d) exceeded; ignoring key \"%s\"",
 						OTEL_RESOURCE_ATTR_CAPACITY, key)));
 		return;
 	}
