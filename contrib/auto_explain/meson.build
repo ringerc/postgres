@@ -12,8 +12,9 @@ endif
 
 auto_explain = shared_module('auto_explain',
   auto_explain_sources,
-  # otel_api/otel_api.h resolves from contrib/otel_api/ via -I.../contrib.
-  c_args: ['-I' + meson.project_source_root() / 'contrib'],
+  # No HAVE_OTEL_API here: auto_explain.c falls back to the vendored
+  # otel_producer_stub.h in this directory, so no otel_api include path
+  # is needed for the in-tree build.
   kwargs: contrib_mod_args,
 )
 contrib_targets += auto_explain

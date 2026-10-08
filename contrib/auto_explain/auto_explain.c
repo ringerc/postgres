@@ -28,14 +28,16 @@
 #include "utils/varlena.h"
 
 /*
- * Optional OTel span enrichment.  When otel_api is present in the build tree
- * (patched PostgreSQL), include its header so explain_ExecutorEnd can attach
- * the plan text to the active statement span.  otel_api_get() returns NULL
- * when the provider is absent at runtime, making this a safe no-op.
+ * Optional OTel span enrichment, via the otel_api MAJOR 3 producer API.
+ * HAVE_OTEL_API selects the real otel_api/otel_producer.h; otherwise the
+ * vendored otel_producer_stub.h declares the same calls as no-ops, so no
+ * #ifdef is needed at any call site below.  Same idiom as
+ * contrib/postgres_fdw/postgres_fdw.c.
  */
-#ifdef PG_HAVE_SDT_PROBE_HOOK		/* defined in pg_config_manual.h by our patch */
-#include "otel_api/otel_api.h"
-#define HAVE_OTEL_API 1
+#ifdef HAVE_OTEL_API
+#include "otel_api/otel_producer.h"
+#else
+#include "otel_producer_stub.h"
 #endif
 
 PG_MODULE_MAGIC_EXT(
@@ -496,30 +498,29 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			 * and under ANALYZE the embedded timings make a plan-text
 			 * attribute high-cardinality; an event is the correct home.
 			 *
-			 * otel_api_get() returns NULL when the provider is absent (or too
-			 * old: it validates struct_size against the OtelTracingApi we
-			 * compiled against, and span_add_event_to_active is a MINOR-3
-			 * table entry), making this a safe no-op in those cases.
+			 * otel_span_current() returns OTEL_SPAN_NONE when there is no
+			 * otel_api span active, or otel_api isn't loaded/recording at
+			 * all (HAVE_OTEL_API unset, or the real producer API's
+			 * recording_possible gate is false); otel_span_add_event() is
+			 * then a no-op, making this a safe no-op in those cases.
 			 *
 			 * The producer COPIES the attribute array and its key/value
 			 * strings into the span's context, so the transient stack array
 			 * below and the es->str->data lifetime are not a concern here
 			 * (the copy happens before this call returns).
 			 */
-#ifdef HAVE_OTEL_API
 			{
-				const OtelTracingApi *otel = otel_api_get();
+				OtelSpanRef s = otel_span_current();
 
-				if (otel != NULL)
+				if (otel_span_recording(s))
 				{
-					const OtelKeyValue attrs[] = {
-						{"db.postgresql.explain_plan", es->str->data},
+					const OtelAttribute attrs[] = {
+						OTEL_ATTR_STR("db.postgresql.explain_plan", es->str->data),
 					};
 
-					otel->span_add_event_to_active("plan", 0, attrs, 1);
+					otel_span_add_event(s, "plan", 0, attrs, 1);
 				}
 			}
-#endif
 
 			/*
 			 * Note: we rely on the existing logging of context or

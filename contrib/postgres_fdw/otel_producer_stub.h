@@ -81,6 +81,7 @@ typedef struct OtelSpanStartArgs
 	bool		force_sample;
 } OtelSpanStartArgs;
 
+static inline bool otel_recording_possible(void) { return false; }
 static inline bool otel_span_recording(OtelSpanRef s) { (void) s; return false; }
 static inline OtelSpanRef otel_span_start_args(const OtelSpanStartArgs *args) { (void) args; return OTEL_SPAN_NONE; }
 #define otel_span_start(...) \
