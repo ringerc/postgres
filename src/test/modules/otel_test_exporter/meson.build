@@ -12,10 +12,12 @@ endif
 
 test_otel_exporter = shared_module('test_otel_exporter',
   test_otel_exporter_sources,
-  # <otel_api/otel.h> resolves from the otel_api SOURCE tree (this
-  # module's ancestor two levels up: tests/otel_test_exporter ->
-  # tests -> postgres_otel_api), not any installed copy.
-  c_args: ['-I' + meson.current_source_dir() / '../..'],
+  # <otel_api/otel.h> resolves from this mirror's contrib/ tree (this
+  # module lives under src/test/modules/, two levels away from
+  # contrib/otel_api/), not any installed copy. Mirror-specific override:
+  # do not replace with the upstream postgres_otel_api relative-path form,
+  # which assumes the otel_api canonical repo's own layout.
+  c_args: ['-I' + meson.project_source_root() / 'contrib'],
   kwargs: pg_test_mod_args,
 )
 test_install_libs += test_otel_exporter
