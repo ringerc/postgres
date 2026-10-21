@@ -10,6 +10,12 @@
  * can vendor it together with otel_api.h, otel_producer.h and
  * otel_producer_stub.h.
  *
+ * The public otel_api headers must stay valid C++ as well as C: C++
+ * producers such as pg_stat_ch include them.  No implicit void *
+ * conversions (cast palloc results) and no C-only constructs in
+ * anything a C++ compiler sees.  Check with tests/cxx_headers/check.sh
+ * or "make check-cxx-headers".
+ *
  * IDs are binary.  Hex is only produced and parsed at the edges: the
  * W3C traceparent string, log output, SQL-visible functions.
  *
