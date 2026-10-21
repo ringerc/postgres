@@ -367,7 +367,7 @@ otel_span_context_recv(StringInfo buf, OtelSpanContext *ctx)
 	}
 	if (tslen > 0)
 	{
-		char	   *ts = palloc(tslen + 1);
+		char	   *ts = (char *) palloc(tslen + 1);
 
 		pq_copymsgbytes(buf, ts, tslen);
 		ts[tslen] = '\0';
