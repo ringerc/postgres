@@ -21,6 +21,29 @@
 #include "utils/relcache.h"
 
 /*
+ * How postgres_fdw propagates local OTel trace context to the remote
+ * server ahead of a cursor DECLARE or a direct-modify UPDATE/DELETE.
+ *
+ *	 off		Never propagate.  The remote only traces what its own
+ *				sampler policy decides for an untagged query.
+ *	 comment	Embed the traceparent in a sqlcommenter trailing comment
+ *				appended to the query text sent to the remote: no extra
+ *				round trip.  The remote needs otel_api loaded with
+ *				otel_api.parse_sqlcommenter = on to pick it up.
+ *	 set		(previous behaviour) issue a separate
+ *				"SET otel_api.traceparent = ..." before the query.  One
+ *				extra round trip per remote query whenever a span exists.
+ */
+typedef enum PgFdwTracePropagation
+{
+	PGFDW_TRACE_PROPAGATION_OFF,
+	PGFDW_TRACE_PROPAGATION_COMMENT,
+	PGFDW_TRACE_PROPAGATION_SET,
+} PgFdwTracePropagation;
+
+extern int	pgfdw_trace_propagation;
+
+/*
  * FDW-specific planner information kept in RelOptInfo.fdw_private for a
  * postgres_fdw foreign table.  For a baserel, this struct is created by
  * postgresGetForeignRelSize, although some fields are not filled till later.
