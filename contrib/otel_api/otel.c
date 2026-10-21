@@ -20,7 +20,7 @@
  *					   every conformant tracing participant MUST
  *					   understand it.  Our assign-hook parses and
  *					   decomposes the value into the in-memory
- *					   OtelContext struct used by the emit_log_hook.
+ *					   otel_root_ctx, read by span start and the emit_log_hook.
  *					   This is the load-bearing piece for log
  *					   correlation.
  *
@@ -66,7 +66,7 @@
  * GUC values automatically propagate to parallel workers via
  * RestoreGUCState during ParallelWorkerMain startup.  The workers'
  * assign-hooks then populate their own copies of the in-memory
- * OtelContext, so worker-side log emission picks up the trace context
+ * otel_root_ctx, so worker-side log emission picks up the trace context
  * exactly as the leader's does.  No bespoke parallel-state plumbing
  * is required.
  *
@@ -195,11 +195,16 @@
 
 PG_MODULE_MAGIC;
 
-/* In-memory derived state populated by the otel_api.traceparent assign-hook
- * (called by the GUC machinery on M-header arrival, SET, or
- * parallel-worker RestoreGUCState).  Read by the emit_log_hook in
- * otel_log.c. */
-OtelContext otel_ctx;
+/*
+ * The backend's root trace context: the parent of a span started with an
+ * empty active stack.  Set by the otel_api.traceparent assign-hook (on
+ * 'M' header arrival, SET, or parallel-worker RestoreGUCState), or by a
+ * sqlcommenter parse, which is statement-scoped and bypasses the GUC so
+ * SHOW doesn't report it and it doesn't outlive the statement.
+ * ctx.tracestate is left NULL here; readers take it from
+ * otel_tracestate_guc.
+ */
+OtelRootContext otel_root_ctx;
 
 /* GUC variables --- canonical storage. */
 static char *otel_traceparent_guc;
@@ -212,20 +217,34 @@ char	   *otel_tracestate_guc;
 bool		otel_emit_spans_to_log = false;
 bool		otel_parse_sqlcommenter = false;
 
+/* Span-storage and attribute limits; see _PG_init. */
+int			otel_max_open_spans = 64;
+int			otel_max_session_spans = 16;
+int			otel_attr_value_max = 4096;
+int			otel_max_span_bytes = 65536;
+
 /*
- * Flag set by the executor/utility hooks when otel_ctx was
- * populated from a sqlcommenter comment in the SQL text (as opposed
- * to from the otel_api.traceparent GUC).  Comment-derived context is
- * STATEMENT-scoped: cleared in finalize_span.  We bypass the GUC
- * path so SHOW otel_api.traceparent doesn't lie about session state
- * and so a comment on one statement doesn't bleed into the next.
+ * otel_api's sampler policy.  Consulted by otel_run_sampler()
+ * (otel_api.c) only for a brand-new root span or a remote parent ---
+ * every other span simply inherits its local parent's decision.  See
+ * OtelApiSampler for the OTEL_TRACES_SAMPLER-style values.
  */
-bool		otel_ctx_from_comment = false;
+int			otel_sampler_mode = OTEL_SAMPLER_PARENTBASED_ALWAYS_ON;
+double		otel_sampler_arg = 1.0;
+
+static const struct config_enum_entry otel_sampler_options[] = {
+	{"always_on", OTEL_SAMPLER_ALWAYS_ON, false},
+	{"always_off", OTEL_SAMPLER_ALWAYS_OFF, false},
+	{"traceidratio", OTEL_SAMPLER_TRACEIDRATIO, false},
+	{"parentbased_always_on", OTEL_SAMPLER_PARENTBASED_ALWAYS_ON, false},
+	{"parentbased_always_off", OTEL_SAMPLER_PARENTBASED_ALWAYS_OFF, false},
+	{"parentbased_traceidratio", OTEL_SAMPLER_PARENTBASED_TRACEIDRATIO, false},
+	{NULL, 0, false},
+};
 
 
-static bool parse_traceparent(const char *s, OtelContext *out);
-static bool all_hex(const char *p, size_t n);
-static bool all_zeros(const char *p, size_t n);
+static void assign_emit_spans_to_log(bool newval, void *extra);
+static void assign_sampler(int newval, void *extra);
 
 /* GUC check / assign hooks. */
 static bool check_traceparent(char **newval, void **extra, GucSource source);
@@ -246,12 +265,12 @@ static bool extract_traceparent_from_comment(const char *body, size_t bodylen,
 static bool
 check_traceparent(char **newval, void **extra, GucSource source)
 {
-	OtelContext tmp;
+	OtelSpanContext tmp;
 
 	if (*newval == NULL || (*newval)[0] == '\0')
 		return true;
 
-	if (!parse_traceparent(*newval, &tmp))
+	if (!otel_traceparent_parse(*newval, &tmp))
 	{
 		GUC_check_errmsg("invalid W3C traceparent format: \"%s\"", *newval);
 		GUC_check_errdetail("Expected \"00-{32 hex}-{16 hex}-{2 hex}\" with non-zero trace-id and parent-id.");
@@ -268,26 +287,22 @@ check_traceparent(char **newval, void **extra, GucSource source)
 static void
 assign_traceparent(const char *newval, void *extra)
 {
-	OtelContext tmp;
+	OtelSpanContext tmp;
 
+	otel_root_ctx_reset();
 	if (newval == NULL || newval[0] == '\0')
-	{
-		otel_ctx_reset();
 		return;
-	}
 
-	/*
-	 * parse_traceparent was already vetted in the check-hook; this
-	 * cannot fail.  Defensively still check.
-	 */
-	if (parse_traceparent(newval, &tmp))
-		otel_ctx = tmp;
-	else
-		otel_ctx_reset();
+	/* Vetted by the check-hook, so this can't fail; check anyway. */
+	if (otel_traceparent_parse(newval, &tmp))
+	{
+		otel_root_ctx.ctx = tmp;
+		otel_root_ctx.is_set = true;
+	}
 }
 
 /*
- * Tracks whether the in-memory otel_ctx was last populated by an 'M'
+ * Tracks whether the in-memory otel_root_ctx was last populated by an 'M'
  * TraceContext message (as opposed to a user-issued SET or a sqlcommenter
  * parse).  Used by otel_trace_context_clear_cb to decide whether to
  * clear at the ReadyForQuery boundary.
@@ -323,9 +338,9 @@ otel_trace_context_apply_cb(const char *traceparent, const char *tracestate,
 
 	/*
 	 * Mark as M-installed only when traceparent was actually accepted (a
-	 * malformed value leaves otel_ctx.is_set false).
+	 * malformed value leaves otel_root_ctx.is_set false).
 	 */
-	if (otel_ctx.is_set)
+	if (otel_root_ctx.is_set)
 		otel_ctx_from_M_header = true;
 }
 
@@ -337,7 +352,7 @@ otel_trace_context_apply_cb(const char *traceparent, const char *tracestate,
  * Context installed via SET / SET LOCAL is owned by the GUC machinery;
  * we only clear what we installed via apply_cb.
  *
- * Resets otel_ctx directly rather than via set_config_option to avoid any
+ * Resets otel_root_ctx directly rather than via set_config_option to avoid any
  * GUC-rollback interaction when the reset occurs during error recovery.
  */
 static void
@@ -345,9 +360,29 @@ otel_trace_context_clear_cb(void *cb_ctx)
 {
 	if (otel_ctx_from_M_header)
 	{
-		otel_ctx_reset();
+		otel_root_ctx_reset();
 		otel_ctx_from_M_header = false;
 	}
+}
+
+static void
+assign_emit_spans_to_log(bool newval, void *extra)
+{
+	otel_emit_spans_to_log = newval;
+	otel_update_recording_possible();
+}
+
+/*
+ * GUC assign-hook for otel_api.sampler.  Sets otel_sampler_mode from
+ * newval itself (the GUC machinery's own write to *valueAddr happens
+ * only after this hook returns, same as assign_emit_spans_to_log()
+ * above), then recomputes the recording_possible gate.
+ */
+static void
+assign_sampler(int newval, void *extra)
+{
+	otel_sampler_mode = newval;
+	otel_update_recording_possible();
 }
 
 /*
@@ -361,11 +396,10 @@ otel_current_traceparent(PG_FUNCTION_ARGS)
 {
 	char		buf[OTEL_TRACEPARENT_LEN + 1];
 
-	if (!otel_ctx.is_set)
+	if (!otel_root_ctx.is_set)
 		PG_RETURN_NULL();
 
-	snprintf(buf, sizeof(buf), "00-%s-%s-%s",
-			 otel_ctx.trace_id, otel_ctx.span_id, otel_ctx.trace_flags);
+	otel_traceparent_format(&otel_root_ctx.ctx, buf);
 	PG_RETURN_TEXT_P(cstring_to_text(buf));
 }
 
@@ -424,6 +458,74 @@ _PG_init(void)
 							 false,
 							 PGC_SIGHUP,
 							 0,
+							 NULL, assign_emit_spans_to_log, NULL);
+
+	DefineCustomIntVariable("otel_api.max_open_spans",
+							"Maximum number of recording spans open at once in a backend.",
+							"Spans started beyond this are not recorded.  Ended spans free "
+							"their slot, so this doesn't limit spans per trace.",
+							&otel_max_open_spans,
+							64, 4, 4096,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("otel_api.max_session_spans",
+							"Maximum number of open session spans in a backend.",
+							"Session spans have no transaction-scoped resource owner, "
+							"so this budget stops leaked ones using up otel_api.max_open_spans.",
+							&otel_max_session_spans,
+							16, 0, 4096,
+							PGC_SUSET,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("otel_api.attr_value_max",
+							"Maximum length of a span attribute value; longer values are truncated.",
+							NULL,
+							&otel_attr_value_max,
+							4096, 16, 1024 * 1024,
+							PGC_SUSET,
+							GUC_UNIT_BYTE,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("otel_api.max_span_bytes",
+							"Maximum memory for one span's attributes, events and links.",
+							"Attributes, events and links past this are dropped and counted.",
+							&otel_max_span_bytes,
+							65536, 1024, 64 * 1024 * 1024,
+							PGC_SUSET,
+							GUC_UNIT_BYTE,
+							NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("otel_api.sampler",
+							 "The sampler otel_api uses for a new root span or a remote parent.",
+							 "Standard OTEL_TRACES_SAMPLER names.  parentbased_* variants use the "
+							 "remote parent's W3C sampled bit when there is one, and fall back to "
+							 "the non-parentbased behaviour of the same name for a brand-new root. "
+							 "A local parent's own decision is always inherited regardless of this "
+							 "setting.  Raising the sample rate cluster-wide is an operator decision "
+							 "(PGC_SUSET); see otel.trace_all_queries for the per-session opt-in that "
+							 "starts new root traces at all.  always_off disables tracing entirely: "
+							 "no span IDs are generated, force_sample is ignored, and incoming trace "
+							 "context still passes through.  Use traceidratio with sampler_arg = 0 "
+							 "for unsampled spans that are still tracked.  See README \"Sampling\".",
+							 &otel_sampler_mode,
+							 OTEL_SAMPLER_PARENTBASED_ALWAYS_ON,
+							 otel_sampler_options,
+							 PGC_SUSET,
+							 0,
+							 NULL, assign_sampler, NULL);
+
+	DefineCustomRealVariable("otel_api.sampler_arg",
+							 "Sampling probability for the traceidratio and parentbased_traceidratio samplers.",
+							 "Ignored by the other sampler values.  OTel consistent probability "
+							 "sampling on the trace ID's low 56 bits: 1.0 always samples, 0.0 never "
+							 "does.",
+							 &otel_sampler_arg,
+							 1.0, 0.0, 1.0,
+							 PGC_SUSET,
+							 0,
 							 NULL, NULL, NULL);
 
 	/* trace_all_queries is owned by otel_postgres_tracing; see its
@@ -431,12 +533,14 @@ _PG_init(void)
 
 	DefineCustomStringVariable("otel_api.service_name",
 							   "OTel Resource service.name attribute for this postmaster.",
-							   "Identifies the service emitting traces / metrics.  Default "
-							   "\"postgres\".  Operators typically set this to a deployment-"
-							   "specific name (e.g. \"orders-db-primary\").  Matches the "
-							   "OTel-standard OTEL_SERVICE_NAME environment variable.",
+							   "Identifies the service emitting traces / metrics.  When unset "
+							   "(the default), the value is resolved in order: "
+							   "(1) this GUC if explicitly set to a non-empty value, "
+							   "(2) the OTEL_SERVICE_NAME environment variable, "
+							   "(3) the service.name key inside OTEL_RESOURCE_ATTRIBUTES, "
+							   "(4) the hard-coded fallback \"postgres\".",
 							   &otel_service_name_guc,
-							   "postgres",
+							   NULL,
 							   PGC_POSTMASTER,
 							   0,
 							   NULL, NULL, NULL);
@@ -444,9 +548,13 @@ _PG_init(void)
 	DefineCustomStringVariable("otel_api.service_instance_id",
 							   "OTel Resource service.instance.id attribute for this postmaster.",
 							   "Uniquely identifies this postmaster instance among instances "
-							   "of the same service.  Empty string (the default) selects the "
-							   "cluster's pg_control system identifier, which is stable across "
-							   "postmaster restarts and unique per initdb.",
+							   "of the same service.  When unset (empty string, the default), "
+							   "the value is resolved in order: "
+							   "(1) this GUC if explicitly set to a non-empty value, "
+							   "(2) the OTEL_SERVICE_INSTANCE_ID environment variable, "
+							   "(3) the service.instance.id key inside OTEL_RESOURCE_ATTRIBUTES, "
+							   "(4) the cluster's pg_control system identifier, which is stable "
+							   "across postmaster restarts and unique per initdb.",
 							   &otel_service_instance_id_guc,
 							   "",
 							   PGC_POSTMASTER,
@@ -500,133 +608,10 @@ _PG_init(void)
 	otel_api_publish_rendezvous();
 }
 
-/*
- * Parse a W3C traceparent value into *out.  Returns true on success.
- *
- * Format: "{version}-{trace-id}-{parent-id}-{flags}[-future-fields]"
- *
- *	 version		2 lowercase hex chars.  Version "00" is the only
- *					version this code knows in detail; per the W3C
- *					spec, higher versions MUST be parsed by reading
- *					the known prefix (trace-id, parent-id, flags) and
- *					ignoring any trailing additional fields.  Version
- *					"ff" is W3C-reserved as invalid.
- *	 trace-id		32 lowercase hex chars, not all-zeros.
- *	 parent-id		16 lowercase hex chars, not all-zeros.
- *	 flags			2 lowercase hex chars.
- *
- * For version "00" the input MUST be exactly 55 chars.  For higher
- * versions the input MUST be at least 55 chars and the byte at
- * position 55 (if present) MUST be a hyphen introducing trailing
- * fields, which this implementation accepts and ignores.
- */
-static bool
-parse_traceparent(const char *s, OtelContext *out)
-{
-	size_t		len = strlen(s);
-	bool		is_v00;
-
-	if (len < OTEL_TRACEPARENT_LEN)
-		return false;
-	if (s[2] != '-' || s[35] != '-' || s[52] != '-')
-		return false;
-
-	/*
-	 * Version: must be lowercase hex.  "ff" is reserved as invalid by
-	 * the W3C spec.  "00" enables strict-parse mode; anything else
-	 * (01..fe) is treated as a future version and parsed for the
-	 * known prefix only.
-	 */
-	if (!all_hex(s, 2))
-		return false;
-	if (s[0] == 'f' && s[1] == 'f')
-		return false;
-	is_v00 = (s[0] == '0' && s[1] == '0');
-
-	/*
-	 * Length / trailing-field policy.
-	 *	 v00:        exactly 55 chars, no trailing fields allowed.
-	 *	 v01..vfe:   55 chars OK; longer OK iff char 55 is '-' (a new
-	 *	             field separator) --- the trailing data is parsed
-	 *	             out by future implementations and ignored here.
-	 */
-	if (is_v00)
-	{
-		if (len != OTEL_TRACEPARENT_LEN)
-			return false;
-	}
-	else
-	{
-		if (len > OTEL_TRACEPARENT_LEN && s[OTEL_TRACEPARENT_LEN] != '-')
-			return false;
-	}
-
-	if (!all_hex(s + 3, OTEL_TRACE_ID_LEN))
-		return false;
-	if (!all_hex(s + 36, OTEL_SPAN_ID_LEN))
-		return false;
-	if (!all_hex(s + 53, OTEL_TRACE_FLAGS_LEN))
-		return false;
-
-	/* per W3C: all-zero trace-id and all-zero parent-id are invalid */
-	if (all_zeros(s + 3, OTEL_TRACE_ID_LEN))
-		return false;
-	if (all_zeros(s + 36, OTEL_SPAN_ID_LEN))
-		return false;
-
-	memcpy(out->trace_id, s + 3, OTEL_TRACE_ID_LEN);
-	out->trace_id[OTEL_TRACE_ID_LEN] = '\0';
-	memcpy(out->span_id, s + 36, OTEL_SPAN_ID_LEN);
-	out->span_id[OTEL_SPAN_ID_LEN] = '\0';
-	memcpy(out->trace_flags, s + 53, OTEL_TRACE_FLAGS_LEN);
-	out->trace_flags[OTEL_TRACE_FLAGS_LEN] = '\0';
-
-	/* Parse the trace_flags byte to extract the W3C "sampled" bit
-	 * (bit 0).  See the comment on OtelContext.sampled_flag_set
-	 * for the W3C-vs-OTel interpretation distinction. */
-	{
-		unsigned int flags_byte = 0;
-
-		if (sscanf(s + 53, "%2x", &flags_byte) == 1)
-			out->sampled_flag_set = (flags_byte & 0x01) != 0;
-		else
-			out->sampled_flag_set = false;
-	}
-
-	out->is_set = true;
-	return true;
-}
-
 void
-otel_ctx_reset(void)
+otel_root_ctx_reset(void)
 {
-	otel_ctx.is_set = false;
-	otel_ctx.sampled_flag_set = false;
-	otel_ctx.trace_id[0] = '\0';
-	otel_ctx.span_id[0] = '\0';
-	otel_ctx.trace_flags[0] = '\0';
-}
-
-static bool
-all_hex(const char *p, size_t n)
-{
-	for (size_t i = 0; i < n; i++)
-	{
-		char		c = p[i];
-
-		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
-			return false;
-	}
-	return true;
-}
-
-static bool
-all_zeros(const char *p, size_t n)
-{
-	for (size_t i = 0; i < n; i++)
-		if (p[i] != '0')
-			return false;
-	return true;
+	memset(&otel_root_ctx, 0, sizeof(otel_root_ctx));
 }
 
 
@@ -871,30 +856,30 @@ extract_traceparent_from_comment(const char *body, size_t bodylen,
 }
 
 /*
- * Orchestrator: if otel_api.parse_sqlcommenter is on AND otel_ctx is
+ * Orchestrator: if otel_api.parse_sqlcommenter is on AND otel_root_ctx is
  * not already populated by a higher-priority source ('M' header or
  * SET / SET LOCAL), try to extract a traceparent from a comment in
- * `sql` and apply it to otel_ctx directly (NOT via the GUC path
+ * `sql` and apply it to otel_root_ctx directly (NOT via the GUC path
  * --- comment-derived context must NOT outlive the statement).
  *
- * Returns true if otel_ctx was populated from the comment; in that
+ * Returns true if otel_root_ctx was populated from the comment; in that
  * case caller must arrange for finalize_span to clear it (via the
- * otel_ctx_from_comment flag this fn sets).
+ * otel_root_ctx.from_comment flag this fn sets).
  *
  * On any malformed-comment or parse-validation failure: silently
  * proceed without context.  Tracing is best-effort.
  */
 bool
-try_apply_sqlcommenter_context(const char *sql)
+otel_try_apply_sqlcommenter_context(const char *sql)
 {
 	const char *body;
 	size_t		bodylen;
 	char		raw[OTEL_TRACEPARENT_LEN + 1];
-	OtelContext tmp;
+	OtelSpanContext tmp;
 
 	if (!otel_parse_sqlcommenter)
 		return false;
-	if (otel_ctx.is_set)
+	if (otel_root_ctx.is_set)
 		return false;	/* 'M' header / GUC always wins */
 	if (sql == NULL || sql[0] == '\0')
 		return false;
@@ -903,10 +888,11 @@ try_apply_sqlcommenter_context(const char *sql)
 		return false;
 	if (!extract_traceparent_from_comment(body, bodylen, raw, sizeof(raw)))
 		return false;
-	if (!parse_traceparent(raw, &tmp))
+	if (!otel_traceparent_parse(raw, &tmp))
 		return false;
 
-	otel_ctx = tmp;
-	otel_ctx_from_comment = true;
+	otel_root_ctx.ctx = tmp;
+	otel_root_ctx.is_set = true;
+	otel_root_ctx.from_comment = true;
 	return true;
 }

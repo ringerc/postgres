@@ -1,1317 +1,2204 @@
 /*-------------------------------------------------------------------------
  *
  * otel_producer.c
- *	  Producer-side API for contrib/otel: the active-span stack,
- *	  parent-context management, and the span_emit dispatch entry point
- *	  used by both contrib/otel's own query-tracing hooks and any
- *	  external consumer (PGD, PGAA, PL handlers, etc.) that wants to
- *	  emit spans via the OtelTracingApi rendezvous interface.
+ *	  Span storage, the active span stack, and the producer API.
  *
- * Phase 1 of the contrib/otel split (see contrib-otel-split.md in
- * the parent workspace): this file owns the producer API surface
- * that will, in Phase 4, become the boundary between the API
- * module (this file stays in contrib/otel) and the collector module
- * (contrib/otel_postgres_tracing, which will consume this API for
- * statement-span construction).
+ * Storage
+ * -------
+ * otel_api owns every span.  A recording span lives in a slot of a
+ * per-backend array of otel_api.max_open_spans slots, allocated on the
+ * first recorded span and never resized.  Slots are handed out from a
+ * LIFO free list, and slots never used are never written, so a backend
+ * only touches as many slots as it has spans open at its peak.  Each slot
+ * has its own small memory context for the strings, attributes, events
+ * and links copied into the span; ending the span resets it.
  *
- * State model
- * -----------
- *	  * Root context: per-backend (trace_id, root_span_id, trace_flags,
- *	    tracestate), set when the client supplies trace context via the
- *	    'M' protocol header or via the otel_api.traceparent GUC.  The legacy
- *	    `OtelContext otel_ctx` in otel.c is the canonical storage; this
- *	    file reads it via the existing assign-hook-populated state.
+ * An unsampled span takes no slot.  It is a "non-recording entry": a
+ * trace context and a subtransaction level in a separate fixed array.
+ * It exists so that its children are unsampled too (without calling the
+ * sampler) and so that its context still propagates, with sampled=0.
  *
- *	  * Active stack: bounded array of OtelSpanStackEntry, one per
- *	    currently-open span pushed by a consumer.  Each entry stores
- *	    enough W3C identity to reconstitute the current context; push
- *	    variants chain to the existing top, while explicit-parent
- *	    variants do not touch the stack.
+ * Handles
+ * -------
+ * OtelSpanRef.v is (generation << 32 | index): positive for a slot,
+ * negated for a non-recording entry.  Generations are 31-bit, never 0,
+ * and come from a per-backend counter that starts at a random value, so
+ * a handle from another backend is very unlikely to match.  A handle
+ * whose generation doesn't match is stale: a no-op, counted, and an
+ * Assert failure in cassert builds.  The exception is a handle whose
+ * span was ended by its resource owner (abort), which callers can't
+ * always know about: using that is a quiet no-op.
  *
- * Lifecycle of a pushed span
- * --------------------------
- *	  1. Consumer allocates OtelSpan in its own MemoryContext (typically
- *	     a per-statement context, or a static slab).
- *	  2. Consumer calls otel_span_init() (inline, in Commit D) or fills
- *	     fields directly.
- *	  3. Consumer calls api->span_link_to_active_and_push(span):
- *	      - parent identity fetched from top-of-stack, or root context
- *	        if stack empty, or stays zero if neither set;
- *	      - new entry pushed at top of span_stack;
- *	      - unwind_policy captured into the stack entry at push time.
- *	  4. Consumer does work, sets attributes, etc.
- *	  5. Consumer calls api->span_emit(span):
- *	      - dispatch to registered emit hook + JSON-log emitter;
- *	      - if span is at top of stack, pop;
- *	      - if span is on the stack but not at top, WARNING and pop
- *	        down to it (entries above pop as well; their unwind_policy
- *	        decides whether they emit-as-ERROR or silently drop).
- *
- * Phase 1 (this commit) scope
- * ---------------------------
- *	  * Active stack + push/inspect/emit machinery.
- *	  * Producer-API function pointers in OtelTracingApi.
- *	  * Root context read via the existing OtelContext.
- *
- * Phase 1 deferred to subsequent commits
- * --------------------------------------
- *	  * MemoryContextCallback-driven cleanup on ereport unwind
- *	    (Commit C).  For now, if the consumer's allocation is freed
- *	    without an emit, the stack retains a stale entry until the
- *	    next push reaches it.  This is benign in the current usage
- *	    (existing query-tracing path doesn't push yet) but must be
- *	    fixed before external consumers rely on it.
- *	  * Stack-overflow telemetry (Commit C).  This commit silently
- *	    declines to push past MAX_SPAN_STACK_DEPTH; Commit C adds
- *	    WARNING + counter.
- *	  * Inline helpers in otel.h (Commit D).
- *	  * TAP coverage (Commit E).
- *
+ * Lifetime
+ * --------
+ * Every recording span is remembered by a resource owner (by default
+ * CurrentResourceOwner), or is a session span.  Owner release on abort
+ * exports the span with ERROR status.  Owner release on commit with
+ * the span still open is a leak: core calls the DebugPrint callback just
+ * before ReleaseResource, only in that case, which is how the two are
+ * told apart.  Non-recording entries are dropped by subtransaction and
+ * transaction end callbacks, by subtransaction level.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
- * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  contrib/otel/otel_producer.c
+ *	  otel_api/otel_producer.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include <string.h>
-
-#include "common/cryptohash.h"
+#include "access/parallel.h"
+#include "access/xact.h"
+#include "common/pg_prng.h"
+#include "funcapi.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "port.h"				/* pg_strong_random */
-#include "utils/builtins.h"		/* escape_json */
-#include "utils/elog.h"
+#include "storage/ipc.h"
+#include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/json.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "utils/tuplestore.h"
 
-#include "otel.h"
 #include "otel_internal.h"
 
+/* Maximum active-stack depth, and number of non-recording entries. */
+#define OTEL_MAX_STACK_DEPTH	128
 
-/*
- * Maximum depth of the active-span stack.  Hard-coded for now; promoted
- * to a GUC if/when real workloads need tuning.  At ~120 bytes per entry
- * (OtelSpanStackEntry size below), 64 deep is ~7.5 KB of per-backend
- * static memory --- negligible.
- *
- * Beyond this depth, new pushes still link parent_span_id to the
- * current top-of-stack for correctness, but are not themselves
- * pushed.  See api_span_link_to_active_and_push.
- */
-#define MAX_SPAN_STACK_DEPTH	64
+/* Attributes stored in the slot before spilling to its context. */
+#define OTEL_SLOT_INLINE_ATTRS	12
 
+#define OTEL_GEN_MASK			0x7fffffffu
 
-/*
- * One entry on the active-span stack.  Inline IDs make
- * span_current_context() cache-friendly --- no pointer chase through
- * the consumer's OtelSpan on the hot path.  The pointer to the
- * consumer's OtelSpan is used only at unwind time when this entry's
- * unwind_policy is OTEL_UNWIND_ERROR; for OTEL_UNWIND_DROP entries
- * the pointer is never dereferenced after push, so its post-push
- * validity is not required.
- */
-typedef struct OtelSpanStackEntry
+/* A captured error, lowered into an "exception" event at end. */
+typedef struct OtelSlotError
 {
-	/* Identity, inline for fast inspection.  No tracestate here: it
-	 * lives in the shared otel_tracestate_guc and is constant across
-	 * the lifetime of a trace within a backend. */
-	char		trace_id[OTEL_TRACE_ID_LEN + 1];
-	char		span_id[OTEL_SPAN_ID_LEN + 1];
-	char		trace_flags[OTEL_TRACE_FLAGS_LEN + 1];
+	bool		used;
+	int			elevel;
+	int			lineno;
+	char		sqlstate[6];
+	TimestampTz time;
+	const char *message;		/* all copied; any may be NULL */
+	const char *detail;
+	const char *hint;
+	const char *filename;
+	const char *funcname;
+} OtelSlotError;
 
-	/* Unwind policy captured at push time --- changes to the
-	 * underlying OtelSpan's policy after push do not affect this
-	 * stack entry. */
-	OtelSpanUnwindPolicy unwind_policy;
-
-	/* Borrowed pointer to the consumer's OtelSpan.  Read only at
-	 * unwind time for OTEL_UNWIND_ERROR entries.  Memory ownership
-	 * stays with the consumer. */
-	OtelSpan   *span;
-} OtelSpanStackEntry;
-
-
-/*
- * Per-backend storage for the active-span stack.  Static, zero-
- * initialised at backend start.  Single-threaded by construction
- * (each backend has its own copy), no locking required.
- */
-static OtelSpanStackEntry span_stack[MAX_SPAN_STACK_DEPTH];
-static int	span_stack_top = -1;	/* index of topmost entry; -1 == empty */
-
-
-/*
- * Backend-local storage backing the OtelSpanContext * returned by
- * api->span_current_context() and api->span_root_context().  The
- * docs guarantee the returned pointer is valid until the next call
- * that may modify the active stack or root context, which is
- * trivially satisfied by single-threaded per-backend access plus
- * "never reuse the buffer until something changes" --- which we
- * implement by simply having one buffer per call site.
- */
-static OtelSpanContext current_ctx_buf;
-static OtelSpanContext root_ctx_buf;
-
-
-/*
- * Backend-local flag --- set the first time we decline to push due
- * to stack overflow.  Used to emit at most one WARNING per backend
- * (the postmaster log fills up fast otherwise on pathological
- * recursive PL/pgSQL).  Reset never; we'd rather miss a second
- * warning than spam.
- */
-static bool stack_overflow_warned = false;
-
-
-/*
- * span_id_on_stack --- return true if a span with the given span_id is
- * already present anywhere on the active stack.
- *
- * Used as a defensive uniqueness check at push time.  The unwind
- * lookup in both on_memory_context_reset() and otel_producer_span_emit()
- * relies on span_id uniqueness across the entire active stack: the first
- * matching entry is treated as the canonical one.  A duplicate span_id
- * would cause the lookup to pop the WRONG entry, silently corrupting
- * stack state.  Catching it at push time is cheaper than diagnosing the
- * resulting mis-pop.
- */
-static bool
-span_id_on_stack(const char span_id[OTEL_SPAN_ID_LEN + 1])
+typedef struct OtelSlot
 {
-	int			i;
+	OtelSpan	span;			/* the exporter's view */
 
-	for (i = 0; i <= span_stack_top; i++)
+	uint32		gen;			/* 0 = free */
+	uint32		owner_released_gen; /* last generation ended by its owner */
+	int			next_free;
+
+	bool		detached;
+	bool		session;
+	bool		leaked;			/* set by DebugPrint on commit release */
+	bool		dispatching;
+	ResourceOwner owner;		/* NULL for a session span */
+	void	   *scope_frame;	/* cassert: an address in the start frame */
+
+	MemoryContext cxt;
+	Size		bytes;			/* copied into cxt for this span */
+
+	OtelAttribute inline_attrs[OTEL_SLOT_INLINE_ATTRS];
+	OtelAttribute *attrs;
+	int			attrs_cap;
+	OtelSpanEvent *events;
+	int			events_cap;
+	OtelSpanContext *links;
+	int			links_cap;
+
+	OtelSlotError err;
+} OtelSlot;
+
+/* A non-recording (unsampled) span. */
+typedef struct OtelNrec
+{
+	uint32		gen;			/* 0 = free */
+	uint32		owner_released_gen; /* last generation dropped at xact end */
+	int			next_free;
+	int			nest_level;		/* subtransaction level at start */
+	bool		detached;
+	bool		have_span_id;	/* span_id is generated lazily */
+	OtelSpanContext ctx;		/* tracestate always NULL */
+} OtelNrec;
+
+/*
+ * The active stack.  Entry >= 0 is a slot index; < 0 is -(nrec index) - 1.
+ *
+ * span_stack_meta runs parallel to span_stack: an entry pushed by
+ * otel_span_activate() (rather than otel_span_start()) is marked
+ * is_activation, with the subtransaction nest level current at
+ * activation time.  That is what tells apart a span's own stack entry
+ * (ended, not merely popped, by otel_span_end()/abort/unwind) from an
+ * activation of a .detached span the caller still owns elsewhere
+ * (popped only -- never ended -- by otel_span_deactivate(), by a
+ * (sub)transaction ending at or above that level, or by a LIFO unwind
+ * passing over it).
+ */
+typedef struct StackEntryMeta
+{
+	bool		is_activation;
+	int			nest_level;		/* subxact level when activated */
+} StackEntryMeta;
+
+static int32 span_stack[OTEL_MAX_STACK_DEPTH];
+static StackEntryMeta span_stack_meta[OTEL_MAX_STACK_DEPTH];
+static int	span_stack_depth = 0;
+
+static OtelSlot *slots = NULL;
+static int	nslots = 0;			/* otel_max_open_spans, fixed at first use */
+static int	slots_used = 0;		/* slots below this have been initialised */
+static int	slot_free_head = -1;
+static int	session_spans_open = 0;
+static int	dispatch_depth = 0;	/* > 0 while an emit hook runs */
+static MemoryContext span_pool_cxt = NULL;
+
+static OtelNrec nrecs[OTEL_MAX_STACK_DEPTH];
+static int	nrecs_used = 0;
+static int	nrec_free_head = -1;
+
+static uint32 gen_counter = 0;
+static pg_prng_state otel_prng;
+static int	otel_prng_pid = 0;	/* pid that seeded otel_prng */
+
+OtelApiCounters otel_counters;
+
+static bool non_lifo_warned = false;
+static bool exit_callback_registered = false;
+
+static emit_log_hook_type prev_emit_log_hook = NULL;
+
+static void otel_span_release_resource(Datum res);
+static char *otel_span_debug_print(Datum res);
+
+static const ResourceOwnerDesc otel_span_resowner_desc = {
+	.name = "otel_api span",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_FIRST,
+	.ReleaseResource = otel_span_release_resource,
+	.DebugPrint = otel_span_debug_print,
+};
+
+static void end_slot(int idx, TimestampTz end_time, bool unwinding,
+					 const char *unwind_reason);
+
+
+/* ----------------------------------------------------------------
+ * Handles, IDs, small helpers
+ * ---------------------------------------------------------------- */
+
+static inline OtelSpanRef
+make_ref(uint32 gen, int idx, bool recording)
+{
+	int64		v = ((int64) gen << 32) | (uint32) idx;
+
+	return (OtelSpanRef) {recording ? v : -v};
+}
+
+static inline uint32
+ref_gen(OtelSpanRef s)
+{
+	int64		v = s.v < 0 ? -s.v : s.v;
+
+	return (uint32) (v >> 32);
+}
+
+static inline int
+ref_idx(OtelSpanRef s)
+{
+	int64		v = s.v < 0 ? -s.v : s.v;
+
+	return (int) (uint32) v;
+}
+
+static void
+seed_prng_if_needed(void)
+{
+	if (likely(otel_prng_pid == MyProcPid))
+		return;
+	if (!pg_prng_strong_seed(&otel_prng))
+		pg_prng_seed(&otel_prng, (uint64) MyProcPid ^ (uint64) GetCurrentTimestamp());
+	otel_prng_pid = MyProcPid;
+	gen_counter = pg_prng_uint32(&otel_prng) & OTEL_GEN_MASK;
+}
+
+static uint32
+next_gen(void)
+{
+	gen_counter = (gen_counter + 1) & OTEL_GEN_MASK;
+	if (gen_counter == 0)
+		gen_counter = 1;
+	return gen_counter;
+}
+
+static void
+new_span_id(OtelSpanId *id)
+{
+	uint64		v;
+
+	do
+		v = pg_prng_uint64(&otel_prng);
+	while (v == 0);
+	memcpy(id->b, &v, sizeof(v));
+}
+
+static void
+new_trace_id(OtelTraceId *id)
+{
+	uint64		v[2];
+
+	do
 	{
-		if (memcmp(span_stack[i].span_id, span_id, OTEL_SPAN_ID_LEN + 1) == 0)
+		v[0] = pg_prng_uint64(&otel_prng);
+		v[1] = pg_prng_uint64(&otel_prng);
+	} while (v[0] == 0 && v[1] == 0);
+	memcpy(id->b, v, sizeof(v));
+}
+
+/*
+ * The slot for a positive handle, or NULL if stale.  A handle whose span
+ * its owner ended is stale but not a caller bug, so it isn't counted.
+ */
+static OtelSlot *
+slot_for_ref(OtelSpanRef s)
+{
+	int			idx = ref_idx(s);
+	uint32		gen = ref_gen(s);
+
+	Assert(s.v > 0);
+	if (idx < slots_used && slots[idx].gen == gen)
+		return &slots[idx];
+	if (idx < slots_used && slots[idx].owner_released_gen == gen)
+		return NULL;
+	otel_counters.stale_handle++;
+	Assert(false);				/* use after end, double end, or foreign handle */
+	return NULL;
+}
+
+static OtelNrec *
+nrec_for_ref(OtelSpanRef s)
+{
+	int			idx = ref_idx(s);
+	uint32		gen = ref_gen(s);
+
+	Assert(s.v < 0);
+	if (idx < nrecs_used && nrecs[idx].gen == gen)
+		return &nrecs[idx];
+	if (idx < nrecs_used && nrecs[idx].owner_released_gen == gen)
+		return NULL;
+	otel_counters.stale_handle++;
+	Assert(false);				/* use after end, double end, or foreign handle */
+	return NULL;
+}
+
+/*
+ * Test-only allocation-failure injection: compiles to a no-op / always
+ * false without USE_INJECTION_POINTS (INJECTION_POINT() is a macro that
+ * expands to nothing in that case; see utils/injection_point.h).  With
+ * it, tests/otel_api_conformance can arm one of the named sites below
+ * for the current backend so the next allocation at that site behaves
+ * exactly as if MCXT_ALLOC_NO_OOM (or repalloc_extended/ResourceOwner-
+ * Enlarge/otel_tracer_register) had failed -- otel_api's own code takes
+ * the same NULL/ERROR path it would on a real OOM.
+ *
+ * Site names (each is "otel-api-oom-<site>"):
+ *   pool             ensure_pool's slots array
+ *   name             a span's name (start, or otel_span_set_name)
+ *   tracestate       a copied parent tracestate
+ *   attr-key         an attribute (or event-attribute) key
+ *   attr-value       an attribute (or event-attribute) value
+ *   event-name       an event's name
+ *   status-description  a span's status description (auto or user-set)
+ *   error-message    a captured error's message
+ *   error-detail     a captured error's detail
+ *   error-hint       a captured error's hint
+ *   error-filename   a captured error's source file name
+ *   error-funcname   a captured error's source function name
+ *   attrs            growing the attributes array
+ *   events           growing the events array
+ *   links            growing the links array
+ *   exception-attrs  the "exception" event's attribute array
+ *   event-attrs      an event's attribute-array copy (otel_span_add_event)
+ *   vprintf          the oversized buffer in otel_span_set_vprintf
+ *
+ * Four more sites precede a call that can raise ERROR for a reason other
+ * than a real OOM, armed the same way but with the callback itself doing
+ * the ereport (see tests/otel_api_conformance's injection callback):
+ *   resowner-enlarge  ResourceOwnerEnlarge() in otel_span_start()
+ *   slot-context      a slot's first AllocSetContextCreate() (take_slot)
+ *   tracer-register   otel_tracer_register() in otel_span_start()
+ *   owner-forget      ResourceOwnerForget() in end_slot(): models its
+ *                     "after release started" ERROR, not an OOM
+ *
+ * No site sits on a path reachable from a critical section: otel_api's
+ * own use of otel_span_context_of_internal() (from a commit-time trace-
+ * context callback) allocates nothing on any of its paths.
+ */
+static inline bool
+otel_inject_fail(const char *site)
+{
+	bool		fail = false;
+
+	INJECTION_POINT(site, &fail);
+	return fail;
+}
+
+/* Copy up to maxlen bytes of str, clipped at a character boundary. */
+static char *
+slot_strdup(OtelSlot *slot, const char *str, int maxlen, bool *truncated,
+			const char *site)
+{
+	size_t		len = strlen(str);
+	char	   *copy;
+
+	if (truncated)
+		*truncated = false;
+	if (maxlen >= 0 && len > (size_t) maxlen)
+	{
+		len = pg_mbcliplen(str, len, maxlen);
+		if (truncated)
+			*truncated = true;
+	}
+	if (slot->bytes + len + 1 > (Size) otel_max_span_bytes)
+		return NULL;
+	if (otel_inject_fail(site))
+		return NULL;
+	copy = MemoryContextAllocExtended(slot->cxt, len + 1, MCXT_ALLOC_NO_OOM);
+	if (copy == NULL)
+		return NULL;
+	memcpy(copy, str, len);
+	copy[len] = '\0';
+	slot->bytes += len + 1;
+	return copy;
+}
+
+/* Grow an array in the slot's context to hold at least want elements. */
+static bool
+slot_grow(OtelSlot *slot, void **arr, int *cap, int want, Size elemsize,
+		  void *inline_arr, const char *site)
+{
+	int			newcap;
+	void	   *newarr;
+
+	if (want <= *cap)
+		return true;
+	newcap = Max(want, *cap * 2);
+	newcap = Max(newcap, 4);
+	if (slot->bytes + (Size) (newcap - *cap) * elemsize > (Size) otel_max_span_bytes)
+		return false;
+	if (otel_inject_fail(site))
+		return false;
+	if (*arr == NULL || *arr == inline_arr)
+	{
+		newarr = MemoryContextAllocExtended(slot->cxt, newcap * elemsize,
+											MCXT_ALLOC_NO_OOM);
+		if (newarr != NULL && *arr != NULL)
+			memcpy(newarr, *arr, *cap * elemsize);
+	}
+	else
+		newarr = repalloc_extended(*arr, newcap * elemsize, MCXT_ALLOC_NO_OOM);
+	if (newarr == NULL)
+		return false;
+	slot->bytes += (Size) (newcap - *cap) * elemsize;
+	*arr = newarr;
+	*cap = newcap;
+	return true;
+}
+
+static const char *
+stack_entry_name(int32 e)
+{
+	return e >= 0 ? slots[e].span.name : "(unsampled span)";
+}
+
+static void
+nonlifo_warning(const char *what, int pos)
+{
+	otel_counters.non_lifo_end++;
+	if (!non_lifo_warned)
+	{
+		non_lifo_warned = true;
+		ereport(WARNING,
+				errmsg("otel_api: %s", what),
+				errdetail("Ending \"%s\" at stack depth %d; \"%s\" is on top at depth %d. "
+						  "The spans above it were ended first. "
+						  "Further occurrences in this backend are only counted.",
+						  stack_entry_name(span_stack[pos]), pos + 1,
+						  stack_entry_name(span_stack[span_stack_depth - 1]),
+						  span_stack_depth));
+	}
+	Assert(false);				/* spans must end in LIFO order */
+}
+
+
+/* ----------------------------------------------------------------
+ * The active stack
+ * ---------------------------------------------------------------- */
+
+static inline int32
+stack_entry_for_slot(int idx)
+{
+	return idx;
+}
+
+static inline int32
+stack_entry_for_nrec(int idx)
+{
+	return -idx - 1;
+}
+
+static int
+stack_find(int32 entry)
+{
+	for (int i = span_stack_depth - 1; i >= 0; i--)
+		if (span_stack[i] == entry)
+			return i;
+	return -1;
+}
+
+/* Push entry, recording whether it is an activation (see StackEntryMeta). */
+static inline void
+stack_push(int32 entry, bool is_activation, int nest_level)
+{
+	span_stack[span_stack_depth] = entry;
+	span_stack_meta[span_stack_depth].is_activation = is_activation;
+	span_stack_meta[span_stack_depth].nest_level = nest_level;
+	span_stack_depth++;
+}
+
+/* Remove the entry at position pos, closing the gap. */
+static void
+stack_remove_at(int pos)
+{
+	Assert(pos >= 0 && pos < span_stack_depth);
+	memmove(&span_stack[pos], &span_stack[pos + 1],
+			(span_stack_depth - pos - 1) * sizeof(span_stack[0]));
+	memmove(&span_stack_meta[pos], &span_stack_meta[pos + 1],
+			(span_stack_depth - pos - 1) * sizeof(span_stack_meta[0]));
+	span_stack_depth--;
+}
+
+static void
+free_nrec(int idx, bool by_owner)
+{
+	OtelNrec   *n = &nrecs[idx];
+
+	if (by_owner)
+		n->owner_released_gen = n->gen;
+	n->gen = 0;
+	n->next_free = nrec_free_head;
+	nrec_free_head = idx;
+}
+
+/*
+ * End everything above position pos on the stack, as happens when a span
+ * lower down ends first.  Recording spans end as if unwound.
+ */
+static void
+stack_unwind_above(int pos, const char *reason)
+{
+	while (span_stack_depth > pos + 1)
+	{
+		int32		e = span_stack[span_stack_depth - 1];
+		bool		is_activation = span_stack_meta[span_stack_depth - 1].is_activation;
+
+		span_stack_depth--;
+		if (is_activation)
+		{
+			/*
+			 * An activation names a .detached span some other
+			 * component still owns (e.g. a cursor's executor span).
+			 * Unwinding past it must only pop it off the active
+			 * stack, never end the span itself -- that would end a
+			 * span out from under its real owner.
+			 */
+			otel_counters.activation_unwound++;
+			continue;
+		}
+		if (e >= 0)
+			end_slot(e, 0, true, reason);
+		else
+			free_nrec(-e - 1, false);
+	}
+}
+
+/*
+ * cassert only: a .scoped span on the stack whose start frame has
+ * returned was leaked by an early return.  The stack grows down on every
+ * supported platform, so a current address above an address in the
+ * start frame means that frame is gone.  Frames of the same depth aren't
+ * detected; this finds leaks, it doesn't prove their absence.
+ */
+static void
+check_scoped_frames(void)
+{
+#ifdef USE_ASSERT_CHECKING
+	char		here;
+
+	for (int i = 0; i < span_stack_depth; i++)
+	{
+		int32		e = span_stack[i];
+
+		if (e >= 0 && slots[e].scope_frame != NULL &&
+			(char *) &here > (char *) slots[e].scope_frame)
+		{
+			elog(LOG, "otel_api: scoped span \"%s\" is still open after the function that started it returned",
+				 slots[e].span.name);
+			Assert(false);		/* .scoped span leaked by an early return */
+		}
+	}
+#endif
+}
+
+
+/* ----------------------------------------------------------------
+ * Parents and sampling
+ * ---------------------------------------------------------------- */
+
+typedef enum ParentKind
+{
+	PARENT_NONE,				/* new trace */
+	PARENT_REMOTE,				/* a context from outside this backend */
+	PARENT_SLOT,				/* a recording span here */
+	PARENT_NREC,				/* an unsampled span here */
+} ParentKind;
+
+typedef struct ResolvedParent
+{
+	ParentKind	kind;
+	int			idx;			/* PARENT_SLOT, PARENT_NREC */
+	OtelSpanContext ctx;		/* PARENT_REMOTE */
+} ResolvedParent;
+
+static void
+resolve_from_entry(int32 e, ResolvedParent *p)
+{
+	if (e >= 0)
+	{
+		p->kind = PARENT_SLOT;
+		p->idx = e;
+	}
+	else
+	{
+		p->kind = PARENT_NREC;
+		p->idx = -e - 1;
+	}
+}
+
+/* The parent a span started with OTEL_PARENT_ACTIVE gets. */
+static void
+resolve_active_parent(ResolvedParent *p)
+{
+	memset(p, 0, sizeof(*p));
+	if (span_stack_depth > 0)
+	{
+		resolve_from_entry(span_stack[span_stack_depth - 1], p);
+		return;
+	}
+	if (IsParallelWorker() && otel_parallel_get_leader_context(&p->ctx))
+	{
+		p->kind = PARENT_REMOTE;
+		return;
+	}
+	if (otel_root_ctx.is_set)
+	{
+		p->kind = PARENT_REMOTE;
+		p->ctx = otel_root_ctx.ctx;
+		p->ctx.tracestate = (otel_tracestate_guc && otel_tracestate_guc[0])
+			? otel_tracestate_guc : NULL;
+	}
+}
+
+static bool
+resolve_parent(const OtelSpanStartArgs *args, ResolvedParent *p)
+{
+	memset(p, 0, sizeof(*p));
+	switch (args->parent)
+	{
+		case OTEL_PARENT_ACTIVE:
+			resolve_active_parent(p);
+			return true;
+		case OTEL_PARENT_CONTEXT:
+			if (args->parent_ctx != NULL &&
+				otel_span_context_is_valid(args->parent_ctx))
+			{
+				p->kind = PARENT_REMOTE;
+				p->ctx = *args->parent_ctx;
+			}
+			return true;
+		case OTEL_PARENT_SPAN:
+			if (args->parent_span.v > 0)
+			{
+				OtelSlot   *ps = slot_for_ref(args->parent_span);
+
+				if (ps == NULL)
+					return false;
+				p->kind = PARENT_SLOT;
+				p->idx = ps - slots;
+			}
+			else if (args->parent_span.v < 0)
+			{
+				OtelNrec   *pn = nrec_for_ref(args->parent_span);
+
+				if (pn == NULL)
+					return false;
+				p->kind = PARENT_NREC;
+				p->idx = pn - nrecs;
+			}
+			return true;
+		case OTEL_PARENT_ROOT:
 			return true;
 	}
 	return false;
 }
 
 
-/*
- * MemoryContextCallback support.  When a consumer pushes a span via
- * api->span_link_to_active_and_push, we allocate a small node in
- * CurrentMemoryContext and register it as a reset callback.  When
- * that context is reset or deleted (typically by ereport unwinding
- * past the producer's PG_TRY) the callback pops the matching stack
- * entry, applying its unwind_policy.
- *
- * The node is freed automatically with the context; we never need
- * to free it explicitly.  If the consumer's span_emit pops the
- * entry first, the callback later finds nothing to do and harmless-
- * ly returns.
- *
- * The node lives in the same MemoryContext as the consumer's
- * CurrentMemoryContext at push time --- typically a per-statement
- * or per-function context, but the consumer can choose otherwise
- * by switching MemoryContext before calling
- * span_link_to_active_and_push.
- */
-typedef struct OtelSpanUnwindNode
+/* ----------------------------------------------------------------
+ * Slot allocation and release
+ * ---------------------------------------------------------------- */
+
+static bool
+ensure_pool(void)
 {
-	MemoryContextCallback cb;
-	char		span_id[OTEL_SPAN_ID_LEN + 1];
-} OtelSpanUnwindNode;
-
-
-/*
- * Helper: dispatch a span to the registered emit hook + the
- * built-in JSON-log emitter.  Both code paths (the existing
- * finalize_span in otel_trace.c, and the new api->span_emit
- * below) need this; for now we duplicate the small block in
- * the two sites rather than refactoring, since Commit B's goal
- * is purely additive.
- *
- * The PG_TRY/PG_CATCH wrapper ensures an exporter that ereports
- * doesn't disrupt the producer.  Tracing failures must not break
- * the query.
- */
-/*
- * Zero-config JSON-log fallback emitter.  Gated by
- * otel_api.emit_spans_to_log.  Used by dispatch_span below.  Moved
- * here from otel_trace.c when the query-tracing module split out
- * in Phase 4 --- the log-line emitter is producer-side
- * infrastructure, not query-tracing-specific.
- *
- * The JSON shape carries headline span identity, name, kind,
- * status, timing, attributes, and events.  Emitted as a single
- * LOG line prefixed with "otel-span: " for log-pipeline
- * filtering.
- */
-void
-otel_emit_span_as_log_line(const OtelSpan *span)
-{
-	StringInfoData buf;
-	int			i;
-	bool		first;
-
-	initStringInfo(&buf);
-
-	appendStringInfoChar(&buf, '{');
-
-	appendStringInfoString(&buf, "\"trace_id\":");
-	escape_json(&buf, span->trace_id);
-	appendStringInfoString(&buf, ",\"span_id\":");
-	escape_json(&buf, span->span_id);
-	appendStringInfoString(&buf, ",\"parent_span_id\":");
-	escape_json(&buf, span->parent_span_id);
-	appendStringInfoString(&buf, ",\"trace_flags\":");
-	escape_json(&buf, span->trace_flags);
-	if (span->tracestate)
-	{
-		appendStringInfoString(&buf, ",\"tracestate\":");
-		escape_json(&buf, span->tracestate);
-	}
-	appendStringInfoString(&buf, ",\"name\":");
-	escape_json(&buf, span->name ? span->name : "");
-	appendStringInfo(&buf, ",\"kind\":%d", (int) span->kind);
-	appendStringInfo(&buf, ",\"status\":%d", (int) span->status);
-	appendStringInfo(&buf, ",\"start_time\":%" PRId64,
-					 (int64) span->start_time);
-	appendStringInfo(&buf, ",\"end_time\":%" PRId64,
-					 (int64) span->end_time);
-
-	appendStringInfoString(&buf, ",\"attributes\":{");
-	first = true;
-	for (i = 0; i < span->n_attrs; i++)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		escape_json(&buf, span->attrs[i].key ? span->attrs[i].key : "");
-		appendStringInfoChar(&buf, ':');
-		escape_json(&buf, span->attrs[i].value ? span->attrs[i].value : "");
-	}
-	for (i = 0; i < span->n_overflow_attrs; i++)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		first = false;
-		escape_json(&buf, span->overflow_attrs[i].key ? span->overflow_attrs[i].key : "");
-		appendStringInfoChar(&buf, ':');
-		escape_json(&buf, span->overflow_attrs[i].value ? span->overflow_attrs[i].value : "");
-	}
-	appendStringInfoChar(&buf, '}');
-
-	/*
-	 * Events: the unified generic list.  Any ereport-derived
-	 * "exception" event has already been lowered into span->events by
-	 * otel_producer_span_emit before dispatch, so this path is fully
-	 * generic --- name, time, and attrs.  There is no longer any
-	 * elevel/sqlstate/filename/... special-casing here.
-	 */
-	appendStringInfoString(&buf, ",\"events\":[");
-	for (i = 0; i < span->n_events; i++)
-	{
-		const OtelSpanEvent *e = &span->events[i];
-		int			j;
-
-		if (i > 0)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfoChar(&buf, '{');
-		appendStringInfoString(&buf, "\"name\":");
-		escape_json(&buf, e->name ? e->name : "");
-		appendStringInfo(&buf, ",\"time\":%" PRId64, (int64) e->time);
-		appendStringInfoString(&buf, ",\"attributes\":{");
-		for (j = 0; j < e->n_attrs; j++)
-		{
-			if (j > 0)
-				appendStringInfoChar(&buf, ',');
-			escape_json(&buf, e->attrs[j].key ? e->attrs[j].key : "");
-			appendStringInfoChar(&buf, ':');
-			escape_json(&buf, e->attrs[j].value ? e->attrs[j].value : "");
-		}
-		appendStringInfoChar(&buf, '}');
-		appendStringInfoChar(&buf, '}');
-	}
-	appendStringInfoChar(&buf, ']');
-
-	/* Span links (associations with spans in other traces). */
-	if (span->n_links > 0)
-	{
-		appendStringInfoString(&buf, ",\"links\":[");
-		for (i = 0; i < span->n_links; i++)
-		{
-			if (i > 0)
-				appendStringInfoChar(&buf, ',');
-			appendStringInfoString(&buf, "{\"trace_id\":");
-			escape_json(&buf, span->links[i].trace_id);
-			appendStringInfoString(&buf, ",\"span_id\":");
-			escape_json(&buf, span->links[i].span_id);
-			appendStringInfoString(&buf, ",\"trace_flags\":");
-			escape_json(&buf, span->links[i].trace_flags);
-			appendStringInfoChar(&buf, '}');
-		}
-		appendStringInfoChar(&buf, ']');
-	}
-
-	if (span->scope)
-	{
-		appendStringInfoString(&buf, ",\"scope\":{\"name\":");
-		escape_json(&buf, span->scope->name ? span->scope->name : "");
-		if (span->scope->version)
-		{
-			appendStringInfoString(&buf, ",\"version\":");
-			escape_json(&buf, span->scope->version);
-		}
-		if (span->scope->schema_url)
-		{
-			appendStringInfoString(&buf, ",\"schema_url\":");
-			escape_json(&buf, span->scope->schema_url);
-		}
-		appendStringInfoString(&buf, "}");
-	}
-
-	appendStringInfoChar(&buf, '}');
-
-	ereport(LOG,
-			(errmsg_internal("otel-span: %s", buf.data)));
-
-	pfree(buf.data);
+	if (likely(slots != NULL))
+		return true;
+	if (span_pool_cxt == NULL)
+		span_pool_cxt = AllocSetContextCreate(TopMemoryContext, "otel_api span pool",
+											  ALLOCSET_SMALL_SIZES);
+	nslots = otel_max_open_spans;
+	if (otel_inject_fail("otel-api-oom-pool"))
+		return false;
+	/* Not zeroed: slots are initialised when first handed out. */
+	slots = MemoryContextAllocExtended(span_pool_cxt, sizeof(OtelSlot) * nslots,
+									   MCXT_ALLOC_NO_OOM | MCXT_ALLOC_HUGE);
+	return slots != NULL;
 }
 
+/* Take a free slot, creating its memory context if needed. */
+static int
+take_slot(void)
+{
+	int			idx;
+	OtelSlot   *slot;
+
+	if (slot_free_head >= 0)
+	{
+		idx = slot_free_head;
+		slot_free_head = slots[idx].next_free;
+	}
+	else if (slots_used < nslots)
+	{
+		idx = slots_used++;
+		memset(&slots[idx], 0, sizeof(OtelSlot));
+	}
+	else
+		return -1;
+
+	slot = &slots[idx];
+	if (slot->cxt == NULL)
+	{
+		/* Can raise ERROR on OOM; the slot is still free if it does. */
+		PG_TRY();
+		{
+			INJECTION_POINT("otel-api-oom-slot-context", NULL);
+			slot->cxt = AllocSetContextCreate(span_pool_cxt, "otel_api span",
+											  ALLOCSET_SMALL_SIZES);
+		}
+		PG_CATCH();
+		{
+			slot->next_free = slot_free_head;
+			slot_free_head = idx;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	return idx;
+}
+
+static void
+release_slot(int idx, bool by_owner)
+{
+	OtelSlot   *slot = &slots[idx];
+	MemoryContext cxt = slot->cxt;
+	uint32		released = by_owner ? slot->gen : slot->owner_released_gen;
+
+	if (slot->owner != NULL && !by_owner)
+		ResourceOwnerForget(slot->owner, Int64GetDatum(make_ref(slot->gen, idx, true).v),
+							&otel_span_resowner_desc);
+	if (slot->session)
+		session_spans_open--;
+	MemoryContextReset(cxt);
+	memset(slot, 0, sizeof(OtelSlot));
+	slot->cxt = cxt;
+	slot->owner_released_gen = released;
+	slot->next_free = slot_free_head;
+	slot_free_head = idx;
+}
+
+
+/* ----------------------------------------------------------------
+ * Errors
+ * ---------------------------------------------------------------- */
+
+/*
+ * Record edata in the slot, keeping the most severe error (the latest,
+ * on a tie).  Copies everything, with MCXT_ALLOC_NO_OOM: a field that
+ * can't be copied is left NULL.  Never raises an error.
+ */
+static void
+slot_record_error(OtelSlot *slot, const ErrorData *edata)
+{
+	OtelSlotError *err = &slot->err;
+	bool		oom = edata->sqlerrcode == ERRCODE_OUT_OF_MEMORY;
+
+	if (err->used && edata->elevel < err->elevel)
+		return;
+
+	memset(err, 0, sizeof(*err));
+	err->used = true;
+	err->elevel = edata->elevel;
+	err->lineno = edata->lineno;
+	err->time = GetCurrentTimestamp();
+	strlcpy(err->sqlstate, unpack_sql_state(edata->sqlerrcode), sizeof(err->sqlstate));
+
+	/* After an OOM, don't make the allocator's day worse. */
+	if (!oom)
+	{
+		if (edata->message)
+			err->message = slot_strdup(slot, edata->message, otel_attr_value_max, NULL,
+										"otel-api-oom-error-message");
+		if (edata->detail)
+			err->detail = slot_strdup(slot, edata->detail, otel_attr_value_max, NULL,
+									  "otel-api-oom-error-detail");
+		if (edata->hint)
+			err->hint = slot_strdup(slot, edata->hint, otel_attr_value_max, NULL,
+									"otel-api-oom-error-hint");
+		/* May point into JIT code unloaded at transaction end: copy. */
+		if (edata->filename)
+			err->filename = slot_strdup(slot, edata->filename, -1, NULL,
+										"otel-api-oom-error-filename");
+		if (edata->funcname)
+			err->funcname = slot_strdup(slot, edata->funcname, -1, NULL,
+										"otel-api-oom-error-funcname");
+		if ((edata->message && !err->message) || (edata->detail && !err->detail) ||
+			(edata->hint && !err->hint))
+			otel_counters.error_capture_failed++;
+	}
+	else
+		otel_counters.error_capture_failed++;
+
+	if (edata->elevel >= ERROR)
+		slot->span.status = OTEL_STATUS_ERROR;
+}
+
+/*
+ * "SQLSTATE / message" in the slot's context, for a status description.
+ * NULL if it can't be allocated.
+ */
+static const char *
+error_description(OtelSlot *slot, const char *sqlstate, const char *message)
+{
+	char	   *buf;
+
+	if (otel_inject_fail("otel-api-oom-status-description"))
+		return NULL;
+	buf = MemoryContextAllocExtended(slot->cxt, 256, MCXT_ALLOC_NO_OOM);
+
+	if (buf)
+	{
+		if (message)
+			snprintf(buf, 256, "%s / %s", sqlstate, message);
+		else
+			strlcpy(buf, sqlstate, 256);
+	}
+	return buf;
+}
+
+/*
+ * emit_log_hook: record WARNING and worse into the innermost recording
+ * span.  An ERROR goes into the innermost recording span that isn't a
+ * session span, since the abort that follows ends and exports it; that
+ * span gets the exception event.  The other non-session spans on the
+ * stack are ended by the same abort: they get ERROR status and the
+ * SQLSTATE and message as their status description, but no event.
+ * Session spans outlive the abort and are left alone.
+ *
+ * This runs for errors that reach EmitErrorReport, which for a top-level
+ * ERROR is before transaction abort releases the spans.  Errors caught
+ * before that (plpgsql EXCEPTION, C PG_CATCH) need
+ * otel_span_capture_error().
+ */
+static void
+otel_emit_log_hook(ErrorData *edata)
+{
+	if (edata->elevel >= WARNING && CritSectionCount == 0)
+	{
+		bool		recorded = false;
+
+		for (int i = span_stack_depth - 1; i >= 0; i--)
+		{
+			int32		e = span_stack[i];
+			OtelSlot   *slot;
+
+			if (e < 0 || slots[e].dispatching)
+				continue;
+			slot = &slots[e];
+			if (edata->elevel < ERROR)
+			{
+				slot_record_error(slot, edata);
+				break;
+			}
+			if (slot->session)
+				continue;
+			if (!recorded)
+			{
+				slot_record_error(slot, edata);
+				recorded = true;
+			}
+			else
+			{
+				slot->span.status = OTEL_STATUS_ERROR;
+				if (slot->span.status_description == NULL &&
+					edata->sqlerrcode != ERRCODE_OUT_OF_MEMORY)
+					slot->span.status_description =
+						error_description(slot, unpack_sql_state(edata->sqlerrcode),
+										  edata->message);
+			}
+		}
+	}
+	if (prev_emit_log_hook)
+		prev_emit_log_hook(edata);
+}
+
+/* Lower a captured error into an "exception" event and status text. */
+static void
+lower_error_event(OtelSlot *slot)
+{
+	OtelSlotError *err = &slot->err;
+	OtelAttribute a[8];
+	int			n = 0;
+	OtelSpanEvent *ev;
+
+	a[n++] = OTEL_ATTR_STR(OTEL_SC_EXCEPTION_TYPE, err->sqlstate);
+	if (err->message)
+		a[n++] = OTEL_ATTR_STR(OTEL_SC_EXCEPTION_MESSAGE, err->message);
+	a[n++] = OTEL_ATTR_I64(OTEL_PG_ERROR_ELEVEL, err->elevel);
+	if (err->detail)
+		a[n++] = OTEL_ATTR_STR(OTEL_PG_ERROR_DETAIL, err->detail);
+	if (err->hint)
+		a[n++] = OTEL_ATTR_STR(OTEL_PG_ERROR_HINT, err->hint);
+	if (err->funcname)
+		a[n++] = OTEL_ATTR_STR(OTEL_SC_CODE_FUNCTION_NAME, err->funcname);
+	if (err->filename)
+		a[n++] = OTEL_ATTR_STR(OTEL_SC_CODE_FILE_PATH, err->filename);
+	a[n++] = OTEL_ATTR_I64(OTEL_SC_CODE_LINE_NUMBER, err->lineno);
+
+	/* The strings are already in the slot's context: store, don't copy. */
+	if (slot_grow(slot, (void **) &slot->events, &slot->events_cap,
+				  slot->span.n_events + 1, sizeof(OtelSpanEvent), NULL,
+				  "otel-api-oom-events"))
+	{
+		OtelAttribute *attrs = otel_inject_fail("otel-api-oom-exception-attrs") ? NULL :
+			MemoryContextAllocExtended(slot->cxt, sizeof(a[0]) * n, MCXT_ALLOC_NO_OOM);
+
+		ev = &slot->events[slot->span.n_events++];
+		ev->name = OTEL_SC_EXCEPTION_EVENT;
+		ev->time = err->time;
+		ev->n_attrs = attrs ? n : 0;
+		ev->attrs = attrs;
+		if (attrs)
+			memcpy(attrs, a, sizeof(a[0]) * n);
+	}
+	else
+		slot->span.dropped_events++;
+
+	if (slot->span.status == OTEL_STATUS_ERROR && slot->span.status_description == NULL)
+		slot->span.status_description = error_description(slot, err->sqlstate, err->message);
+}
+
+
+/* ----------------------------------------------------------------
+ * Ending and dispatching
+ * ---------------------------------------------------------------- */
 
 static void
 dispatch_span(const OtelSpan *span)
 {
 	otel_span_emit_hook_type emit_hook = otel_get_span_emit_hook();
+	uint32		save_holdoff;
+	uint32		save_query_cancel_holdoff;
+	MemoryContext save_cxt;
+	int			save_depth = dispatch_depth;
 
 	if (emit_hook == NULL && !otel_emit_spans_to_log)
 		return;
 
+	save_holdoff = InterruptHoldoffCount;
+	save_query_cancel_holdoff = QueryCancelHoldoffCount;
+	save_cxt = CurrentMemoryContext;
 	PG_TRY();
 	{
+		dispatch_depth++;
 		if (emit_hook)
 			emit_hook(span);
 		if (otel_emit_spans_to_log)
 			otel_emit_span_as_log_line(span);
+		dispatch_depth--;
 	}
 	PG_CATCH();
 	{
+		/*
+		 * A tracing failure must not break the traced operation.
+		 * errfinish() zeroes InterruptHoldoffCount and
+		 * QueryCancelHoldoffCount before throwing, and error handling
+		 * leaves CurrentMemoryContext as ErrorContext; restore all three
+		 * (see the comment in errfinish()).
+		 */
+		MemoryContextSwitchTo(save_cxt);
+		dispatch_depth = save_depth;
+		InterruptHoldoffCount = save_holdoff;
+		QueryCancelHoldoffCount = save_query_cancel_holdoff;
 		FlushErrorState();
+		otel_counters.emit_hook_errors++;
 	}
 	PG_END_TRY();
+	otel_counters.spans_emitted++;
 }
 
-
 /*
- * Pop entries from the top of the stack down to (but excluding) a
- * target index, applying each entry's unwind_policy.  Used by both
- * the MemoryContextCallback (which is then called with target -1
- * to drain everything matching the callback) and by span_emit on
- * the out-of-order path.
+ * End the span in slot idx: export it and free the slot.  The caller
+ * has taken it off the active stack.  unwinding means the span didn't
+ * reach otel_span_end(): it is exported with ERROR status, since
+ * storage is owned by otel_api and exporting is always memory-safe.
  *
- * For OTEL_UNWIND_ERROR entries with a non-NULL span pointer:
- *	   * status is set to OTEL_STATUS_ERROR (unless already set);
- *	   * status_description is set to the supplied reason string;
- *	   * end_time is set to now;
- *	   * dispatch_span is called.
- *
- * For OTEL_UNWIND_DROP entries: nothing besides the pop.
+ * Forget the resource-owner entry before dispatching.
+ * ResourceOwnerForget() raises ERROR if the owner has started releasing;
+ * the span is then still unexported and still owned, and the owner's
+ * release exports it once.  From the forget to the slot reset in
+ * release_slot(), nothing may raise ERROR: dispatch_span() catches
+ * errors, and lower_error_event() allocates with MCXT_ALLOC_NO_OOM.
  */
 static void
-unwind_to(int target_top, const char *reason)
+end_slot(int idx, TimestampTz end_time, bool unwinding, const char *unwind_reason)
 {
-	while (span_stack_top > target_top)
-	{
-		OtelSpanStackEntry *e = &span_stack[span_stack_top];
+	OtelSlot   *slot = &slots[idx];
 
-		if (e->unwind_policy == OTEL_UNWIND_ERROR && e->span != NULL)
-		{
-			if (e->span->status == OTEL_STATUS_UNSET)
-				e->span->status = OTEL_STATUS_ERROR;
-			e->span->status_description = reason;
-			e->span->end_time = GetCurrentTimestamp();
-			dispatch_span(e->span);
-		}
-		/* Clear before decrementing so a future re-push to this slot
-		 * starts with a clean slate. */
-		e->span = NULL;
-		span_stack_top--;
+	Assert(!slot->dispatching);
+
+	if (slot->owner != NULL)
+	{
+		/* Test-only: see the injection-point doc comment above. */
+		INJECTION_POINT("otel-api-oom-owner-forget", NULL);
+		ResourceOwnerForget(slot->owner, Int64GetDatum(make_ref(slot->gen, idx, true).v),
+							&otel_span_resowner_desc);
+		slot->owner = NULL;
 	}
+
+	if (unwinding)
+	{
+		slot->span.status = OTEL_STATUS_ERROR;
+		if (!slot->err.used && slot->span.status_description == NULL)
+			slot->span.status_description = unwind_reason;
+		otel_counters.unwound++;
+	}
+
+	slot->span.end_time = end_time ? end_time : GetCurrentTimestamp();
+	if (slot->err.used)
+		lower_error_event(slot);
+	slot->span.attrs = slot->attrs;
+	slot->span.events = slot->events;
+	slot->span.links = slot->links;
+	slot->dispatching = true;
+	dispatch_span(&slot->span);
+	slot->dispatching = false;
+	release_slot(idx, false);
+}
+
+/* ResourceOwnerDesc.DebugPrint: called only for a span leaked at commit. */
+static char *
+otel_span_debug_print(Datum res)
+{
+	OtelSpanRef s = {DatumGetInt64(res)};
+	int			idx = ref_idx(s);
+
+	if (idx < slots_used && slots[idx].gen == ref_gen(s))
+	{
+		slots[idx].leaked = true;
+		return psprintf("otel_api span \"%s\"", slots[idx].span.name);
+	}
+	return pstrdup("otel_api span (stale)");
 }
 
 /*
- * MemoryContextCallback driver.  Called when the consumer's
- * CurrentMemoryContext (at push time) is reset or deleted ---
- * typically because ereport unwound through it.  Find the matching
- * span_id in the stack and unwind THAT ENTRY ONLY.
+ * ResourceOwnerDesc.ReleaseResource: the owner is being released.
  *
- * Critically: we do NOT touch entries above the matched one.  A
- * producer that pushes A under context ctx-A, then
- * MemoryContextSwitchTo(ctx-B) and pushes B (with ctx-B's reset
- * scope), produces a stack with A at a lower index than B but a
- * callback registered against ctx-A.  When ctx-A resets, this
- * callback fires for A's entry.  B was pushed under ctx-B, which
- * has not been reset; B's stack entry must survive.
- *
- * Implementation: remove the matched entry in place and slide
- * entries above it down by one.  span_stack_top decrements by one.
- * Lookup keys (span_id) are stable across the move because each
- * entry is a value-copy.  Callbacks for entries that moved still
- * find their span_id via memcmp at the new index.
+ * ResourceOwnerReleaseAll() drops an entry only after this returns.  If
+ * an emit hook raises FATAL while the span is dispatched from here, the
+ * entry stays, and backend exit (AbortOutOfAnyTransaction) releases the
+ * owner again.  The span is then still dispatching: free it without
+ * exporting it a second time.
  */
 static void
-on_memory_context_reset(void *arg)
+otel_span_release_resource(Datum res)
 {
-	OtelSpanUnwindNode *node = (OtelSpanUnwindNode *) arg;
-	int			i;
+	OtelSpanRef s = {DatumGetInt64(res)};
+	int			idx = ref_idx(s);
+	OtelSlot   *slot;
+	int			pos;
 
-	/*
-	 * Unwind-stack lookup invariant: span_id values on the active stack are
-	 * unique (enforced by the duplicate-check in both push functions).
-	 * Stopping at the first match is therefore correct and sufficient ---
-	 * there can be at most one matching entry.
-	 */
-	for (i = span_stack_top; i >= 0; i--)
-	{
-		OtelSpanStackEntry *e = &span_stack[i];
-
-		if (memcmp(e->span_id, node->span_id,
-				   sizeof(node->span_id)) == 0)
-		{
-			/* Apply unwind_policy to THIS entry only. */
-			if (e->unwind_policy == OTEL_UNWIND_ERROR && e->span != NULL)
-			{
-				if (e->span->status == OTEL_STATUS_UNSET)
-					e->span->status = OTEL_STATUS_ERROR;
-				e->span->status_description = "unwound by ereport";
-				e->span->end_time = GetCurrentTimestamp();
-				dispatch_span(e->span);
-			}
-
-			/* Remove the matched entry; slide entries above down by
-			 * one to keep the stack contiguous.  For a top-of-stack
-			 * match the loop body executes zero times --- a
-			 * straightforward pop. */
-			for (int j = i; j < span_stack_top; j++)
-				span_stack[j] = span_stack[j + 1];
-			memset(&span_stack[span_stack_top], 0,
-				   sizeof(span_stack[span_stack_top]));
-			span_stack_top--;
-			return;
-		}
-	}
-	/* Not found: span_emit already popped it, so this callback is a
-	 * no-op.  This is the common success path: explicit emit beats
-	 * the callback every time. */
-}
-
-
-/* ====================================================================
- * Producer API functions exposed via OtelTracingApi function pointers.
- * Bound into the api struct in otel_api.c.
- * ==================================================================== */
-
-/*
- * api_span_link_to_active_and_push --- the common-case "start a new
- * nested span" entry point.  Sets span->trace_id and
- * span->parent_span_id from the current top-of-stack (or root
- * context if the stack is empty), then pushes the new span onto
- * the active stack.
- *
- * If neither the stack nor the root context is set, the new span
- * starts a brand-new trace: span->trace_id stays whatever the
- * caller pre-populated (typically a freshly-generated one from
- * otel_span_init), span->parent_span_id stays zeroed.  The new
- * span IS still pushed in that case --- it becomes the root of
- * the active call-stack-based trace for this backend.
- *
- * If the stack is already at MAX_SPAN_STACK_DEPTH, parent linkage
- * is still computed correctly (preserving trace topology) but the
- * span is NOT pushed.  Subsequent pushes will all share the same
- * deepest-pushed parent --- approximately right since they share
- * the same logical scope.  Commit C adds WARNING + counter for
- * observable overflow.
- */
-/*
- * check_unwind_context --- defensive misuse check for push time.
- *
- * The push functions register a MemoryContextResetCallback against
- * the active CurrentMemoryContext.  Under OTEL_UNWIND_ERROR that
- * callback is the safety net that emits an aborted span on ereport
- * unwind --- but only if the context actually resets in the normal
- * course of operation.  TopMemoryContext, CacheMemoryContext, and
- * ErrorContext don't, so binding the safety net to them silently
- * defeats it.
- *
- * Emit a LOG-level message (server log only --- never delivered to
- * the client connection, which is the right severity for an API
- * misuse the SQL caller had no way to cause) and Assert() so cassert
- * builds crash where the bug is rather than later when the missing
- * span causes a confusing absence in trace output.
- *
- * Only fires under OTEL_UNWIND_ERROR; under OTEL_UNWIND_DROP the
- * callback isn't load-bearing, so the context choice is harmless.
- */
-static void
-check_unwind_context(const OtelSpan *span)
-{
-	if (span->unwind_policy != OTEL_UNWIND_ERROR)
+	if (idx >= slots_used || slots[idx].gen != ref_gen(s))
 		return;
+	slot = &slots[idx];
+	slot->owner = NULL;			/* the owner has already forgotten it */
 
-	if (CurrentMemoryContext == TopMemoryContext ||
-		CurrentMemoryContext == CacheMemoryContext ||
-		CurrentMemoryContext == ErrorContext)
+	pos = stack_find(stack_entry_for_slot(idx));
+	if (pos >= 0)
+		stack_remove_at(pos);
+
+	if (slot->leaked || slot->dispatching)
 	{
-		ereport(LOG,
-				(errmsg("otel_api: span pushed under OTEL_UNWIND_ERROR with a long-lived MemoryContext"),
-				 errdetail("CurrentMemoryContext = \"%s\"; the MemoryContextResetCallback that drives the unwind safety net will not fire as expected.",
-						   CurrentMemoryContext->name),
-				 errhint("MemoryContextSwitchTo a per-statement or per-executor context before calling the push function.")));
-		Assert(false);
-	}
-}
-
-/*
- * otel_producer_span_push --- push the span onto the active stack
- * without fetching a parent context.  Used internally by
- * otel_trace.c during Phase 2 migration so the existing
- * start_span / start_utility_span code can populate parent fields
- * themselves (including the parallel-worker leader-span-id logic
- * that takes priority over otel_ctx.span_id) and just push the
- * result onto the stack.
- *
- * Caller is responsible for populating span->span_id,
- * span->trace_flags, and span->unwind_policy before calling.
- *
- * Behaviour on overflow / MemoryContextCallback registration is
- * identical to otel_producer_span_link_to_active_and_push.
- */
-void
-otel_producer_span_push(OtelSpan *span)
-{
-	if (span == NULL)
-		return;
-
-	check_unwind_context(span);
-
-	if (span_stack_top + 1 < MAX_SPAN_STACK_DEPTH)
-	{
-		OtelSpanStackEntry *entry;
-		OtelSpanUnwindNode *node;
-
-		/*
-		 * Uniqueness invariant: every span_id on the active stack must be
-		 * distinct.  The unwind lookup (on_memory_context_reset and
-		 * otel_producer_span_emit) does a linear scan and treats the first
-		 * match as canonical --- a duplicate would silently pop the wrong
-		 * entry and corrupt stack state.
-		 *
-		 * In assert builds, die loudly so the caller can fix the ID
-		 * generation bug.  In production builds, emit a WARNING and refuse
-		 * to push the duplicate rather than silently corrupt the stack.
-		 */
-		if (span_id_on_stack(span->span_id))
-		{
-			Assert(false);		/* duplicate span_id in push path */
-			ereport(WARNING,
-					(errmsg("otel: duplicate span_id \"%s\" already on active stack; push refused",
-							span->span_id),
-					 errdetail("The span was not pushed. span_id uniqueness is required for correct unwind-stack operation."),
-					 errhint("Check span_id generation; pg_strong_random failure may be producing colliding fallback IDs.")));
-			return;
-		}
-
-		span_stack_top++;
-		entry = &span_stack[span_stack_top];
-		memcpy(entry->trace_id, span->trace_id, sizeof(entry->trace_id));
-		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
-		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
-		entry->unwind_policy = span->unwind_policy;
-		/*
-		 * Only OTEL_UNWIND_ERROR ever needs to dereference the
-		 * borrowed pointer at unwind time.  Under OTEL_UNWIND_DROP
-		 * store NULL outright so there is structurally no
-		 * dangling-pointer hazard --- even an on-stack OtelSpan
-		 * cannot become a stale dereference target.
-		 */
-		entry->span = (span->unwind_policy == OTEL_UNWIND_ERROR) ? span : NULL;
-
-		node = (OtelSpanUnwindNode *) MemoryContextAllocExtended(CurrentMemoryContext,
-																 sizeof(*node),
-																 MCXT_ALLOC_NO_OOM);
-		if (node != NULL)
-		{
-			memcpy(node->span_id, span->span_id, sizeof(node->span_id));
-			node->cb.func = on_memory_context_reset;
-			node->cb.arg = node;
-			MemoryContextRegisterResetCallback(CurrentMemoryContext, &node->cb);
-		}
-	}
-	else
-	{
-		if (!stack_overflow_warned)
-		{
-			ereport(WARNING,
-					(errmsg("otel: span-stack overflow at depth %d",
-							MAX_SPAN_STACK_DEPTH),
-					 errdetail("Further over-cap spans in this backend will still link to the deepest-pushed parent for correctness but will not be pushed onto the active stack."),
-					 errhint("Reduce instrumentation nesting or, if the workload genuinely needs deeper nesting, increase MAX_SPAN_STACK_DEPTH and rebuild contrib/otel.")));
-			stack_overflow_warned = true;
-		}
-	}
-}
-
-void
-otel_producer_span_link_to_active_and_push(OtelSpan *span)
-{
-	if (span == NULL)
-		return;
-
-	check_unwind_context(span);
-
-	/* Fetch parent: top-of-stack > root context > none. */
-	if (span_stack_top >= 0)
-	{
-		const OtelSpanStackEntry *top = &span_stack[span_stack_top];
-
-		memcpy(span->trace_id, top->trace_id, sizeof(span->trace_id));
-		memcpy(span->parent_span_id, top->span_id, sizeof(span->parent_span_id));
-		memcpy(span->trace_flags, top->trace_flags, sizeof(span->trace_flags));
-	}
-	else if (otel_ctx.is_set)
-	{
-		memcpy(span->trace_id, otel_ctx.trace_id, sizeof(span->trace_id));
-		memcpy(span->parent_span_id, otel_ctx.span_id, sizeof(span->parent_span_id));
-		memcpy(span->trace_flags, otel_ctx.trace_flags, sizeof(span->trace_flags));
-	}
-	/* else: root span of a brand-new trace; caller's pre-populated
-	 * trace_id/span_id are used as-is, parent_span_id stays zero. */
-
-	/* Push onto stack if there's room. */
-	if (span_stack_top + 1 < MAX_SPAN_STACK_DEPTH)
-	{
-		OtelSpanStackEntry *entry;
-		OtelSpanUnwindNode *node;
-
-		/*
-		 * Uniqueness invariant: every span_id on the active stack must be
-		 * distinct.  See the identical check in otel_producer_span_push for
-		 * the full rationale.
-		 */
-		if (span_id_on_stack(span->span_id))
-		{
-			Assert(false);		/* duplicate span_id in push path */
-			ereport(WARNING,
-					(errmsg("otel: duplicate span_id \"%s\" already on active stack; push refused",
-							span->span_id),
-					 errdetail("The span was not pushed. span_id uniqueness is required for correct unwind-stack operation."),
-					 errhint("Check span_id generation; pg_strong_random failure may be producing colliding fallback IDs.")));
-			return;
-		}
-
-		span_stack_top++;
-		entry = &span_stack[span_stack_top];
-		memcpy(entry->trace_id, span->trace_id, sizeof(entry->trace_id));
-		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
-		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
-		entry->unwind_policy = span->unwind_policy;
-		/* DROP entries store NULL --- see otel_producer_span_push. */
-		entry->span = (span->unwind_policy == OTEL_UNWIND_ERROR) ? span : NULL;
-
-		/*
-		 * Register a MemoryContextCallback against CurrentMemoryContext
-		 * so that an ereport unwind through the producer's context
-		 * correctly pops this entry and applies its unwind_policy.
-		 * The node lives in CurrentMemoryContext and is freed
-		 * automatically when that context is reset/deleted (after the
-		 * callback fires).
-		 *
-		 * On allocation failure the call is downgraded: we still push
-		 * the entry, but no callback is installed.  An ereport-unwind
-		 * in that case leaves a stale stack entry that span_emit /
-		 * span_link_to_active_and_push will eventually find and step
-		 * past (the next emit with a matching span_id pops it; pushes
-		 * past stack-overflow keep parent linkage correct).  The
-		 * cost is one missing emit-as-ERROR on unwind for an
-		 * OTEL_UNWIND_ERROR span --- acceptable under OOM.
-		 */
-		node = (OtelSpanUnwindNode *) MemoryContextAllocExtended(CurrentMemoryContext,
-																 sizeof(*node),
-																 MCXT_ALLOC_NO_OOM);
-		if (node != NULL)
-		{
-			memcpy(node->span_id, span->span_id, sizeof(node->span_id));
-			node->cb.func = on_memory_context_reset;
-			node->cb.arg = node;
-			MemoryContextRegisterResetCallback(CurrentMemoryContext, &node->cb);
-		}
-	}
-	else
-	{
-		/* Stack overflow.  Parent linkage was set above so the new
-		 * span still threads correctly into the trace; we just don't
-		 * push it.  Subsequent pushes beyond MAX_SPAN_STACK_DEPTH
-		 * will all chain to the same deepest-pushed parent ---
-		 * approximately right since they share the same logical
-		 * scope.
-		 *
-		 * Emit one WARNING per backend session; otherwise pathologic-
-		 * ally recursive instrumentation could spam the log. */
-		if (!stack_overflow_warned)
-		{
-			ereport(WARNING,
-					(errmsg("otel: span-stack overflow at depth %d",
-							MAX_SPAN_STACK_DEPTH),
-					 errdetail("Further over-cap spans in this backend will still link to the deepest-pushed parent for correctness but will not be pushed onto the active stack."),
-					 errhint("Reduce instrumentation nesting or, if the workload genuinely needs deeper nesting, increase MAX_SPAN_STACK_DEPTH and rebuild contrib/otel.")));
-			stack_overflow_warned = true;
-		}
-	}
-}
-
-/*
- * api_span_set_parent_explicit --- caller provides parent
- * SpanContext directly; stack is untouched.  Used for spans that
- * belong to a trace maintained independently of the active
- * call-stack-based trace (background work, sibling spans, etc.).
- *
- * If `parent` is NULL, span identity stays as the caller
- * pre-populated it.
- */
-void
-otel_producer_span_set_parent_explicit(OtelSpan *span, const OtelSpanContext *parent)
-{
-	if (span == NULL || parent == NULL)
-		return;
-
-	memcpy(span->trace_id, parent->trace_id, sizeof(span->trace_id));
-	memcpy(span->parent_span_id, parent->span_id, sizeof(span->parent_span_id));
-	memcpy(span->trace_flags, parent->trace_flags, sizeof(span->trace_flags));
-	/* tracestate is read from the otel_tracestate_guc at emit time
-	 * --- not stored per-span.  Callers that need a span-specific
-	 * tracestate divergence should set the GUC before emit. */
-}
-
-/*
- * api_span_current_context --- return SpanContext of the topmost
- * stack entry, or of the root context if the stack is empty, or
- * NULL if neither is set.  The returned pointer is valid until
- * the next API call that may modify the stack or root context.
- */
-const OtelSpanContext *
-otel_producer_span_current_context(void)
-{
-	if (span_stack_top >= 0)
-	{
-		const OtelSpanStackEntry *top = &span_stack[span_stack_top];
-
-		memcpy(current_ctx_buf.trace_id, top->trace_id, sizeof(current_ctx_buf.trace_id));
-		memcpy(current_ctx_buf.span_id, top->span_id, sizeof(current_ctx_buf.span_id));
-		memcpy(current_ctx_buf.trace_flags, top->trace_flags, sizeof(current_ctx_buf.trace_flags));
-		current_ctx_buf.tracestate = otel_tracestate_guc;
-		return &current_ctx_buf;
-	}
-	else if (otel_ctx.is_set)
-	{
-		memcpy(root_ctx_buf.trace_id, otel_ctx.trace_id, sizeof(root_ctx_buf.trace_id));
-		memcpy(root_ctx_buf.span_id, otel_ctx.span_id, sizeof(root_ctx_buf.span_id));
-		memcpy(root_ctx_buf.trace_flags, otel_ctx.trace_flags, sizeof(root_ctx_buf.trace_flags));
-		root_ctx_buf.tracestate = otel_tracestate_guc;
-		return &root_ctx_buf;
-	}
-	return NULL;
-}
-
-/*
- * api_span_root_context --- return the client-supplied root
- * SpanContext directly, bypassing the active stack.  For consumers
- * that want to start a sibling of the root operation rather than
- * a child of the current nested span.  Returns NULL if no root
- * context is set.
- */
-const OtelSpanContext *
-otel_producer_span_root_context(void)
-{
-	if (!otel_ctx.is_set)
-		return NULL;
-
-	memcpy(root_ctx_buf.trace_id, otel_ctx.trace_id, sizeof(root_ctx_buf.trace_id));
-	memcpy(root_ctx_buf.span_id, otel_ctx.span_id, sizeof(root_ctx_buf.span_id));
-	memcpy(root_ctx_buf.trace_flags, otel_ctx.trace_flags, sizeof(root_ctx_buf.trace_flags));
-	root_ctx_buf.tracestate = otel_tracestate_guc;
-	return &root_ctx_buf;
-}
-
-/*
- * api_span_stack_depth --- number of entries currently on the
- * active stack.  Useful for recursion guards, conditional
- * instrumentation, and tests.
- */
-int
-otel_producer_span_stack_depth(void)
-{
-	return span_stack_top + 1;
-}
-
-/*
- * api_span_emit --- finalize and dispatch a span.  If the span is
- * on the active stack, pop it (and entries above, per the
- * out-of-order-emit semantics described in the file header).
- *
- * For Commit B the out-of-order case is handled simply: a WARNING
- * is logged, popped entries above the target are silently
- * dropped, and the explicitly-emitted span dispatches normally.
- * Commit C adds per-entry unwind_policy handling (DROP silently /
- * ERROR emits-with-ERROR-status).
- */
-/*
- * lower_error_event --- synthesize the generic "exception" OtelSpanEvent
- * from a span's producer-private OtelErrorCapture and append it to
- * span->events.  This is the single place the ereport->attribute mapping
- * lives; exporters see only the resulting generic event.
- *
- * Attribute keys match what downstream translators expect
- * (postgres.sqlstate / postgres.elevel / code.filepath / code.lineno /
- * code.function / postgres.detail / postgres.hint) plus exception.message
- * for the message.  Numeric fields (elevel, lineno) are stringified ---
- * OtelKeyValue is string-only for now.
- *
- * On OOM the full event may be dropped; we then degrade to a literal
- * name="exception" event with zero attrs (no allocation for name in the
- * degraded path beyond the events-array slot itself).
- */
-static void
-lower_error_event(OtelSpan *span)
-{
-	const OtelErrorCapture *ec = &span->error_event;
-	OtelKeyValue attrs[8];
-	int			n = 0;
-	char		elevel_buf[16];
-	char		lineno_buf[16];
-	int			before;
-
-	/* exception.message (best-effort; may be NULL) */
-	if (ec->message != NULL)
-	{
-		attrs[n].key = "exception.message";
-		attrs[n].value = ec->message;
-		n++;
-	}
-	if (ec->sqlstate[0] != '\0')
-	{
-		attrs[n].key = "postgres.sqlstate";
-		attrs[n].value = ec->sqlstate;
-		n++;
-	}
-	snprintf(elevel_buf, sizeof(elevel_buf), "%d", ec->elevel);
-	attrs[n].key = "postgres.elevel";
-	attrs[n].value = elevel_buf;
-	n++;
-	if (ec->filename != NULL)
-	{
-		attrs[n].key = "code.filepath";
-		attrs[n].value = ec->filename;
-		n++;
-	}
-	snprintf(lineno_buf, sizeof(lineno_buf), "%d", ec->lineno);
-	attrs[n].key = "code.lineno";
-	attrs[n].value = lineno_buf;
-	n++;
-	if (ec->funcname != NULL)
-	{
-		attrs[n].key = "code.function";
-		attrs[n].value = ec->funcname;
-		n++;
-	}
-	if (ec->detail != NULL)
-	{
-		attrs[n].key = "postgres.detail";
-		attrs[n].value = ec->detail;
-		n++;
-	}
-	if (ec->hint != NULL)
-	{
-		attrs[n].key = "postgres.hint";
-		attrs[n].value = ec->hint;
-		n++;
-	}
-
-	before = span->n_events;
-	otel_producer_span_add_event(span, "exception", ec->time, attrs, n);
-
-	/*
-	 * If the full event could not be allocated (attrs copy or array grow
-	 * failed under memory pressure), degrade to a literal name="exception"
-	 * event with zero attrs.
-	 */
-	if (span->n_events == before)
-		otel_producer_span_add_event(span, "exception", ec->time, NULL, 0);
-}
-
-void
-otel_producer_span_emit(OtelSpan *span)
-{
-	int			i;
-
-	if (span == NULL)
-		return;
-
-	/*
-	 * Lower any producer-private ereport capture into a generic
-	 * "exception" event before dispatch, so span->events is the complete
-	 * list every exporter reads.  Guarded so a span emitted twice (rare)
-	 * doesn't lower twice.
-	 */
-	if (span->error_event_used)
-	{
-		span->error_event_used = false;
-		lower_error_event(span);
-	}
-
-	/*
-	 * Locate the span on the stack (if pushed).  Search from top down
-	 * since the common case is "emit the most recently pushed".
-	 *
-	 * Relies on the uniqueness invariant: span_id values on the active stack
-	 * are unique (enforced at push time by span_id_on_stack checks in both
-	 * push functions).  Stopping at the first match is correct --- there is
-	 * at most one matching entry.
-	 */
-	for (i = span_stack_top; i >= 0; i--)
-	{
-		if (memcmp(span_stack[i].span_id, span->span_id,
-				   sizeof(span_stack[i].span_id)) == 0)
-		{
-			if (i != span_stack_top)
-			{
-				ereport(WARNING,
-						(errmsg("otel: span emitted out of stack order; %d span(s) above will be unwound",
-								span_stack_top - i)));
-				/* Drain entries above the target, honouring each
-				 * one's unwind_policy.  Drain target is i so that i
-				 * itself stays on top after this call. */
-				unwind_to(i, "unwound by out-of-order emit");
-			}
-			/* Pop the target entry itself. */
-			span_stack[span_stack_top].span = NULL;
-			span_stack_top = i - 1;
-			break;
-		}
-	}
-
-	dispatch_span(span);
-}
-
-
-/* ====================================================================
- * Producer-side convenience helpers --- out-of-line companions to
- * the static inlines in otel.h.
- * ==================================================================== */
-
-/*
- * Convert raw bytes to lowercase-hex.  Local copy because the
- * matching helper in otel_trace.c is module-static.
- */
-static void
-bytes_to_lower_hex(const unsigned char *src, size_t n, char *dst)
-{
-	static const char hex[] = "0123456789abcdef";
-	size_t		i;
-
-	for (i = 0; i < n; i++)
-	{
-		dst[i * 2] = hex[(src[i] >> 4) & 0xF];
-		dst[i * 2 + 1] = hex[src[i] & 0xF];
-	}
-	dst[n * 2] = '\0';
-}
-
-void
-otel_span_init(OtelSpan *span,
-			   const OtelInstrumentationScope *scope,
-			   const char *name,
-			   OtelSpanKind kind)
-{
-	unsigned char span_buf[OTEL_SPAN_ID_LEN / 2];
-	unsigned char trace_buf[OTEL_TRACE_ID_LEN / 2];
-
-	memset(span, 0, sizeof(*span));
-
-	/* Generate fresh span_id.  pg_strong_random is overkill for
-	 * span IDs (8 random bytes is enough collision resistance for
-	 * any realistic trace volume) but it's the available API and
-	 * does the right thing. */
-	if (!pg_strong_random(span_buf, sizeof(span_buf)))
-	{
-		/* Random source unavailable --- degrade gracefully.  Use a
-		 * timestamp + pid mix for at least some uniqueness within
-		 * the backend. */
-		uint64		fallback = (uint64) GetCurrentTimestamp() ^ (uint64) MyProcPid;
-		memcpy(span_buf, &fallback, sizeof(span_buf));
-	}
-	bytes_to_lower_hex(span_buf, sizeof(span_buf), span->span_id);
-
-	/* Generate a fresh trace_id as well.  If no active/root context
-	 * exists when the span is pushed, this span becomes the root of a
-	 * new valid trace rather than carrying an all-zero trace_id. */
-	if (!pg_strong_random(trace_buf, sizeof(trace_buf)))
-	{
-		uint64		fallback_a = (uint64) GetCurrentTimestamp() ^ (uint64) MyProcPid;
-		uint64		fallback_b = (uint64) MyStartTimestamp ^ ((uint64) MyProcPid << 32);
-
-		memcpy(trace_buf, &fallback_a, sizeof(fallback_a));
-		memcpy(trace_buf + sizeof(fallback_a), &fallback_b, sizeof(fallback_b));
-	}
-	bytes_to_lower_hex(trace_buf, sizeof(trace_buf), span->trace_id);
-
-	span->scope = scope;
-	span->name = name;
-	span->kind = kind;
-	span->status = OTEL_STATUS_UNSET;
-	span->sampler_decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
-	span->unwind_policy = OTEL_UNWIND_DROP;
-	span->start_time = GetCurrentTimestamp();
-}
-
-/* otel_span_finalize is a static inline in otel.h (single struct
- * write to end_time = now); no out-of-line definition needed. */
-
-bool
-otel_span_add_attribute_string(OtelSpan *span, const char *key, const char *value)
-{
-	if (span->n_attrs < OTEL_INLINE_ATTRS)
-	{
-		span->attrs[span->n_attrs].key = key;
-		span->attrs[span->n_attrs].value = value;
-		span->n_attrs++;
-		return true;
-	}
-
-	/* Inline slots full; grow the overflow array by one.  Matches the
-	 * existing pattern in otel_trace.c's span_add_attr.  repalloc is
-	 * routed through the pointer's owning MemoryContext, so this is
-	 * safe across CurrentMemoryContext switches between calls.  On
-	 * OOM we silently drop the attribute --- best-effort
-	 * instrumentation. */
-	{
-		int			newcnt = span->n_overflow_attrs + 1;
-		OtelKeyValue *newarr;
-
-		if (span->overflow_attrs == NULL)
-			newarr = (OtelKeyValue *)
-				MemoryContextAllocExtended(CurrentMemoryContext,
-										   sizeof(OtelKeyValue) * newcnt,
-										   MCXT_ALLOC_NO_OOM);
+		if (slot->leaked)
+			otel_counters.leaked_at_commit++;
 		else
-			newarr = (OtelKeyValue *)
-				repalloc_extended(span->overflow_attrs,
-								  sizeof(OtelKeyValue) * newcnt,
-								  MCXT_ALLOC_NO_OOM);
-		if (newarr == NULL)
-			return false;
-		newarr[newcnt - 1].key = key;
-		newarr[newcnt - 1].value = value;
-		span->overflow_attrs = newarr;
-		span->n_overflow_attrs = newcnt;
-		return true;
+			otel_counters.dropped_in_dispatch++;
+		release_slot(idx, true);
+		return;
+	}
+
+	/* end_slot releases with by_owner = false; record the owner release. */
+	{
+		uint32		gen = slot->gen;
+
+		end_slot(idx, 0, true, "ended by transaction or subtransaction abort");
+		slots[idx].owner_released_gen = gen;
 	}
 }
 
+/* Drop non-recording entries at subtransaction level >= level. */
+static void
+drop_nrecs_from_level(int level)
+{
+	for (int i = span_stack_depth - 1; i >= 0; i--)
+	{
+		int32		e = span_stack[i];
+
+		if (e < 0 && nrecs[-e - 1].nest_level >= level)
+			stack_remove_at(i);
+	}
+	for (int i = 0; i < nrecs_used; i++)
+		if (nrecs[i].gen != 0 && nrecs[i].nest_level >= level)
+			free_nrec(i, true);
+}
 
 /*
- * otel_producer_span_add_attribute_string_to_active --- add a string attribute
- * to the top-of-stack span without requiring a pointer to it.  Intended for
- * contrib modules that hook ExecutorEnd (e.g. auto_explain) and want to
- * enrich the active statement span without managing the span themselves.
+ * Pop (never end) activation entries made at subtransaction level >=
+ * level.  Nothing else tears an activation down: the span it names
+ * has its own, independent lifecycle (owned by a resource owner, or a
+ * session/nrec that outlives the transaction), so otel_api must stop
+ * treating it as current without touching that lifecycle at all.
  *
- * Returns true when the attribute was attached, false when there is no active
- * span with a stored pointer (no stack entry, or top entry is OTEL_UNWIND_DROP).
+ * is_leak counts each one in activation_leaked_at_commit: at a
+ * top-level COMMIT/PREPARE, a remaining activation means the caller
+ * never deactivated it, same shape as a leaked span.  At ABORT (top-
+ * level or subtransaction) this is ordinary unwind-time cleanup, not a
+ * caller mistake, so it isn't counted here.
  */
-bool
-otel_producer_span_add_attribute_string_to_active(const char *key,
-												   const char *value)
+static void
+drop_activations_from_level(int level, bool is_leak)
 {
-	OtelSpanStackEntry *top;
+	for (int i = span_stack_depth - 1; i >= 0; i--)
+	{
+		if (span_stack_meta[i].is_activation && span_stack_meta[i].nest_level >= level)
+		{
+			if (is_leak)
+				otel_counters.activation_leaked_at_commit++;
+			stack_remove_at(i);
+		}
+	}
+}
 
-	if (span_stack_top < 0)
-		return false;
+static void
+otel_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PREPARE:
+			drop_nrecs_from_level(1);
+			drop_activations_from_level(1, true);
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			drop_nrecs_from_level(1);
+			drop_activations_from_level(1, false);
+			break;
+		default:
+			break;
+	}
+}
 
-	top = &span_stack[span_stack_top];
+static void
+otel_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					  SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		int			level = GetCurrentTransactionNestLevel();
 
-	/*
-	 * The span pointer is stored only for OTEL_UNWIND_ERROR entries; for
-	 * OTEL_UNWIND_DROP the slot holds NULL by design (see otel_producer_span_push).
-	 */
-	if (top->span == NULL)
-		return false;
+		drop_nrecs_from_level(level);
+		drop_activations_from_level(level, false);
+	}
+}
 
-	return otel_span_add_attribute_string(top->span, key, value);
+static void
+otel_producer_shmem_exit(int code, Datum arg)
+{
+	otel_counters.open_at_exit += session_spans_open;
 }
 
 
-/*
- * otel_producer_span_add_event --- append a named generic event to a span.
- *
- * COPY semantics: the event name and every attribute key/value string,
- * plus the OtelKeyValue array itself, are pstrdup'd / copied into the
- * CurrentMemoryContext so the caller may free or reuse its transient
- * buffers immediately.  (This is the per-node/transient-attrs case; it
- * intentionally diverges from span_add_attribute_string's borrow rule.)
- *
- * ts == 0 means "now" (GetCurrentTimestamp()).  attrs may be NULL when
- * n_attrs <= 0.
- *
- * The span->events array grows one entry at a time via
- * palloc/repalloc with MCXT_ALLOC_NO_OOM (matching the overflow-attr
- * pattern); on any allocation failure the event is silently dropped ---
- * best-effort instrumentation, never breaks the query.
- */
-void
-otel_producer_span_add_event(OtelSpan *span, const char *name,
-							 TimestampTz ts, const OtelKeyValue *attrs,
-							 int n_attrs)
+/* ----------------------------------------------------------------
+ * Producer API
+ * ---------------------------------------------------------------- */
+
+static OtelSpanRef
+start_nrec(const OtelSpanStartArgs *args, const ResolvedParent *p,
+		   const OtelTraceId *trace_id, uint8 random_flag)
 {
-	int			newcnt;
-	OtelSpanEvent *newarr;
-	OtelSpanEvent *ev;
-	char	   *name_copy;
-	OtelKeyValue *attrs_copy = NULL;
+	int			idx;
+	OtelNrec   *n;
 
-	if (span == NULL)
-		return;
-	if (n_attrs < 0)
-		n_attrs = 0;
-	if (attrs == NULL)
-		n_attrs = 0;
-
-	if (ts == 0)
-		ts = GetCurrentTimestamp();
-
-	/*
-	 * Copy the name.  On OOM we drop the whole event (best-effort).
-	 */
-	name_copy = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
-													(name ? strlen(name) : 0) + 1,
-													MCXT_ALLOC_NO_OOM);
-	if (name_copy == NULL)
-		return;
-	if (name != NULL)
-		strcpy(name_copy, name);
+	if (!args->detached && span_stack_depth >= OTEL_MAX_STACK_DEPTH)
+	{
+		otel_counters.start_stack_full++;
+		return OTEL_SPAN_NONE;
+	}
+	if (nrec_free_head >= 0)
+	{
+		idx = nrec_free_head;
+		nrec_free_head = nrecs[idx].next_free;
+	}
+	else if (nrecs_used < OTEL_MAX_STACK_DEPTH)
+	{
+		idx = nrecs_used++;
+		nrecs[idx].owner_released_gen = 0;
+	}
 	else
-		name_copy[0] = '\0';
+	{
+		otel_counters.start_stack_full++;
+		return OTEL_SPAN_NONE;
+	}
+
+	n = &nrecs[idx];
+	n->gen = next_gen();
 
 	/*
-	 * Copy the attribute array + each key/value string.  On any OOM we
-	 * abandon the whole event (the already-allocated name_copy is left
-	 * for the span context to reclaim; harmless).
+	 * An unsampled span has no resource owner; transaction and
+	 * subtransaction end drop it by level.  One that would have been a
+	 * session span, as a recording span, gets level 0 so no transaction
+	 * end drops it.  A default-owner span is dropped at the end of its
+	 * (sub)transaction, a little later than a recording span would be
+	 * (at the end of its statement's portal).
 	 */
+	if (args->owner == OTEL_OWNER_SESSION ||
+		(args->owner == NULL && CurrentResourceOwner == NULL))
+		n->nest_level = 0;
+	else
+		n->nest_level = GetCurrentTransactionNestLevel();
+	n->detached = args->detached;
+	n->have_span_id = false;
+	memset(&n->ctx, 0, sizeof(n->ctx));
+	n->ctx.trace_id = *trace_id;
+	n->ctx.trace_flags = random_flag;	/* sampled bit clear */
+	(void) p;
+
+	if (!args->detached)
+		stack_push(stack_entry_for_nrec(idx), false, 0);
+	otel_counters.spans_unsampled++;
+	return make_ref(n->gen, idx, false);
+}
+
+static void nrec_context(OtelNrec *n, OtelSpanContext *out);
+
+/*
+ * No producer call may run inside a critical section, or from inside an
+ * emit hook.  cassert builds fail an Assert; other builds count the call
+ * and do nothing.  A read_only call allocates nothing and changes no
+ * span, so an emit hook may make it.  After a FATAL from an emit hook,
+ * backend exit runs with dispatch_depth still raised; calls made then are
+ * refused without the Assert.
+ */
+static inline bool
+call_refused(bool read_only)
+{
+	Assert(CritSectionCount == 0);
+	Assert(read_only || dispatch_depth == 0 || proc_exit_inprogress);
+	if (unlikely(CritSectionCount != 0))
+	{
+		otel_counters.in_crit_section++;
+		return true;
+	}
+	if (unlikely(dispatch_depth > 0) && !read_only)
+	{
+		otel_counters.in_emit_hook++;
+		return true;
+	}
+	return false;
+}
+
+static OtelSpanRef
+api_span_start(const OtelSpanStartArgs *args)
+{
+	ResolvedParent p;
+	OtelTraceId trace_id;
+	uint8		parent_flags = 0;
+	OtelSamplerDecision decision;
+	ResourceOwner owner;
+	bool		session;
+	int			idx;
+	OtelSlot   *slot;
+	OtelSpanRef ref;
+
+	if (call_refused(false))
+		return OTEL_SPAN_NONE;
+	if (args == NULL || args->struct_size < sizeof(OtelSpanStartArgs) ||
+		args->name == NULL)
+	{
+		otel_counters.start_bad_args++;
+		Assert(false);			/* bad arguments to otel_span_start */
+		return OTEL_SPAN_NONE;
+	}
+	seed_prng_if_needed();
+	check_scoped_frames();
+
+	if (!resolve_parent(args, &p))
+	{
+		otel_counters.start_bad_args++;
+		return OTEL_SPAN_NONE;
+	}
+
+	/* The trace ID and the sampling decision. */
+	switch (p.kind)
+	{
+		case PARENT_SLOT:
+			trace_id = slots[p.idx].span.trace_id;
+			parent_flags = slots[p.idx].span.trace_flags;
+			decision = (parent_flags & OTEL_TRACE_FLAG_SAMPLED)
+				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_RECORD_ONLY;
+			break;
+		case PARENT_NREC:
+			/*
+			 * An unsampled local parent.  force_sample does not apply
+			 * here: it only forces a new root to record (PARENT_NONE,
+			 * below), never a child of an unsampled parent --- that
+			 * would record a span whose parent is never exported,
+			 * producing an orphan.
+			 */
+			return start_nrec(args, &p, &nrecs[p.idx].ctx.trace_id,
+							  nrecs[p.idx].ctx.trace_flags & OTEL_TRACE_FLAG_RANDOM);
+		case PARENT_REMOTE:
+			{
+				trace_id = p.ctx.trace_id;
+				parent_flags = p.ctx.trace_flags;
+				decision = otel_run_sampler(&trace_id, false,
+											otel_span_context_sampled(&p.ctx));
+				break;
+			}
+		case PARENT_NONE:
+		default:
+			{
+				new_trace_id(&trace_id);
+				parent_flags = OTEL_TRACE_FLAG_RANDOM;
+				decision = otel_run_sampler(&trace_id, true, false);
+				/*
+				 * force_sample applies only to a new root: an explicit
+				 * per-session opt-in ("trace everything") bypasses the
+				 * sampler for spans that start their own trace.  It
+				 * must never override the decision for a span with a
+				 * parent (PARENT_SLOT/PARENT_NREC/PARENT_REMOTE above) ---
+				 * doing so would record a span under an unrecorded
+				 * parent, and that parent is never exported, producing an
+				 * orphan span.
+				 */
+				if (args->force_sample)
+					decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
+				break;
+			}
+	}
+
+	if (decision == OTEL_SAMPLE_DROP)
+		return start_nrec(args, &p, &trace_id, parent_flags & OTEL_TRACE_FLAG_RANDOM);
+
+	/* A recording span.  Find its owner, then a slot. */
+	if (args->owner == OTEL_OWNER_SESSION)
+		owner = NULL;
+	else if (args->owner != NULL)
+		owner = args->owner;
+	else
+		owner = CurrentResourceOwner;
+	session = owner == NULL;
+
+	if (session && session_spans_open >= otel_max_session_spans)
+	{
+		otel_counters.start_no_session_slot++;
+		return OTEL_SPAN_NONE;
+	}
+	if (!args->detached && span_stack_depth >= OTEL_MAX_STACK_DEPTH)
+	{
+		otel_counters.start_stack_full++;
+		return OTEL_SPAN_NONE;
+	}
+	if (!ensure_pool())
+	{
+		otel_counters.start_no_slot++;
+		return OTEL_SPAN_NONE;
+	}
+	/* These can raise ERROR on OOM; nothing to undo yet. */
+	if (args->tracer != NULL && args->tracer->scope == NULL && args->tracer->name != NULL)
+	{
+		INJECTION_POINT("otel-api-oom-tracer-register", NULL);
+		args->tracer->scope = otel_tracer_register(args->tracer->name,
+												   args->tracer->version,
+												   args->tracer->schema_url);
+	}
+	if (owner != NULL)
+	{
+		INJECTION_POINT("otel-api-oom-resowner-enlarge", NULL);
+		ResourceOwnerEnlarge(owner);
+	}
+	idx = take_slot();
+	if (idx < 0)
+	{
+		otel_counters.start_no_slot++;
+		return OTEL_SPAN_NONE;
+	}
+
+	slot = &slots[idx];
+	slot->gen = next_gen();
+	slot->detached = args->detached;
+	slot->session = session;
+	slot->owner = owner;
+	slot->attrs = slot->inline_attrs;
+	slot->attrs_cap = OTEL_SLOT_INLINE_ATTRS;
+#ifdef USE_ASSERT_CHECKING
+	slot->scope_frame = args->scoped ? (void *) args : NULL;
+#endif
+
+	slot->span.struct_size = sizeof(OtelSpan);
+	slot->span.kind = args->kind;
+	if (args->tracer != NULL)
+		slot->span.scope = args->tracer->scope;
+	slot->span.trace_id = trace_id;
+	new_span_id(&slot->span.span_id);
+	if (p.kind == PARENT_SLOT)
+	{
+		slot->span.parent_span_id = slots[p.idx].span.span_id;
+		if (slots[p.idx].span.tracestate)
+			slot->span.tracestate = slot_strdup(slot, slots[p.idx].span.tracestate, -1, NULL,
+												"otel-api-oom-tracestate");
+	}
+	else if (p.kind == PARENT_REMOTE)
+	{
+		slot->span.parent_span_id = p.ctx.span_id;
+		if (p.ctx.tracestate)
+			slot->span.tracestate = slot_strdup(slot, p.ctx.tracestate, -1, NULL,
+												"otel-api-oom-tracestate");
+	}
+	slot->span.trace_flags = (parent_flags & ~OTEL_TRACE_FLAG_SAMPLED) |
+		(decision == OTEL_SAMPLE_RECORD_AND_SAMPLE ? OTEL_TRACE_FLAG_SAMPLED : 0);
+	slot->span.sampler_decision = decision;
+	slot->span.name = slot_strdup(slot, args->name, otel_attr_value_max, NULL,
+								  "otel-api-oom-name");
+	if (slot->span.name == NULL)
+		slot->span.name = "(out of memory)";
+	slot->span.start_time = args->start_time ? args->start_time : GetCurrentTimestamp();
+
+	ref = make_ref(slot->gen, idx, true);
+	if (!args->detached)
+		stack_push(stack_entry_for_slot(idx), false, 0);
+	if (owner != NULL)
+		ResourceOwnerRemember(owner, Int64GetDatum(ref.v), &otel_span_resowner_desc);
+	else
+	{
+		session_spans_open++;
+		/* Exit callbacks registered in _PG_init are reset in each backend. */
+		if (!exit_callback_registered)
+		{
+			before_shmem_exit(otel_producer_shmem_exit, (Datum) 0);
+			exit_callback_registered = true;
+		}
+	}
+	otel_counters.spans_started++;
+	return ref;
+}
+
+static void
+api_span_end(OtelSpanRef s, TimestampTz end_time)
+{
+	int			pos;
+
+	if (call_refused(false) || s.v == 0)
+		return;
+	check_scoped_frames();
+
+	if (s.v < 0)
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+		int			idx;
+
+		if (n == NULL)
+			return;
+		idx = n - nrecs;
+
+		/*
+		 * Search the stack regardless of .detached: a .detached entry
+		 * that is currently active (otel_span_activate()) is on the
+		 * stack too, and must be popped the same way.
+		 */
+		if ((pos = stack_find(stack_entry_for_nrec(idx))) >= 0)
+		{
+			if (pos != span_stack_depth - 1)
+			{
+				nonlifo_warning("unsampled span ended with spans still open above it", pos);
+				stack_unwind_above(pos, "parent span ended first");
+			}
+			span_stack_depth--;
+		}
+		free_nrec(idx, false);
+		return;
+	}
+	else
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+		int			idx;
+
+		if (slot == NULL)
+			return;
+		idx = slot - slots;
+
+		/* See the .detached comment in the s.v < 0 branch above. */
+		if ((pos = stack_find(stack_entry_for_slot(idx))) >= 0)
+		{
+			if (pos != span_stack_depth - 1)
+			{
+				nonlifo_warning("span ended with spans still open above it", pos);
+				stack_unwind_above(pos, "parent span ended first");
+			}
+			span_stack_depth--;
+		}
+		end_slot(idx, end_time, false, NULL);
+	}
+}
+
+/* Find or add the attribute key; NULL if it can't be stored. */
+static OtelAttribute *
+slot_attr(OtelSlot *slot, const char *key)
+{
+	OtelAttribute *a;
+	char	   *k;
+
+	for (int i = 0; i < slot->span.n_attrs; i++)
+		if (strcmp(slot->attrs[i].key, key) == 0)
+			return &slot->attrs[i];
+
+	if (!slot_grow(slot, (void **) &slot->attrs, &slot->attrs_cap,
+				   slot->span.n_attrs + 1, sizeof(OtelAttribute), slot->inline_attrs,
+				   "otel-api-oom-attrs") ||
+		(k = slot_strdup(slot, key, -1, NULL, "otel-api-oom-attr-key")) == NULL)
+	{
+		slot->span.dropped_attrs++;
+		otel_counters.attr_dropped++;
+		return NULL;
+	}
+	a = &slot->attrs[slot->span.n_attrs++];
+	a->key = k;
+	a->type = OTEL_ATTR_INT;
+	a->v.i = 0;
+	return a;
+}
+
+static OtelSlot *
+setter_slot(OtelSpanRef s)
+{
+	if (call_refused(false) || s.v <= 0)
+		return NULL;
+	return slot_for_ref(s);
+}
+
+static void
+set_str_internal(OtelSlot *slot, const char *key, const char *val)
+{
+	OtelAttribute *a;
+	bool		truncated;
+	char	   *copy;
+
+	if (val == NULL || (a = slot_attr(slot, key)) == NULL)
+		return;
+	copy = slot_strdup(slot, val, otel_attr_value_max, &truncated, "otel-api-oom-attr-value");
+	if (copy == NULL)
+	{
+		/* Keep the key, drop the value: remove the entry again. */
+		slot->span.n_attrs--;
+		slot->span.dropped_attrs++;
+		otel_counters.attr_dropped++;
+		return;
+	}
+	if (truncated)
+		otel_counters.attr_truncated++;
+	a->type = OTEL_ATTR_STRING;
+	a->v.s = copy;
+}
+
+static void
+api_span_set_str(OtelSpanRef s, const char *key, const char *val)
+{
+	OtelSlot   *slot = setter_slot(s);
+
+	if (slot)
+		set_str_internal(slot, key, val);
+}
+
+static void
+api_span_set_int(OtelSpanRef s, const char *key, int64 val)
+{
+	OtelSlot   *slot = setter_slot(s);
+	OtelAttribute *a;
+
+	if (slot && (a = slot_attr(slot, key)) != NULL)
+	{
+		a->type = OTEL_ATTR_INT;
+		a->v.i = val;
+	}
+}
+
+static void
+api_span_set_double(OtelSpanRef s, const char *key, double val)
+{
+	OtelSlot   *slot = setter_slot(s);
+	OtelAttribute *a;
+
+	if (slot && (a = slot_attr(slot, key)) != NULL)
+	{
+		a->type = OTEL_ATTR_DOUBLE;
+		a->v.d = val;
+	}
+}
+
+static void
+api_span_set_bool(OtelSpanRef s, const char *key, bool val)
+{
+	OtelSlot   *slot = setter_slot(s);
+	OtelAttribute *a;
+
+	if (slot && (a = slot_attr(slot, key)) != NULL)
+	{
+		a->type = OTEL_ATTR_BOOL;
+		a->v.b = val;
+	}
+}
+
+static void api_span_set_vprintf(OtelSpanRef s, const char *key, const char *fmt,
+								 va_list ap) pg_attribute_printf(3, 0);
+
+static void
+api_span_set_vprintf(OtelSpanRef s, const char *key, const char *fmt, va_list ap)
+{
+	OtelSlot   *slot = setter_slot(s);
+	char		buf[1024];
+	va_list		ap2;
+	int			len;
+
+	if (slot == NULL)
+		return;
+	va_copy(ap2, ap);
+	len = pg_vsnprintf(buf, sizeof(buf), fmt, ap);
+	if (len >= (int) sizeof(buf) && otel_attr_value_max >= (int) sizeof(buf))
+	{
+		/* Longer than the buffer, and attr_value_max allows more. */
+		char	   *big = otel_inject_fail("otel-api-oom-vprintf") ? NULL :
+			MemoryContextAllocExtended(slot->cxt, len + 1, MCXT_ALLOC_NO_OOM);
+
+		if (big != NULL)
+		{
+			pg_vsnprintf(big, len + 1, fmt, ap2);
+			set_str_internal(slot, key, big);
+			pfree(big);
+			va_end(ap2);
+			return;
+		}
+	}
+	va_end(ap2);
+	if (len >= (int) sizeof(buf))
+		otel_counters.attr_truncated++;
+	set_str_internal(slot, key, buf);
+}
+
+static void
+api_span_set_name(OtelSpanRef s, const char *name)
+{
+	OtelSlot   *slot = setter_slot(s);
+	char	   *copy;
+
+	if (slot && name &&
+		(copy = slot_strdup(slot, name, otel_attr_value_max, NULL, "otel-api-oom-name")) != NULL)
+		slot->span.name = copy;
+}
+
+static void
+api_span_set_status(OtelSpanRef s, OtelSpanStatus code, const char *description)
+{
+	OtelSlot   *slot = setter_slot(s);
+
+	if (slot == NULL)
+		return;
+	slot->span.status = code;
+	slot->span.status_description = description
+		? slot_strdup(slot, description, otel_attr_value_max, NULL,
+					  "otel-api-oom-status-description") : NULL;
+}
+
+static void
+api_span_add_event(OtelSpanRef s, const char *name, TimestampTz ts,
+				   const OtelAttribute *attrs, int n_attrs)
+{
+	OtelSlot   *slot = setter_slot(s);
+	OtelSpanEvent *ev;
+	OtelAttribute *copy = NULL;
+	char	   *ename;
+
+	if (slot == NULL || name == NULL)
+		return;
+	if (!slot_grow(slot, (void **) &slot->events, &slot->events_cap,
+				   slot->span.n_events + 1, sizeof(OtelSpanEvent), NULL,
+				   "otel-api-oom-events") ||
+		(ename = slot_strdup(slot, name, otel_attr_value_max, NULL,
+							 "otel-api-oom-event-name")) == NULL)
+		goto dropped;
 	if (n_attrs > 0)
 	{
-		int			k;
+		Size		sz = sizeof(OtelAttribute) * n_attrs;
 
-		attrs_copy = (OtelKeyValue *)
-			MemoryContextAllocExtended(CurrentMemoryContext,
-									   sizeof(OtelKeyValue) * n_attrs,
-									   MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
-		if (attrs_copy == NULL)
-			return;
-
-		for (k = 0; k < n_attrs; k++)
+		if (slot->bytes + sz > (Size) otel_max_span_bytes ||
+			otel_inject_fail("otel-api-oom-event-attrs") ||
+			(copy = MemoryContextAllocExtended(slot->cxt, sz, MCXT_ALLOC_NO_OOM)) == NULL)
+			goto dropped;
+		slot->bytes += sz;
+		for (int i = 0; i < n_attrs; i++)
 		{
-			const char *key = attrs[k].key;
-			const char *val = attrs[k].value;
-			char	   *keyc = NULL;
-			char	   *valc = NULL;
-
-			if (key != NULL)
-			{
-				keyc = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
-														   strlen(key) + 1,
-														   MCXT_ALLOC_NO_OOM);
-				if (keyc == NULL)
-					return;		/* drop event */
-				strcpy(keyc, key);
-			}
-			if (val != NULL)
-			{
-				valc = (char *) MemoryContextAllocExtended(CurrentMemoryContext,
-														   strlen(val) + 1,
-														   MCXT_ALLOC_NO_OOM);
-				if (valc == NULL)
-					return;		/* drop event */
-				strcpy(valc, val);
-			}
-			attrs_copy[k].key = keyc;
-			attrs_copy[k].value = valc;
+			copy[i] = attrs[i];
+			copy[i].key = slot_strdup(slot, attrs[i].key, -1, NULL, "otel-api-oom-attr-key");
+			if (attrs[i].type == OTEL_ATTR_STRING && attrs[i].v.s)
+				copy[i].v.s = slot_strdup(slot, attrs[i].v.s, otel_attr_value_max, NULL,
+										  "otel-api-oom-attr-value");
+			if (copy[i].key == NULL ||
+				(attrs[i].type == OTEL_ATTR_STRING && attrs[i].v.s && copy[i].v.s == NULL))
+				goto dropped;
 		}
 	}
-
-	/* Grow the events array by one. */
-	newcnt = span->n_events + 1;
-	if (span->events == NULL)
-		newarr = (OtelSpanEvent *)
-			MemoryContextAllocExtended(CurrentMemoryContext,
-									   sizeof(OtelSpanEvent) * newcnt,
-									   MCXT_ALLOC_NO_OOM);
-	else
-		newarr = (OtelSpanEvent *)
-			repalloc_extended(span->events,
-							  sizeof(OtelSpanEvent) * newcnt,
-							  MCXT_ALLOC_NO_OOM);
-	if (newarr == NULL)
-		return;					/* drop event */
-
-	ev = &newarr[newcnt - 1];
-	ev->name = name_copy;
-	ev->time = ts;
+	ev = &slot->events[slot->span.n_events++];
+	ev->name = ename;
+	ev->time = ts ? ts : GetCurrentTimestamp();
 	ev->n_attrs = n_attrs;
-	ev->attrs = attrs_copy;
+	ev->attrs = copy;
+	return;
 
-	span->events = newarr;
-	span->n_events = newcnt;
+dropped:
+	slot->span.dropped_events++;
+	otel_counters.event_dropped++;
+}
+
+static void
+api_span_add_link(OtelSpanRef s, const OtelSpanContext *target)
+{
+	OtelSlot   *slot = setter_slot(s);
+	OtelSpanContext *l;
+
+	if (slot == NULL || target == NULL || !otel_span_context_is_valid(target))
+		return;
+	if (!slot_grow(slot, (void **) &slot->links, &slot->links_cap,
+				   slot->span.n_links + 1, sizeof(OtelSpanContext), NULL,
+				   "otel-api-oom-links"))
+	{
+		slot->span.dropped_links++;
+		otel_counters.link_dropped++;
+		return;
+	}
+	l = &slot->links[slot->span.n_links++];
+	*l = *target;
+	l->tracestate = NULL;
+}
+
+static void
+api_span_record_error(OtelSpanRef s, const ErrorData *edata)
+{
+	OtelSlot   *slot = setter_slot(s);
+
+	if (slot && edata)
+		slot_record_error(slot, edata);
 }
 
 /*
- * otel_producer_span_add_event_to_active --- append a named event to the
- * top-of-stack active span without a pointer to it.  Mirrors
- * otel_producer_span_add_attribute_string_to_active.
- *
- * Returns true when the event was appended (or attempted best-effort on
- * a valid active span), false when there is no active span with a
- * stored pointer (empty stack, or top entry is OTEL_UNWIND_DROP).
+ * For PG_CATCH.  CopyErrorData is the only way to read the error being
+ * handled; it allocates, so it can itself fail and replace the original
+ * error with an out-of-memory one.  An OOM being handled is recorded
+ * from geterrcode() alone, without copying.
+ */
+static void
+api_span_capture_error(OtelSpanRef s)
+{
+	OtelSlot   *slot = setter_slot(s);
+	MemoryContext old;
+	ErrorData  *edata;
+
+	if (slot == NULL)
+		return;
+	if (geterrcode() == ERRCODE_OUT_OF_MEMORY)
+	{
+		ErrorData	e = {.elevel = ERROR, .sqlerrcode = ERRCODE_OUT_OF_MEMORY};
+
+		slot_record_error(slot, &e);
+		return;
+	}
+	old = MemoryContextSwitchTo(slot->cxt);
+	edata = CopyErrorData();
+	MemoryContextSwitchTo(old);
+	slot_record_error(slot, edata);
+	FreeErrorData(edata);
+}
+
+static OtelSpanRef
+api_span_current(void)
+{
+	int32		e;
+
+	if (call_refused(true) || span_stack_depth == 0)
+		return OTEL_SPAN_NONE;
+	e = span_stack[span_stack_depth - 1];
+	if (e >= 0)
+		return make_ref(slots[e].gen, e, true);
+	return make_ref(nrecs[-e - 1].gen, -e - 1, false);
+}
+
+static void
+nrec_context(OtelNrec *n, OtelSpanContext *out)
+{
+	if (!n->have_span_id)
+	{
+		seed_prng_if_needed();
+		new_span_id(&n->ctx.span_id);
+		n->have_span_id = true;
+	}
+	*out = n->ctx;
+}
+
+/*
+ * otel_span_context_of() without the critical-section check, for
+ * otel_api's own commit-record hook, which core calls inside
+ * RecordTransactionCommit's critical section.  Allocates nothing.
  */
 bool
-otel_producer_span_add_event_to_active(const char *name, TimestampTz ts,
-									   const OtelKeyValue *attrs, int n_attrs)
+otel_span_context_of_internal(OtelSpanRef s, OtelSpanContext *out)
 {
-	OtelSpanStackEntry *top;
+	memset(out, 0, sizeof(*out));
+	if (s.v == 0)
+	{
+		ResolvedParent p;
 
-	if (span_stack_top < 0)
+		resolve_active_parent(&p);
+		switch (p.kind)
+		{
+			case PARENT_SLOT:
+				s = make_ref(slots[p.idx].gen, p.idx, true);
+				break;
+			case PARENT_NREC:
+				nrec_context(&nrecs[p.idx], out);
+				return true;
+			case PARENT_REMOTE:
+				*out = p.ctx;
+				return true;
+			case PARENT_NONE:
+				return false;
+		}
+	}
+	if (s.v > 0)
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL)
+			return false;
+		out->trace_id = slot->span.trace_id;
+		out->span_id = slot->span.span_id;
+		out->trace_flags = slot->span.trace_flags;
+		out->tracestate = slot->span.tracestate;
+		return true;
+	}
+	else
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return false;
+		nrec_context(n, out);
+		return true;
+	}
+}
+
+static bool
+api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
+{
+	if (call_refused(true))
+	{
+		memset(out, 0, sizeof(*out));
 		return false;
+	}
+	return otel_span_context_of_internal(s, out);
+}
 
-	top = &span_stack[span_stack_top];
+static void
+api_resource_add(const char *key, const char *value)
+{
+	if (call_refused(false))
+		return;
+	otel_resource_attr_add(key, value);
+}
 
-	/*
-	 * The span pointer is stored only for OTEL_UNWIND_ERROR entries; for
-	 * OTEL_UNWIND_DROP the slot holds NULL by design (see
-	 * otel_producer_span_push).
-	 */
-	if (top->span == NULL)
-		return false;
+static void
+api_span_discard(OtelSpanRef s)
+{
+	int			pos;
 
-	otel_producer_span_add_event(top->span, name, ts, attrs, n_attrs);
-	return true;
+	if (call_refused(false) || s.v == 0)
+		return;
+	if (s.v < 0)
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return;
+		if ((pos = stack_find(stack_entry_for_nrec(n - nrecs))) >= 0)
+			stack_remove_at(pos);
+		free_nrec(n - nrecs, false);
+	}
+	else
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL)
+			return;
+		if ((pos = stack_find(stack_entry_for_slot(slot - slots))) >= 0)
+			stack_remove_at(pos);
+		release_slot(slot - slots, false);
+	}
+	otel_counters.spans_discarded++;
+}
+
+/*
+ * Push a .detached, still-open span onto the active stack.  Refused
+ * (OTEL_ACTIVATION_NONE, counted) for a stale handle, a non-.detached
+ * span (already on the stack from otel_span_start()), a span that is
+ * already active, or a full stack.  The encoding mirrors make_ref():
+ * an activation token and the span's own handle name the same (gen,
+ * idx) pair, which is enough to find it again in otel_span_deactivate()
+ * and to detect a stale token the same way slot_for_ref()/nrec_for_ref()
+ * do for a span handle.
+ */
+static OtelActivation
+api_span_activate(OtelSpanRef s)
+{
+	int			idx;
+	int32		entry;
+	uint32		gen;
+	bool		recording;
+
+	if (call_refused(false) || s.v == 0)
+		return OTEL_ACTIVATION_NONE;
+
+	if (s.v > 0)
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL)
+			return OTEL_ACTIVATION_NONE;
+		if (!slot->detached)
+		{
+			otel_counters.activate_not_detached++;
+			Assert(false);		/* only a .detached span may be activated */
+			return OTEL_ACTIVATION_NONE;
+		}
+		idx = slot - slots;
+		entry = stack_entry_for_slot(idx);
+		gen = slot->gen;
+		recording = true;
+	}
+	else
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return OTEL_ACTIVATION_NONE;
+		if (!n->detached)
+		{
+			otel_counters.activate_not_detached++;
+			Assert(false);
+			return OTEL_ACTIVATION_NONE;
+		}
+		idx = n - nrecs;
+		entry = stack_entry_for_nrec(idx);
+		gen = n->gen;
+		recording = false;
+	}
+
+	if (stack_find(entry) >= 0)
+	{
+		otel_counters.activate_already_active++;
+		Assert(false);			/* span is already active */
+		return OTEL_ACTIVATION_NONE;
+	}
+	if (span_stack_depth >= OTEL_MAX_STACK_DEPTH)
+	{
+		otel_counters.start_stack_full++;
+		return OTEL_ACTIVATION_NONE;
+	}
+
+	stack_push(entry, true, GetCurrentTransactionNestLevel());
+	return (OtelActivation) {make_ref(gen, idx, recording).v};
+}
+
+/*
+ * Pop an activation.  Checked exactly like otel_span_end(): entries
+ * pushed above it since are unwound first (LIFO violation, WARNING,
+ * Assert in cassert builds), same as ending a span out of order.  A
+ * stale token (the span already ended, or this token already
+ * deactivated) is a quiet no-op via slot_for_ref()/nrec_for_ref(),
+ * except that a token whose span is still open but no longer on the
+ * stack (a double deactivate) is its own counted misuse, since neither
+ * of those helpers can tell that case apart from a fresh stale handle.
+ */
+static void
+api_span_deactivate(OtelActivation tok)
+{
+	OtelSpanRef s = {tok.v};
+	int32		entry;
+	int			pos;
+
+	if (call_refused(false) || tok.v == 0)
+		return;
+
+	if (s.v > 0)
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL)
+			return;				/* stale: already ended */
+		entry = stack_entry_for_slot(slot - slots);
+	}
+	else
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return;				/* stale: already ended */
+		entry = stack_entry_for_nrec(n - nrecs);
+	}
+
+	pos = stack_find(entry);
+	if (pos < 0)
+	{
+		otel_counters.deactivate_not_active++;
+		Assert(false);			/* not currently active (double deactivate?) */
+		return;
+	}
+	if (pos != span_stack_depth - 1)
+	{
+		nonlifo_warning("span deactivated with spans still open above it", pos);
+		stack_unwind_above(pos, "parent activation deactivated first");
+	}
+	span_stack_depth--;
+}
+
+const OtelProducerApi otel_producer_api_table = {
+	.version = OTEL_PRODUCER_API_VERSION,
+	.struct_size = sizeof(OtelProducerApi),
+	.recording_possible = &otel_recording_possible_flag,
+	.span_start = api_span_start,
+	.span_end = api_span_end,
+	.span_set_str = api_span_set_str,
+	.span_set_int = api_span_set_int,
+	.span_set_double = api_span_set_double,
+	.span_set_bool = api_span_set_bool,
+	.span_set_vprintf = api_span_set_vprintf,
+	.span_set_name = api_span_set_name,
+	.span_set_status = api_span_set_status,
+	.span_add_event = api_span_add_event,
+	.span_add_link = api_span_add_link,
+	.span_capture_error = api_span_capture_error,
+	.span_record_error = api_span_record_error,
+	.span_current = api_span_current,
+	.span_context_of = api_span_context_of,
+	.resource_add = api_resource_add,
+	.span_discard = api_span_discard,
+	.span_activate = api_span_activate,
+	.span_deactivate = api_span_deactivate,
+};
+
+
+/* ----------------------------------------------------------------
+ * JSON log emitter (otel_api.emit_spans_to_log)
+ * ---------------------------------------------------------------- */
+
+static void
+append_json_attrs(StringInfo buf, const OtelAttribute *attrs, int n)
+{
+	appendStringInfoChar(buf, '{');
+	for (int i = 0; i < n; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(buf, ',');
+		escape_json(buf, attrs[i].key);
+		appendStringInfoChar(buf, ':');
+		switch (attrs[i].type)
+		{
+			case OTEL_ATTR_STRING:
+				if (attrs[i].v.s)
+					escape_json(buf, attrs[i].v.s);
+				else
+					appendStringInfoString(buf, "null");
+				break;
+			case OTEL_ATTR_INT:
+				appendStringInfo(buf, INT64_FORMAT, attrs[i].v.i);
+				break;
+			case OTEL_ATTR_DOUBLE:
+				appendStringInfo(buf, "%.17g", attrs[i].v.d);
+				break;
+			case OTEL_ATTR_BOOL:
+				appendStringInfoString(buf, attrs[i].v.b ? "true" : "false");
+				break;
+		}
+	}
+	appendStringInfoChar(buf, '}');
+}
+
+void
+otel_emit_span_as_log_line(const OtelSpan *span)
+{
+	StringInfoData buf;
+	char		tid[OTEL_TRACE_ID_HEX_LEN + 1];
+	char		sid[OTEL_SPAN_ID_HEX_LEN + 1];
+	char		pid[OTEL_SPAN_ID_HEX_LEN + 1];
+
+	otel_trace_id_to_hex(&span->trace_id, tid);
+	otel_span_id_to_hex(&span->span_id, sid);
+	otel_span_id_to_hex(&span->parent_span_id, pid);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "{\"trace_id\":\"%s\",\"span_id\":\"%s\",\"parent_span_id\":\"%s\","
+					 "\"trace_flags\":\"%02x\",\"name\":",
+					 tid, sid, otel_span_id_is_valid(&span->parent_span_id) ? pid : "",
+					 span->trace_flags);
+	escape_json(&buf, span->name);
+	appendStringInfo(&buf, ",\"kind\":%d,\"status\":%d", (int) span->kind, (int) span->status);
+	if (span->status_description)
+	{
+		appendStringInfoString(&buf, ",\"status_description\":");
+		escape_json(&buf, span->status_description);
+	}
+	if (span->scope && span->scope->name)
+	{
+		appendStringInfoString(&buf, ",\"scope\":");
+		escape_json(&buf, span->scope->name);
+	}
+	appendStringInfo(&buf, ",\"start_time\":\"%s\"", timestamptz_to_str(span->start_time));
+	appendStringInfo(&buf, ",\"end_time\":\"%s\"", timestamptz_to_str(span->end_time));
+	appendStringInfoString(&buf, ",\"attributes\":");
+	append_json_attrs(&buf, span->attrs, span->n_attrs);
+	appendStringInfoString(&buf, ",\"events\":[");
+	for (int i = 0; i < span->n_events; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "{\"name\":");
+		escape_json(&buf, span->events[i].name);
+		appendStringInfo(&buf, ",\"time\":\"%s\",\"attributes\":",
+						 timestamptz_to_str(span->events[i].time));
+		append_json_attrs(&buf, span->events[i].attrs, span->events[i].n_attrs);
+		appendStringInfoChar(&buf, '}');
+	}
+	appendStringInfoString(&buf, "],\"links\":[");
+	for (int i = 0; i < span->n_links; i++)
+	{
+		char		ltid[OTEL_TRACE_ID_HEX_LEN + 1];
+		char		lsid[OTEL_SPAN_ID_HEX_LEN + 1];
+
+		otel_trace_id_to_hex(&span->links[i].trace_id, ltid);
+		otel_span_id_to_hex(&span->links[i].span_id, lsid);
+		appendStringInfo(&buf, "%s{\"trace_id\":\"%s\",\"span_id\":\"%s\"}",
+						 i > 0 ? "," : "", ltid, lsid);
+	}
+	appendStringInfo(&buf, "],\"dropped_attributes\":%u,\"dropped_events\":%u,\"dropped_links\":%u}",
+					 span->dropped_attrs, span->dropped_events, span->dropped_links);
+
+	ereport(LOG, errmsg_internal("otel-span: %s", buf.data));
+	pfree(buf.data);
 }
 
 
-/*
- * otel_producer_init --- called from contrib/otel's _PG_init.
- * Currently a no-op placeholder; Commit C will populate this with
- * MemoryContextCallback registration setup and the stack-overflow
- * counter SQL function.
- */
+/* ----------------------------------------------------------------
+ * SQL-callable
+ * ---------------------------------------------------------------- */
+
+PG_FUNCTION_INFO_V1(otel_api_counters);
+
+/* otel_api_counters() RETURNS TABLE (name text, value bigint) */
+Datum
+otel_api_counters(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	static const struct
+	{
+		const char *name;
+		size_t		off;
+	}			fields[] = {
+#define F(f) {#f, offsetof(OtelApiCounters, f)}
+		F(spans_started), F(spans_unsampled), F(spans_emitted), F(spans_discarded),
+		F(start_no_slot), F(start_no_session_slot), F(start_stack_full),
+		F(in_crit_section), F(in_emit_hook), F(start_bad_args),
+		F(stale_handle), F(non_lifo_end), F(unwound),
+		F(leaked_at_commit), F(dropped_in_dispatch), F(open_at_exit),
+		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),
+		F(error_capture_failed), F(emit_hook_errors),
+		F(activate_not_detached), F(activate_already_active), F(deactivate_not_active),
+		F(activation_unwound), F(activation_leaked_at_commit),
+#undef F
+	};
+
+	InitMaterializedSRF(fcinfo, 0);
+	for (int i = 0; i < lengthof(fields); i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+
+		values[0] = CStringGetTextDatum(fields[i].name);
+		values[1] = Int64GetDatum((int64) *(const uint64 *)
+								  ((const char *) &otel_counters + fields[i].off));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+
 void
 otel_producer_init(void)
 {
-	/* Zero-initialise active-stack state; static storage is already
-	 * zero, so this is effectively a documentation site. */
-	span_stack_top = -1;
+	prev_emit_log_hook = emit_log_hook;
+	emit_log_hook = otel_emit_log_hook;
+	RegisterXactCallback(otel_xact_callback, NULL);
+	RegisterSubXactCallback(otel_subxact_callback, NULL);
 }

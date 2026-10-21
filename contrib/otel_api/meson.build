@@ -89,13 +89,19 @@ contrib_targets += otel_api
 
 install_data(
   'otel_api.control',
-  'otel_api--0.1.1.sql',
+  'otel_api--0.2.0.sql',
   kwargs: contrib_data_args,
 )
 
 install_headers(
   'otel.h',
+  'otel_types.h',
   'otel_api.h',
+  'otel_producer.h',
+  'otel_producer_stub.h',
+  'otel_exporter.h',
+  'otel_internal_api.h',
+  'otel_semconv.h',
   install_dir: dir_include_extension / 'otel_api',
 )
 

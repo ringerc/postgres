@@ -200,14 +200,17 @@ drain_to_rfq($sock);
 send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT_SEQ));
 run_query($sock, 'SELECT 1');
 
-my $contents = wait_for_n_spans($TRACE_ID_SEQ, 1);
+# Wait for all 6 spans (5 SDT sub-phase + 1 pgsql.execute) to be flushed.
+my $contents = wait_for_n_spans($TRACE_ID_SEQ, 6);
 ok(-e $span_file, 'span file was created');
 
 my @seq_lines = spans_for_trace($contents, $TRACE_ID_SEQ);
-is(scalar @seq_lines, 1,
-	'exactly one span for the single-query trace_id');
+# Filter to the pgsql.execute statement span for assertions below.
+my @seq_stmt = grep { field($_, 'name') eq 'pgsql.execute' } @seq_lines;
+is(scalar @seq_stmt, 1,
+	'exactly one pgsql.execute span for the single-query trace_id');
 
-my $seq_span = $seq_lines[0];
+my $seq_span = $seq_stmt[0];
 is(field($seq_span, 'trace_id'), $TRACE_ID_SEQ,
 	'span trace_id is exactly the client-supplied value');
 is(field($seq_span, 'parent_span_id'), $SPAN_ID_SEQ,
@@ -274,8 +277,14 @@ ok(scalar(@par_lines) >= 2,
 	'at least two spans recorded for the parallel-query trace_id')
   or diag("only got: " . scalar(@par_lines) . " lines\n$contents");
 
-# Identify the leader: its parent_span_id is the client-supplied one.
-my @leader = grep { field($_, 'parent_span_id') eq $SPAN_ID_PAR } @par_lines;
+# Identify the leader: its parent_span_id is the client-supplied one and
+# its name is pgsql.execute (the executor statement span).  SDT bridge
+# spans also set parent_span_id to the client span when the root context
+# has no parent above them, so we need the name filter to avoid false matches.
+my @leader = grep {
+	field($_, 'parent_span_id') eq $SPAN_ID_PAR
+	  && field($_, 'name') eq 'pgsql.execute'
+} @par_lines;
 is(scalar @leader, 1,
 	'exactly one leader span (parent_span_id == client-supplied span_id)');
 

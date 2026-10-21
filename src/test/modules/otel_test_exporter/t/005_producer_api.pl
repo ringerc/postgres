@@ -38,6 +38,9 @@ $node->append_conf(
 	'postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
+# The producer's span starts a new trace, and new traces go to the
+# sampler hook, which drops by default in this exporter.
+test_otel_exporter.sampler_decision = record_and_sample
 EOCONF
 $node->start;
 $node->safe_psql('postgres',
@@ -77,12 +80,21 @@ like($combined, qr/^span_id=\Q$span_id\E$/m,
 	'captured span_id matches what the SQL function returned');
 like($combined, qr/^parent_span_id=$/m,
 	'no parent (root span on a new trace)');
-like($combined, qr/^trace_id=$/m,
-	'trace_id empty (no propagated context, no auto-generated trace_id)');
+like($combined, qr/^trace_id=[0-9a-f]{32}$/m,
+	'trace_id is auto-generated for root span (no propagated context)');
 like($combined, qr/^attr=test\.case=roundtrip$/m,
 	'attribute test.case round-tripped');
 like($combined, qr/^attr=test\.name=producer\.roundtrip$/m,
 	'attribute test.name round-tripped');
+
+# The MINOR-3 generic event API: a named event with attributes attached
+# via api->span_add_event must round-trip through the log dump.
+like($combined, qr/^event\.name=test\.event$/m,
+	'generic named event round-tripped (name)');
+like($combined, qr/^event\.attr=event\.kind=generic$/m,
+	'generic event attribute event.kind round-tripped');
+like($combined, qr/^event\.attr=event\.seq=1$/m,
+	'generic event attribute event.seq round-tripped');
 
 my ($start) = $combined =~ /^start_time=(\d+)$/m;
 my ($end)   = $combined =~ /^end_time=(\d+)$/m;

@@ -72,4 +72,164 @@ EOCONF
 	$node->stop;
 }
 
+# ----------------------------------------------------------------------
+# Test 3: OTEL_SERVICE_NAME env fallback --- no GUC set, env var wins.
+# ----------------------------------------------------------------------
+{
+	local $ENV{OTEL_SERVICE_NAME} = 'env-service';
+
+	my $node = PostgreSQL::Test::Cluster->new('env_fallback');
+	$node->init;
+	$node->append_conf('postgresql.conf', <<EOCONF);
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+log_min_messages = warning
+EOCONF
+	$node->start;
+	$node->safe_psql('postgres',
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
+
+	my $out = $node->safe_psql('postgres',
+		'SELECT test_otel_resource_attributes()');
+
+	like($out, qr/(?:^|;)service\.name=env-service(?:;|$)/,
+		'OTEL_SERVICE_NAME env fallback: service.name = env-service');
+
+	$node->stop;
+}
+
+# ----------------------------------------------------------------------
+# Test 4: GUC wins over OTEL_SERVICE_NAME env.
+# ----------------------------------------------------------------------
+{
+	local $ENV{OTEL_SERVICE_NAME} = 'env-loses';
+
+	my $node = PostgreSQL::Test::Cluster->new('guc_wins');
+	$node->init;
+	$node->append_conf('postgresql.conf', <<EOCONF);
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+otel_api.service_name = 'guc-wins'
+log_min_messages = warning
+EOCONF
+	$node->start;
+	$node->safe_psql('postgres',
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
+
+	my $out = $node->safe_psql('postgres',
+		'SELECT test_otel_resource_attributes()');
+
+	like($out, qr/(?:^|;)service\.name=guc-wins(?:;|$)/,
+		'GUC wins over env: service.name = guc-wins');
+	unlike($out, qr/(?:^|;)service\.name=env-loses(?:;|$)/,
+		'GUC wins over env: env-loses not used');
+
+	$node->stop;
+}
+
+# ----------------------------------------------------------------------
+# Test 5: OTEL_RESOURCE_ATTRIBUTES service.name + extra attr.
+# ----------------------------------------------------------------------
+{
+	local $ENV{OTEL_RESOURCE_ATTRIBUTES} =
+		'service.name=ora-service,deployment.environment=dev';
+
+	my $node = PostgreSQL::Test::Cluster->new('ora_service_name');
+	$node->init;
+	$node->append_conf('postgresql.conf', <<EOCONF);
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+log_min_messages = warning
+EOCONF
+	$node->start;
+	$node->safe_psql('postgres',
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
+
+	my $out = $node->safe_psql('postgres',
+		'SELECT test_otel_resource_attributes()');
+
+	like($out, qr/(?:^|;)service\.name=ora-service(?:;|$)/,
+		'OTEL_RESOURCE_ATTRIBUTES: service.name = ora-service');
+	like($out, qr/(?:^|;)deployment\.environment=dev(?:;|$)/,
+		'OTEL_RESOURCE_ATTRIBUTES: deployment.environment = dev');
+
+	$node->stop;
+}
+
+# ----------------------------------------------------------------------
+# Test 6: OTEL_SERVICE_NAME wins over OTEL_RESOURCE_ATTRIBUTES service.name.
+# ----------------------------------------------------------------------
+{
+	local $ENV{OTEL_SERVICE_NAME}         = 'env-wins';
+	local $ENV{OTEL_RESOURCE_ATTRIBUTES}  = 'service.name=ra-loses';
+
+	my $node = PostgreSQL::Test::Cluster->new('env_over_ora');
+	$node->init;
+	$node->append_conf('postgresql.conf', <<EOCONF);
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+log_min_messages = warning
+EOCONF
+	$node->start;
+	$node->safe_psql('postgres',
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
+
+	my $out = $node->safe_psql('postgres',
+		'SELECT test_otel_resource_attributes()');
+
+	like($out, qr/(?:^|;)service\.name=env-wins(?:;|$)/,
+		'OTEL_SERVICE_NAME wins over OTEL_RESOURCE_ATTRIBUTES service.name');
+	unlike($out, qr/(?:^|;)service\.name=ra-loses(?:;|$)/,
+		'OTEL_RESOURCE_ATTRIBUTES service.name not used when OTEL_SERVICE_NAME set');
+
+	$node->stop;
+}
+
+# ----------------------------------------------------------------------
+# Test 7: OTEL_SERVICE_INSTANCE_ID env fallback.
+# ----------------------------------------------------------------------
+{
+	local $ENV{OTEL_SERVICE_INSTANCE_ID} = 'env-instance-42';
+
+	my $node = PostgreSQL::Test::Cluster->new('env_instance_id');
+	$node->init;
+	$node->append_conf('postgresql.conf', <<EOCONF);
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+log_min_messages = warning
+EOCONF
+	$node->start;
+	$node->safe_psql('postgres',
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
+
+	my $out = $node->safe_psql('postgres',
+		'SELECT test_otel_resource_attributes()');
+
+	like($out, qr/(?:^|;)service\.instance\.id=env-instance-42(?:;|$)/,
+		'OTEL_SERVICE_INSTANCE_ID env fallback: service.instance.id = env-instance-42');
+
+	$node->stop;
+}
+
+# ----------------------------------------------------------------------
+# Test 8: URL-decoding of values in OTEL_RESOURCE_ATTRIBUTES.
+# ----------------------------------------------------------------------
+{
+	local $ENV{OTEL_RESOURCE_ATTRIBUTES} =
+		'deployment.environment=hello%20world';
+
+	my $node = PostgreSQL::Test::Cluster->new('url_decode');
+	$node->init;
+	$node->append_conf('postgresql.conf', <<EOCONF);
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+log_min_messages = warning
+EOCONF
+	$node->start;
+	$node->safe_psql('postgres',
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
+
+	my $out = $node->safe_psql('postgres',
+		'SELECT test_otel_resource_attributes()');
+
+	like($out, qr/(?:^|;)deployment\.environment=hello world(?:;|$)/,
+		'URL-decoding: %20 decoded to space in OTEL_RESOURCE_ATTRIBUTES value');
+
+	$node->stop;
+}
+
 done_testing();

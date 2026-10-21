@@ -156,12 +156,12 @@ like(
 	'log line contains the propagated trace_flags');
 like(
 	$log,
-	qr/otel-span: \{.*"db\.system":"postgresql"/,
-	'log line contains the db.system attribute');
+	qr/otel-span: \{.*"db\.system\.name":"postgresql"/,
+	'log line contains the db.system.name attribute');
 like(
 	$log,
-	qr/otel-span: \{.*"db\.statement":"SELECT 1"/,
-	'log line contains the db.statement attribute');
+	qr/otel-span: \{.*"db\.query\.text":"SELECT 1"/,
+	'log line contains the db.query.text attribute');
 like(
 	$log,
 	qr/otel-span: \{.*"status":0/,
@@ -169,7 +169,7 @@ like(
 
 # ----------------------------------------------------------------------
 # Test 2: a query that errors emits a log line with status=2 (ERROR)
-# and an event in the events array.
+# and the SQLSTATE and message as the status description.
 # ----------------------------------------------------------------------
 
 $log_offset = -s $node->logfile;
@@ -181,8 +181,8 @@ $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 
 like(
 	$log,
-	qr/otel-span: \{.*"status":2.*"events":\[\{.*"sqlstate":"22012"/s,
-	'errored span log line shows status=ERROR with a captured event');
+	qr/otel-span: \{.*"status":2,"status_description":"22012 \/ division by zero"/,
+	'errored span log line shows status=ERROR with the SQLSTATE and message');
 
 # ----------------------------------------------------------------------
 # Tidy up.

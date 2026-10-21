@@ -171,13 +171,27 @@ my $count = $node->safe_psql('postgres', 'SELECT test_otel_span_count()');
 # connection.  Switch back to that connection for the readout.
 
 my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-is(first_value(@msgs), '1',
-	'one span captured by the test exporter');
+is(first_value(@msgs), '6',
+	'six spans captured (pgsql.execute + 5 SDT sub-phase spans)');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+# Every span from the SDT bridge should carry the common filter attribute
+# pg.otel.span_source=sdt_probe, and the executor-hook span should NOT.
+for my $sdt_name (qw(pg.query pg.parse pg.rewrite pg.plan pg.execute))
+{
+	my @sm = run_query($sock,
+		"SELECT test_otel_pop_span_by_name('$sdt_name')");
+	my $s = first_value(@sm);
+	ok(defined $s && length $s,
+		"SDT span '$sdt_name' was captured for tagging check");
+	like($s, qr/attr=pg\.otel\.span_source=sdt_probe/,
+		"SDT span '$sdt_name' carries pg.otel.span_source=sdt_probe");
+}
+
+# Pop the statement span by name so attribute assertions target the right span.
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 my $span = first_value(@msgs);
 ok(defined $span && length $span,
-	'test_otel_pop_span returned a span body');
+	'test_otel_pop_span_by_name returned the pgsql.execute span body');
 
 # trace_id matches what the client supplied
 like($span, qr/trace_id=$TRACE_ID/,
@@ -199,16 +213,20 @@ like($span, qr/trace_flags=$FLAGS/,
 	'trace_flags match the client value');
 
 # Expected attributes are present
-like($span, qr/attr=db\.system=postgresql/,
-	'db.system attribute is "postgresql"');
-like($span, qr/attr=db\.name=postgres/,
-	'db.name attribute is the connected database');
-like($span, qr/attr=db\.statement=SELECT 1/,
-	'db.statement attribute is the SQL text');
+like($span, qr/attr=db\.system\.name=postgresql/,
+	'db.system.name attribute is "postgresql"');
+like($span, qr/attr=db\.namespace=postgres/,
+	'db.namespace attribute is the connected database');
+like($span, qr/attr=db\.query\.text=SELECT 1/,
+	'db.query.text attribute is the SQL text');
 
 # Status is UNSET (0) for a successful query
 like($span, qr/status=0\n/,
 	'status is UNSET on the success path');
+
+# No status_description on non-error spans
+unlike($span, qr/status_description=/,
+	'status_description absent on non-error spans');
 
 # Timestamps are sane (start <= end)
 my ($start) = $span =~ /start_time=(-?\d+)/;
@@ -241,7 +259,9 @@ run_query($sock, 'RESET otel.trace_all_queries');
 isnt(first_value(@msgs), '0',
 	'spans emitted under trace_all_queries even without propagated context');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+# The SDT sub-phase spans nest under pgsql.execute and are recorded too,
+# so look the statement span up by name.
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 $span = first_value(@msgs);
 # Parentless: parent_span_id is empty
 like($span, qr/parent_span_id=\n/,
@@ -264,23 +284,21 @@ send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'SELECT 1/i FROM generate_series(0,0) AS i');
 
 @msgs = run_query($sock, 'SELECT test_otel_span_count()');
-is(first_value(@msgs), '1',
-	'one span captured even though the query errored');
+is(first_value(@msgs), '4',
+	'four spans captured for the errored query (parse+rewrite+plan+pgsql.execute; pg.execute/pg.query not closed on error path)');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 $span = first_value(@msgs);
 like($span, qr/status=2\n/,
 	'span status is ERROR (2) for a query that raised an ereport(ERROR)');
-# In current postgres (v18+), ERROR's numeric value is 21
-# (WARNING_CLIENT_ONLY occupies 20).
-like($span, qr/event\.elevel=21\n/,
-	'event elevel matches ERROR (21)');
-like($span, qr/event\.sqlstate=22012\n/,
-	'event sqlstate is 22012 (division_by_zero)');
-like($span, qr/event\.message=division by zero/,
-	'event message captures the ereport text');
-like($span, qr/event\.filename=\w+\.c/,
-	'event filename is a postgres source file');
+# The exception event goes to the innermost non-session span, the SDT
+# bridge's pg.execute, which the bridge discards on abort, so the event
+# is not exported.  The statement span carries ERROR status and the
+# SQLSTATE and message as its status description.
+unlike($span, qr/event\.name=exception\n/,
+	'no exception event on the enclosing statement span');
+like($span, qr/status_description=22012 \/ division by zero/,
+	'status_description is populated with SQLSTATE / message summary');
 
 # Connection is now in a failed-transaction state; ROLLBACK to clear.
 run_query($sock, 'ROLLBACK');
@@ -301,16 +319,18 @@ run_query($sock, q{DO $$ BEGIN RAISE WARNING 'test-warn'; END $$});
 isnt(first_value(@msgs), '0',
 	'at least one span captured for the DO block');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('DO')");
 $span = first_value(@msgs);
 like($span, qr/name=DO\n/,
 	'utility span name is "DO" (the command tag)');
 like($span, qr/status=0\n/,
 	'utility span status remains UNSET when only WARNING fires');
-like($span, qr/event\.elevel=19\n/,
+like($span, qr/event\.attr=pg\.error\.elevel=19\n/,
 	'WARNING-level event captured on the utility span (elevel 19)');
-like($span, qr/event\.message=test-warn/,
+like($span, qr/event\.attr=exception\.message=test-warn/,
 	'WARNING message captured on the utility span');
+unlike($span, qr/status_description=/,
+	'status_description absent on WARNING-only span (Status.message reserved for Error status)');
 
 # ----------------------------------------------------------------------
 # Test 6: explicit BEGIN/COMMIT cycle - the BEGIN and COMMIT statements
@@ -331,11 +351,11 @@ send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'COMMIT');
 
 # At least two spans (BEGIN and COMMIT); names should reflect.
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('BEGIN')");
 $span = first_value(@msgs);
 like($span, qr/name=BEGIN\n/, 'first utility span is BEGIN');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('COMMIT')");
 $span = first_value(@msgs);
 like($span, qr/name=COMMIT\n/, 'second utility span is COMMIT');
 
@@ -358,18 +378,40 @@ run_query($sock, 'SELECT 1');
 is(first_value(@msgs), '0',
 	'no span emitted for an upstream-unsampled traceparent (default policy)');
 
-# But trace_all_queries still wins over the unsampled bit --- the
-# force-on path bypasses propagated sampling state entirely.
+# trace_all_queries must NOT override an unsampled remote parent: it
+# only forces recording for a brand-new root span (no parent context at
+# all).  Recording a child under a parent that is never exported would
+# produce an orphan span (postgres-cdq.19).
+#
+# The M-header's context is statement-scoped --- it is cleared at the
+# ReadyForQuery boundary that follows each separate Query message
+# (otel_trace_context_clear_cb) --- so SET/SELECT/RESET must all ride
+# the SAME simple-Query message (one semicolon-separated batch, one
+# ReadyForQuery) to keep the remote parent context live across them.
 run_query($sock, 'SELECT test_otel_clear()');
 send_msg($sock, 'M',
 	headers_body('otel.traceparent' => $UNSAMPLED_TRACEPARENT));
-run_query($sock, 'SET otel.trace_all_queries = on');
-run_query($sock, 'SELECT 1');
-run_query($sock, 'RESET otel.trace_all_queries');
+run_query($sock,
+	'SET otel.trace_all_queries = on; SELECT 1; RESET otel.trace_all_queries;'
+);
+
+@msgs = run_query($sock, 'SELECT test_otel_span_count()');
+is(first_value(@msgs), '0',
+	'trace_all_queries does not override an unsampled remote parent');
+
+# ... but a SAMPLED remote parent still gets a recorded child under
+# trace_all_queries, same as without the GUC (it follows the parent's
+# own sampling decision; force_sample just didn't need to do anything).
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M',
+	headers_body('otel.traceparent' => $TRACEPARENT));
+run_query($sock,
+	'SET otel.trace_all_queries = on; SELECT 1; RESET otel.trace_all_queries;'
+);
 
 @msgs = run_query($sock, 'SELECT test_otel_span_count()');
 isnt(first_value(@msgs), '0',
-	'trace_all_queries overrides unsampled traceparent');
+	'trace_all_queries still records a child of a sampled remote parent');
 
 # ----------------------------------------------------------------------
 # Tidy up.

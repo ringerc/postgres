@@ -42,7 +42,7 @@ extern void otel_planshape_install(void);
  * allocated in attr_cxt (span_cxt) so they outlive standard_ExecutorEnd.
  */
 extern void otel_planshape_executor_start(QueryDesc *queryDesc,
-										   OtelSpan *stmt_span,
+										   OtelSpanRef stmt_span,
 										   MemoryContext attr_cxt);
 
 /* Backing variable for the otel.trace_plan_shape GUC. */

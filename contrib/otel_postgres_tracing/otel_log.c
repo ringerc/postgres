@@ -1,14 +1,14 @@
 /*-------------------------------------------------------------------------
  *
  * otel_log.c
- *	  emit_log_hook integration for contrib/otel: surfaces the
+ *	  emit_log_hook integration for otel_postgres_tracing: surfaces the
  *	  propagated trace context in the server's log output so an
  *	  operator can correlate a log line back to the trace it
  *	  belongs to.
  *
  *	  When core postgres has the structured-annotation API on
  *	  ErrorData (the OTEL_HAVE_ERRANNOT feature), we attach
- *	  trace_id / span_id / trace_flags as annotations.  The built-
+ *	  trace_id / span_id / trace_flags as annotations. The built-
  *	  in log writers then surface them via JSON keys, the
  *	  annotations object in CSV, and the %A / %{key}A
  *	  log_line_prefix escapes --- structured, machine-parseable.
@@ -18,6 +18,10 @@
  *	  line to edata->context so the trace context still appears in
  *	  the textual log output, just less structured.
  *
+ *	  otel_api now captures WARNING+ ereports into the innermost
+ *	  recording span automatically (its own emit_log_hook), so this
+ *	  file no longer forwards events into a span itself; it only
+ *	  reads the current trace context to annotate the log line.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -30,6 +34,7 @@
 #include "postgres.h"
 
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
@@ -61,35 +66,27 @@ otel_log_install_hooks(void)
  *	   trace_id / span_id / trace_flags as annotations under their
  *	   well-known keys.  Otherwise append a trace_id=... line to
  *	   edata->context as a less-structured fallback.
- *	2. Hand the ereport to the span event-capture path in
- *	   otel_trace.c; it handles the active-span check, the elevel
- *	   gate, and the ERROR-status update internally.
- *	3. Chain.
+ *	2. Chain.
  *
- *	When the provider is absent (otel_pg_ensure returns NULL) the
- *	trace-context annotation is skipped; the span event capture and
- *	hook chain are still exercised.
+ *	When there is no current trace context, the annotation step is
+ *	skipped; the hook chain is still exercised.
  */
 static void
 otel_emit_log_hook(ErrorData *edata)
 {
-	const OtelTracingApi *api = otel_pg_ensure();
-	OtelRootContextSnapshot rc;
+	OtelSpanContext ctx;
 
-	if (api == NULL)
-	{
-		/* No provider: skip trace-context annotation; chain only. */
-		otel_span_record_log_event(edata);
-		if (prev_emit_log_hook)
-			prev_emit_log_hook(edata);
-		return;
-	}
-
-	api->get_root_context_snapshot(&rc);
-
-	if (rc.is_set)
+	/* otel_api refuses every call inside a critical section. */
+	if (CritSectionCount == 0 && otel_span_context_of(OTEL_SPAN_NONE, &ctx))
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(edata->assoc_context);
+		char		trace_id_hex[OTEL_TRACE_ID_HEX_LEN + 1];
+		char		span_id_hex[OTEL_SPAN_ID_HEX_LEN + 1];
+		char		flags_hex[3];
+
+		otel_trace_id_to_hex(&ctx.trace_id, trace_id_hex);
+		otel_span_id_to_hex(&ctx.span_id, span_id_hex);
+		otel_bytes_to_hex(&ctx.trace_flags, 1, flags_hex);
 
 #ifdef OTEL_HAVE_ERRANNOT
 		/*
@@ -104,9 +101,9 @@ otel_emit_log_hook(ErrorData *edata)
 		 * hook-installed trace context is the most authoritative for
 		 * this log line.
 		 */
-		errannot(OTEL_ERRANNOT_KEY_TRACE_ID, rc.trace_id);
-		errannot(OTEL_ERRANNOT_KEY_SPAN_ID, rc.span_id);
-		errannot(OTEL_ERRANNOT_KEY_TRACE_FLAGS, rc.trace_flags);
+		errannot(OTEL_ERRANNOT_KEY_TRACE_ID, trace_id_hex);
+		errannot(OTEL_ERRANNOT_KEY_SPAN_ID, span_id_hex);
+		errannot(OTEL_ERRANNOT_KEY_TRACE_FLAGS, flags_hex);
 #else
 		/*
 		 * Fallback for unpatched servers without ErrorData
@@ -122,24 +119,22 @@ otel_emit_log_hook(ErrorData *edata)
 		 * stack duplicates.
 		 */
 		if (edata->context == NULL ||
-			strstr(edata->context, rc.trace_id) == NULL)
+			strstr(edata->context, trace_id_hex) == NULL)
 		{
-			StringInfoData ctx;
+			StringInfoData ctxbuf;
 
-			initStringInfo(&ctx);
+			initStringInfo(&ctxbuf);
 			if (edata->context)
-				appendStringInfo(&ctx, "%s\n", edata->context);
-			appendStringInfo(&ctx,
+				appendStringInfo(&ctxbuf, "%s\n", edata->context);
+			appendStringInfo(&ctxbuf,
 							 "trace_id=%s span_id=%s trace_flags=%s",
-							 rc.trace_id, rc.span_id, rc.trace_flags);
-			edata->context = ctx.data;
+							 trace_id_hex, span_id_hex, flags_hex);
+			edata->context = ctxbuf.data;
 		}
 #endif
 
 		MemoryContextSwitchTo(oldcxt);
 	}
-
-	otel_span_record_log_event(edata);
 
 	if (prev_emit_log_hook)
 		prev_emit_log_hook(edata);

@@ -40,9 +40,10 @@ endif
 
 otel_postgres_tracing = shared_module('otel_postgres_tracing',
   otel_postgres_tracing_sources,
-  # <otel_api/otel.h> resolves from contrib/otel_api/ in the in-tree
-  # layout via -I.../contrib.
-  c_args: ['-I' + meson.project_source_root() / 'contrib'] + otel_pgt_cppflags,
+  # <otel_api/otel.h> resolves from the otel_api SOURCE tree (this
+  # module's sibling directory), not any installed copy, so the P2
+  # API reshape is picked up without a reinstall.
+  c_args: ['-I' + meson.current_source_dir() / '..'] + otel_pgt_cppflags,
   kwargs: contrib_mod_args,
 )
 contrib_targets += otel_postgres_tracing

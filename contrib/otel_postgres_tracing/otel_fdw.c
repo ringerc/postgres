@@ -74,6 +74,7 @@
 
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
+#include "otel_pg_attrs.h"
 #include "otel_fdw.h"
 
 /*
@@ -104,63 +105,66 @@
 static struct
 {
 	ForeignScanState *node;		/* key: the ForeignScanState pointer */
-	OtelSpan	span;			/* OTEL_UNWIND_DROP -> static storage ok */
+	OtelSpanRef ref;
 	int			subxact_level;	/* GetCurrentTransactionNestLevel() at push */
 } fdw_scan_stack[OTEL_FDW_SCAN_STACK_MAX];
 static int	fdw_scan_depth = 0;
 
 
 /*
- * Open a pg.fdw.scan span for one ForeignScanState and push it onto both the
- * producer active stack (so it nests under the current span) and our tracking
- * stack (so the matching end can find it).  No-op when the provider is absent
- * or the stack is full.
+ * Open a pg.fdw.scan span for one ForeignScanState.  Our tracking stack
+ * lets the matching end find it again.  No-op when the stack is full, or
+ * when nothing should record (otel_span_start returns OTEL_SPAN_NONE).
  */
 static void
 otel_fdw_scan_begin(ForeignScanState *node)
 {
-	const OtelTracingApi *api = otel_pg_ensure();
-	OtelSpan   *span;
+	OtelSpanRef s;
+	OtelSpanRef parent = otel_span_current();
 
-	if (api == NULL || fdw_scan_depth >= OTEL_FDW_SCAN_STACK_MAX)
+	if (fdw_scan_depth >= OTEL_FDW_SCAN_STACK_MAX)
 		return;
 
-	span = &fdw_scan_stack[fdw_scan_depth].span;
-	fdw_scan_stack[fdw_scan_depth].node = node;
-	fdw_scan_stack[fdw_scan_depth].subxact_level = GetCurrentTransactionNestLevel();
+	/*
+	 * Scans of several foreign tables can be open at once and end in any
+	 * order (joins, async append), so the span is detached, as a child of
+	 * whatever is active when the scan begins.
+	 */
+	s = otel_span_start(.tracer = &otel_pg_tracer,
+						.name = "pg.fdw.scan",
+						.kind = OTEL_SPAN_KIND_CLIENT,
+						.detached = true,
+						.parent = parent.v != 0 ? OTEL_PARENT_SPAN : OTEL_PARENT_ACTIVE,
+						.parent_span = parent);
+	if (s.v == 0)
+		return;
 
-	api->span_init(span, otel_pg_tracer, "pg.fdw.scan", OTEL_SPAN_KIND_CLIENT);
-	api->span_add_attribute_string(span, "db.system", "postgresql");
+	otel_span_set_str(s, OTEL_SC_DB_SYSTEM_NAME, OTEL_SC_DB_SYSTEM_POSTGRESQL);
 
 	if (node->ss.ss_currentRelation != NULL)
-		api->span_add_attribute_string(span, "db.collection.name",
-									   RelationGetRelationName(node->ss.ss_currentRelation));
+		otel_span_set_str(s, OTEL_SC_DB_COLLECTION_NAME,
+						  RelationGetRelationName(node->ss.ss_currentRelation));
 
-	api->span_link_to_active_and_push(span);
+	fdw_scan_stack[fdw_scan_depth].node = node;
+	fdw_scan_stack[fdw_scan_depth].ref = s;
+	fdw_scan_stack[fdw_scan_depth].subxact_level = GetCurrentTransactionNestLevel();
 	fdw_scan_depth++;
 }
 
 /*
  * Locate the tracking entry for one ForeignScanState (end may be non-LIFO
- * with async FDW), emit its span, then compact the stack.  Uses
- * otel_api_get() rather than otel_pg_ensure() because we are only emitting an
- * already-initialised span, not registering a new tracer scope.
+ * with async FDW), end its span, then compact the stack.
  */
 static void
 otel_fdw_scan_end(ForeignScanState *node)
 {
-	const OtelTracingApi *api = otel_api_get();
 	int			i;
 
 	for (i = fdw_scan_depth - 1; i >= 0; i--)
 	{
 		if (fdw_scan_stack[i].node == node)
 		{
-			if (api != NULL)
-			{
-				fdw_scan_stack[i].span.end_time = GetCurrentTimestamp();
-				api->span_emit(&fdw_scan_stack[i].span);
-			}
+			otel_span_end(fdw_scan_stack[i].ref);
 
 			/* Shift remaining entries down to fill the gap. */
 			for (; i < fdw_scan_depth - 1; i++)
@@ -169,7 +173,7 @@ otel_fdw_scan_end(ForeignScanState *node)
 			return;
 		}
 	}
-	/* Not found: already unwound via MemoryContext callback on error. */
+	/* Not found: already unwound via the resource owner on error. */
 }
 
 
@@ -336,10 +340,10 @@ otel_fdw_subxact_abort(SubXactEvent event)
 }
 
 /*
- * Reset on top-level transaction abort.  The FDW scan spans are dropped by
- * the otel_api MemoryContext callbacks during error unwind; we just clear our
- * depth counter so the next transaction starts clean.  Applies to both
- * strategies.
+ * Reset on top-level transaction abort.  The FDW scan spans are ended
+ * (exported with ERROR status) by otel_api's own resource-owner release
+ * during error unwind; we just clear our depth counter so the next
+ * transaction starts clean.  Applies to both strategies.
  */
 void
 otel_fdw_reset(void)
