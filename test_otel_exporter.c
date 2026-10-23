@@ -31,6 +31,8 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -659,4 +661,37 @@ test_otel_resource_attributes(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * test_otel_spectoken_lock(xid bigint, token int, mode text) → void
+ *
+ * Take a transaction-scoped heavyweight lock on a speculative-insertion
+ * lock tag.  Core offers no pause point while an ON CONFLICT insertion
+ * holds its token, so tests use this from two sessions (ExclusiveLock in
+ * the holder, ShareLock in the waiter) to make a spectoken wait
+ * deterministic.  mode is 'exclusive' or 'share'.
+ */
+PG_FUNCTION_INFO_V1(test_otel_spectoken_lock);
+Datum
+test_otel_spectoken_lock(PG_FUNCTION_ARGS)
+{
+	uint32		xid = (uint32) PG_GETARG_INT64(0);
+	uint32		token = (uint32) PG_GETARG_INT32(1);
+	char	   *mode = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	LOCKTAG		tag;
+	LOCKMODE	lockmode;
+
+	if (strcmp(mode, "exclusive") == 0)
+		lockmode = ExclusiveLock;
+	else if (strcmp(mode, "share") == 0)
+		lockmode = ShareLock;
+	else
+		ereport(ERROR,
+				(errmsg("test_otel_spectoken_lock: mode must be 'exclusive' or 'share'")));
+
+	SET_LOCKTAG_SPECULATIVE_INSERTION(tag, xid, token);
+	(void) LockAcquire(&tag, lockmode, false, false);
+
+	PG_RETURN_VOID();
 }
