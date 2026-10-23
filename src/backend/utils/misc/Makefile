@@ -25,6 +25,7 @@ OBJS = \
 	pg_config.o \
 	pg_controldata.o \
 	pg_rusage.o \
+	pg_sdt_probe.o \
 	ps_status.o \
 	queryenvironment.o \
 	rls.o \

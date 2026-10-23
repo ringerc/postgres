@@ -3307,6 +3307,8 @@ TypeCat
 TypeFuncClass
 TypeInfo
 TypeName
+TraceContextApplyCb
+TraceContextClearCb
 TzAbbrevCache
 U32
 U8

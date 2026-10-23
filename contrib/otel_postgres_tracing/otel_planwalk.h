@@ -1,0 +1,170 @@
+/*-------------------------------------------------------------------------
+ *
+ * otel_planwalk.h
+ *	  Single-pass planstate-tree-walker dispatcher for OpenTelemetry
+ *	  instrumentation collectors.
+ *
+ * Every walk-based feature (FDW spans on PG18, per-node stats, pathology
+ * flags, curated child spans) registers a collector here.  A single
+ * planstate_tree_walker pass is performed per ExecutorStart / ExecutorEnd,
+ * dispatching to each enabled collector's node_begin / node_end callback.
+ *
+ * Usage:
+ *   1. At _PG_init time, call otel_planwalk_install().
+ *   2. In otel_ExecutorStart, after the chain, call
+ *      otel_planwalk_executor_start() when span_active.
+ *   3. In otel_ExecutorEnd, before the chain, call
+ *      otel_planwalk_executor_end().
+ *   4. Collectors call otel_planwalk_register_collector() from their own
+ *      install/init functions; the registered array is static and
+ *      fixed-size (OTEL_PLANWALK_MAX_COLLECTORS entries).
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * contrib/otel_postgres_tracing/otel_planwalk.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CONTRIB_OTEL_POSTGRES_TRACING_PLANWALK_H
+#define CONTRIB_OTEL_POSTGRES_TRACING_PLANWALK_H
+
+#include "executor/execdesc.h"
+#include "executor/instrument.h"
+#include "nodes/execnodes.h"
+#include "utils/memutils.h"
+
+#include <otel_api/otel.h>
+
+/*
+ * Context passed to every collector callback during a walk.  The dispatcher
+ * builds one of these per executor call and passes a pointer down through the
+ * planstate_tree_walker.
+ */
+typedef struct OtelPlanwalkContext
+{
+	QueryDesc  *queryDesc;		/* the active QueryDesc */
+	OtelSpanRef stmt_span;		/* the enclosing pgsql.execute span */
+	MemoryContext attr_cxt;		/* scratch context for building attribute
+								 * values; setters copy immediately, so
+								 * this need not outlive the call */
+
+	/*
+	 * The current node's ancestors in the plan tree, root first.  Only
+	 * the top OTEL_PLANWALK_MAX_ANCESTORS levels are recorded; a node
+	 * deeper than that sees only those.
+	 */
+	PlanState  *const *ancestors;
+	int			n_ancestors;
+} OtelPlanwalkContext;
+
+#define OTEL_PLANWALK_MAX_ANCESTORS 64
+
+/*
+ * A collector registration entry.  Any callback may be NULL (the dispatcher
+ * skips NULL callbacks cheaply).
+ *
+ *   enabled()        -- returns true iff this collector wants callbacks for
+ *                       the current query.  Called once per walk before the
+ *                       tree traversal begins.  Must be non-NULL.
+ *   node_begin(ps, ctx) -- called on each PlanState node during the start
+ *                       walk (after standard_ExecutorStart).
+ *   node_end(ps, ctx)   -- called on each PlanState node during the end
+ *                       walk (before standard_ExecutorEnd).
+ *   end_walk_begin(ctx) -- called ONCE before the end-walk traversal begins.
+ *                       Use to reset per-query accumulators.  Aggregation
+ *                       collectors (per-node stats, pathology flags) need this.
+ *   end_walk_end(ctx)   -- called ONCE after the end-walk traversal completes,
+ *                       while stmt_span is still open and attr_cxt is live.
+ *                       Fold aggregated attributes onto ctx->stmt_span here.
+ *
+ * Child-span collectors (FDW, curated node spans) use node_begin/node_end and
+ * leave the end_walk_* framing callbacks NULL.  Root-fold collectors use
+ * end_walk_begin (reset) + node_end (accumulate) + end_walk_end (emit).
+ */
+typedef struct OtelPlanwalkCollector
+{
+	bool		(*enabled) (void);
+	void		(*node_begin) (PlanState *ps, OtelPlanwalkContext *ctx);
+	void		(*node_end) (PlanState *ps, OtelPlanwalkContext *ctx);
+	void		(*end_walk_begin) (OtelPlanwalkContext *ctx);
+	void		(*end_walk_end) (OtelPlanwalkContext *ctx);
+} OtelPlanwalkCollector;
+
+/*
+ * PlanState.instrument accessors, papering over the PG18/PG19 divergence.
+ *
+ * On the patched PG19 core, PlanState.instrument is NodeInstrumentation* --
+ * the per-node stats were split into executor/instrument_node.h, the base
+ * Instrumentation is nested as .instr, and the timing counters (total,
+ * startup) are instr_time (read via INSTR_TIME_GET_MILLISEC).
+ *
+ * On PG18 it is the stock Instrumentation*: total/startup are plain doubles in
+ * *seconds* and bufusage is a top-level field.  These macros yield the same
+ * millisecond / BufferUsage values from either layout so the collector body is
+ * shared verbatim.  ntuples/nloops are top-level in both and used directly.
+ */
+#if PG_VERSION_NUM >= 190000
+#include "executor/instrument_node.h"
+typedef NodeInstrumentation OtelNodeInstr;
+#define OTEL_NI_TOTAL_MS(ni)	INSTR_TIME_GET_MILLISEC((ni)->instr.total)
+#define OTEL_NI_STARTUP_MS(ni)	INSTR_TIME_GET_MILLISEC((ni)->startup)
+#define OTEL_NI_BUFUSAGE(ni)	((ni)->instr.bufusage)
+#else
+typedef Instrumentation OtelNodeInstr;
+#define OTEL_NI_TOTAL_MS(ni)	((ni)->total * 1000.0)
+#define OTEL_NI_STARTUP_MS(ni)	((ni)->startup * 1000.0)
+#define OTEL_NI_BUFUSAGE(ni)	((ni)->bufusage)
+#endif
+
+/* Maximum number of simultaneously registered collectors. */
+#define OTEL_PLANWALK_MAX_COLLECTORS 8
+
+/*
+ * Register a collector.  Must be called before the first executor hook fires
+ * (i.e., from _PG_init or from install functions called by _PG_init).
+ * Panics (elog ERROR) if the fixed-size array is full.
+ */
+extern void otel_planwalk_register_collector(const OtelPlanwalkCollector *c);
+
+/*
+ * Called from otel_trace_install_hooks() once at _PG_init.  Reserved for
+ * future initialization; currently a no-op.
+ */
+extern void otel_planwalk_install(void);
+
+/*
+ * Executor hook drivers called from otel_trace.c.
+ *
+ *   _executor_start: called after standard_ExecutorStart when span_active.
+ *                    Performs the begin-walk (calls node_begin on each node).
+ *   _executor_end:   called before standard_ExecutorEnd (unconditionally,
+ *                    or at minimum whenever span was active at start).
+ *                    Performs the end-walk (calls node_end on each node).
+ *                    Early-outs cheaply when no collector is enabled.
+ */
+extern void otel_planwalk_executor_start(QueryDesc *queryDesc,
+										 OtelSpanRef stmt_span,
+										 MemoryContext attr_cxt);
+extern void otel_planwalk_executor_end(QueryDesc *queryDesc,
+									   OtelSpanRef stmt_span,
+									   MemoryContext attr_cxt);
+
+/*
+ * Returns true iff any group-A feature (requiring per-node Instrumentation)
+ * is currently enabled.  Used by otel_ExecutorStart to decide whether to OR
+ * INSTRUMENT_* flags into queryDesc->instrument_options before the chain.
+ */
+extern bool otel_planwalk_want_instrumentation(void);
+
+/* Backing variable for otel.trace_plan_node_stats GUC. */
+extern bool otel_trace_plan_node_stats;
+
+/*
+ * Backing variable for otel.trace_plan_node_events GUC ("rich" per-node span
+ * events).  Separate from trace_plan_node_stats on purpose (per-node events are
+ * far higher volume than the compact rollup); see otel_planwalk.c for rationale.
+ */
+extern bool otel_trace_plan_node_events;
+
+#endif							/* CONTRIB_OTEL_POSTGRES_TRACING_PLANWALK_H */

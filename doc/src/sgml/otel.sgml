@@ -1,0 +1,275 @@
+<!-- doc/src/sgml/otel.sgml -->
+
+<sect1 id="otel" xreflabel="otel">
+ <title>otel &mdash; OpenTelemetry trace-context infrastructure</title>
+
+ <indexterm zone="otel">
+  <primary>otel</primary>
+ </indexterm>
+
+ <para>
+  The <filename>otel</filename> module is the API/infrastructure
+  half of <productname>PostgreSQL</productname>'s built-in
+  OpenTelemetry trace-context support.  It implements the
+  client-side context-ingestion mechanisms (the <literal>'M'</literal>
+  per-message protocol header, the <varname>otel.traceparent</varname>
+  and <varname>otel.tracestate</varname> GUCs, optional
+  <ulink url="https://google.github.io/sqlcommenter/">sqlcommenter</ulink>
+  parsing), a sampler-hook framework, an active-span stack for
+  producer-side instrumentation, parallel-worker context propagation
+  via shared memory, and a rendezvous-published
+  <structname>OtelTracingApi</structname> that out-of-tree exporters
+  and other contrib modules consume.
+ </para>
+
+ <para>
+  By itself <filename>otel</filename> does not produce any spans for
+  ordinary SQL queries.  Statement-level tracing is the responsibility
+  of a companion module such as the in-tree
+  <xref linkend="otel-postgres-tracing"/>, which builds on the
+  <filename>otel</filename> API.  An installation that loads only
+  <filename>otel</filename> has the protocol-header mechanism and the
+  log-side trace-correlation fields available, but no query spans.
+ </para>
+
+ <sect2 id="otel-loading">
+  <title>Loading the module</title>
+
+  <para>
+   <filename>otel</filename> must be loaded via
+   <xref linkend="guc-shared-preload-libraries"/> because it installs
+   protocol-header handlers, registers rendezvous variables, and
+   allocates shared memory at postmaster start.  A
+   <command>CREATE EXTENSION</command> entry is also provided for
+   catalogue tracking and for the introspection function it exposes
+   (see <xref linkend="otel-sql-surface"/>).
+  </para>
+
+  <para>
+   To get query-side tracing as well, load
+   <filename>otel_postgres_tracing</filename> immediately after.  The
+   order matters: <filename>otel</filename> publishes the
+   <structname>OtelTracingApi</structname> rendezvous variable at its
+   <function>_PG_init</function>, and
+   <filename>otel_postgres_tracing</filename> looks it up at its own
+   <function>_PG_init</function>.
+  </para>
+
+<programlisting>
+# postgresql.conf
+shared_preload_libraries = 'otel,otel_postgres_tracing'
+</programlisting>
+ </sect2>
+
+ <sect2 id="otel-configuration-parameters">
+  <title>Configuration Parameters</title>
+
+  <variablelist>
+   <varlistentry>
+    <term>
+     <varname>otel.traceparent</varname> (<type>text</type>)
+     <indexterm>
+      <primary><varname>otel.traceparent</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Client-supplied W3C TraceContext
+      <literal>traceparent</literal> value, e.g.
+      <literal>00-{32-hex-trace-id}-{16-hex-span-id}-{2-hex-flags}</literal>.
+      Normally set via the per-message <literal>'M'</literal>
+      RequestHeaders protocol mechanism; can also be set with
+      <command>SET</command> / <command>SET LOCAL</command> for
+      clients that do not speak the <literal>'M'</literal> message.
+      Empty by default.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <varname>otel.tracestate</varname> (<type>text</type>)
+     <indexterm>
+      <primary><varname>otel.tracestate</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Optional W3C TraceContext <literal>tracestate</literal> value
+      (vendor-specific key=value entries).  Companion to
+      <varname>otel.traceparent</varname>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <varname>otel.emit_spans_to_log</varname> (<type>boolean</type>)
+     <indexterm>
+      <primary><varname>otel.emit_spans_to_log</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      When on, every emitted span is also written to the postgres log
+      as a JSON line prefixed with <literal>otel-span:</literal>.
+      Off by default.  Useful when no exporter module is loaded, or
+      for debugging the in-process span flow without setting up an
+      external collector.  Reload-only.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <varname>otel.parse_sqlcommenter</varname> (<type>boolean</type>)
+     <indexterm>
+      <primary><varname>otel.parse_sqlcommenter</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      When on, trace context is extracted from
+      <ulink url="https://google.github.io/sqlcommenter/">sqlcommenter</ulink>-style
+      SQL comments in the query text, used as a fallback when no
+      <literal>'M'</literal> header or
+      <varname>otel.traceparent</varname> GUC has been set.  Off by
+      default.
+     </para>
+     <warning>
+      <para>
+       Sqlcommenter is structurally broken under client-side or
+       server-side prepared statements: the comment is captured at
+       Parse time and frozen in the cached plan, so every subsequent
+       Execute reuses the original trace context.  Prefer the
+       <literal>'M'</literal> protocol header for any workload that
+       uses prepared statements.
+      </para>
+     </warning>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect2>
+
+ <sect2 id="otel-sql-surface">
+  <title>SQL surface</title>
+
+  <variablelist>
+   <varlistentry>
+    <term>
+     <function>otel_current_traceparent()</function> returns <type>text</type>
+     <indexterm>
+      <primary><function>otel_current_traceparent</function></primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Returns the currently-active <literal>traceparent</literal>
+      reconstructed from the in-memory root context, or
+      <literal>NULL</literal> if no context is set.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect2>
+
+ <sect2 id="otel-headers-message">
+  <title>The <literal>'M'</literal> RequestHeaders protocol message</title>
+
+  <para>
+   The primary client &rarr; server propagation path is the
+   <literal>'M'</literal> RequestHeaders message added to the v3
+   protocol by this module (negotiated via the
+   <literal>_pq_.headers=1</literal> startup option).  A client sends
+   namespaced <literal>(key, value)</literal> pairs in an
+   <literal>'M'</literal> message; the
+   <literal>_otel.traceparent</literal> and
+   <literal>_otel.tracestate</literal> keys populate the backend's
+   root context for the next statement.
+  </para>
+
+  <para>
+   <filename>otel</filename> affirmatively acknowledges support via a
+   <literal>protocol_features</literal> ParameterStatus message at
+   connection startup.  Proxies (notably pgbouncer) that strip the
+   <literal>_pq_.headers=1</literal> opt-in are therefore observable
+   to the client: no acknowledgement arrives, and the libpq
+   <function>PQheadersAvailable()</function> API returns false.
+   See <xref linkend="libpq-headers"/> for the client-side details.
+  </para>
+ </sect2>
+
+ <sect2 id="otel-rendezvous-api">
+  <title>The <structname>OtelTracingApi</structname> rendezvous interface</title>
+
+  <para>
+   Out-of-tree exporter modules and other contrib extensions consume
+   <filename>otel</filename>'s functionality via a function-pointer
+   table published as a postgres rendezvous variable named
+   <literal>OtelTracingApi</literal>.  Consumers locate it with
+   <function>find_rendezvous_variable()</function> at
+   <function>_PG_init</function> time, verify the major/minor
+   version, and call into the table for hook registration
+   (exporters), producer-side span construction (instrumentation),
+   active-stack inspection (cross-module nesting), parallel-worker
+   propagation, sqlcommenter parsing, and sampler dispatch.
+  </para>
+
+  <para>
+   The full interface declaration is in
+   <filename>contrib/otel/otel_api.h</filename>; the related data
+   types in <filename>contrib/otel/otel.h</filename>.  Both headers
+   are installed under
+   <filename>$(pg_config&nbsp;--includedir-server)/extension/otel/</filename>
+   so consumer modules can <literal>#include &lt;otel/otel.h&gt;</literal>.
+  </para>
+
+  <para>
+   Versioning follows a major/minor halfword convention encoded in a
+   single <type>uint32</type>: the high halfword is bumped on any
+   incompatible layout change (strict-equality check, force rebuild);
+   the low halfword is a monotonic extension counter (additive-only,
+   consumer requires <literal>producer_minor &gt;= consumer_minor</literal>).
+   See the comment on
+   <literal>OTEL_TRACING_API_VERSION</literal> in
+   <filename>otel_api.h</filename>.
+  </para>
+ </sect2>
+
+ <sect2 id="otel-parallel-workers">
+  <title>Parallel-worker context propagation</title>
+
+  <para>
+   When a query that has an active span launches parallel workers,
+   workers attribute their own spans to the leader's currently-active
+   span_id (not the client-supplied root span_id).  This is
+   implemented via a fixed-size shared-memory slot array indexed by
+   <literal>ProcNumber</literal>: the leader publishes its
+   SpanContext to its own slot at span start; workers read their
+   leader's slot via <varname>ParallelLeaderProcNumber</varname>.
+   The mechanism is not exposed through GUCs; it is internal to the
+   <structname>OtelTracingApi</structname>.
+  </para>
+ </sect2>
+
+ <sect2 id="otel-log-correlation">
+  <title>Log/trace correlation</title>
+
+  <para>
+   When a backend has an active trace context (either client-supplied
+   or via the in-process active-span stack), core
+   <productname>PostgreSQL</productname>'s JSON and CSV log writers
+   include <literal>trace_id</literal>, <literal>span_id</literal>,
+   and <literal>trace_flags</literal> as annotations under those
+   well-known keys, and the <literal>%{trace_id}A</literal> /
+   <literal>%{span_id}A</literal> / <literal>%{trace_flags}A</literal>
+   <xref linkend="guc-log-line-prefix"/> escapes substitute them into
+   plain-text log lines.  This is implemented via the core
+   <function>errannot</function> annotation API on
+   <structname>ErrorData</structname>;
+   <filename>otel_postgres_tracing</filename> attaches the annotations
+   from an <varname>emit_log_hook</varname>-style integration when a
+   span is active.
+  </para>
+ </sect2>
+</sect1>

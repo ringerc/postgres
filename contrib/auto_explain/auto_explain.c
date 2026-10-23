@@ -27,6 +27,19 @@
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
+/*
+ * Optional OTel span enrichment, via the otel_api MAJOR 3 producer API.
+ * HAVE_OTEL_API selects the real otel_api/otel_producer.h; otherwise the
+ * vendored otel_producer_stub.h declares the same calls as no-ops, so no
+ * #ifdef is needed at any call site below.  Same idiom as
+ * contrib/postgres_fdw/postgres_fdw.c.
+ */
+#ifdef HAVE_OTEL_API
+#include "otel_api/otel_producer.h"
+#else
+#include "otel_producer_stub.h"
+#endif
+
 PG_MODULE_MAGIC_EXT(
 					.name = "auto_explain",
 					.version = PG_VERSION
@@ -476,6 +489,37 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			{
 				es->str->data[0] = '{';
 				es->str->data[es->str->len - 1] = '}';
+			}
+
+			/*
+			 * Enrich the active OTel statement span with the plan text as a
+			 * span EVENT (name="plan") rather than a span attribute.  A
+			 * KB-sized plan on every sampled span bloats the attribute set,
+			 * and under ANALYZE the embedded timings make a plan-text
+			 * attribute high-cardinality; an event is the correct home.
+			 *
+			 * otel_span_current() returns OTEL_SPAN_NONE when there is no
+			 * otel_api span active, or otel_api isn't loaded/recording at
+			 * all (HAVE_OTEL_API unset, or the real producer API's
+			 * recording_possible gate is false); otel_span_add_event() is
+			 * then a no-op, making this a safe no-op in those cases.
+			 *
+			 * The producer COPIES the attribute array and its key/value
+			 * strings into the span's context, so the transient stack array
+			 * below and the es->str->data lifetime are not a concern here
+			 * (the copy happens before this call returns).
+			 */
+			{
+				OtelSpanRef s = otel_span_current();
+
+				if (otel_span_recording(s))
+				{
+					const OtelAttribute attrs[] = {
+						OTEL_ATTR_STR("db.postgresql.explain_plan", es->str->data),
+					};
+
+					otel_span_add_event(s, "plan", 0, attrs, 1);
+				}
 			}
 
 			/*

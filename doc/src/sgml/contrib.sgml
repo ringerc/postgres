@@ -149,6 +149,8 @@ CREATE EXTENSION <replaceable>extension_name</replaceable>;
  &isn;
  &lo;
  &ltree;
+ &otel;
+ &otelpostgrestracing;
  &pageinspect;
  &passwordcheck;
  &pgbuffercache;

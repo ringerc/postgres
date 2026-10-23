@@ -294,6 +294,12 @@ static char *prepareGID;
  */
 static bool forceSyncCommit = false;
 
+/*
+ * Optional hook (default NULL) letting an extension attach an OpenTelemetry
+ * trace context to commit records.  See access/xact.h.
+ */
+bool		(*commit_trace_context_hook) (xl_xact_trace_context *tc) = NULL;
+
 /* Flag for logging statements in a transaction. */
 bool		xact_is_sampled = false;
 
@@ -5885,6 +5891,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_invals xl_invals;
 	xl_xact_twophase xl_twophase;
 	xl_xact_origin xl_origin;
+	xl_xact_trace_context xl_trace_context;
 	uint8		info;
 
 	Assert(CritSectionCount > 0);
@@ -5970,6 +5977,15 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_origin.origin_timestamp = replorigin_xact_state.origin_timestamp;
 	}
 
+	/*
+	 * Let an extension attach a trace context so a standby can join the
+	 * primary's trace when it replays this commit.  Collected last so it is
+	 * also serialized last (see XACT_XINFO_HAS_TRACE_CONTEXT in xact.h).
+	 */
+	if (commit_trace_context_hook != NULL &&
+		commit_trace_context_hook(&xl_trace_context))
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_TRACE_CONTEXT;
+
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
@@ -6025,6 +6041,10 @@ XactLogCommitRecord(TimestampTz commit_time,
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
 		XLogRegisterData(&xl_origin, sizeof(xl_xact_origin));
+
+	/* MUST be registered last; see XACT_XINFO_HAS_TRACE_CONTEXT in xact.h */
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_TRACE_CONTEXT)
+		XLogRegisterData(&xl_trace_context, SizeOfXactTraceContext);
 
 	/* we allow filtering by xacts */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
@@ -6192,6 +6212,18 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	TimestampTz commit_time;
 
 	Assert(TransactionIdIsValid(xid));
+
+	/*
+	 * If the commit record carries a trace context, fire the recovery probe
+	 * so the standby can emit a span in the same trace as the primary.
+	 */
+	if (parsed->has_trace_context)
+	{
+		char		traceparent[56];
+
+		format_traceparent(&parsed->trace_context, traceparent);
+		TRACE_POSTGRESQL_RECOVERY_XACT_COMMIT(traceparent, (long) lsn);
+	}
 
 	max_xid = TransactionIdLatest(xid, parsed->nsubxacts, parsed->subxacts);
 

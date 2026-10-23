@@ -30,6 +30,10 @@
 static TupleTableSlot *ForeignNext(ForeignScanState *node);
 static bool ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot);
 
+/* Executor hooks for FDW scan begin/end. */
+ForeignScanBegin_hook_type ForeignScanBegin_hook = NULL;
+ForeignScanEnd_hook_type ForeignScanEnd_hook = NULL;
+
 
 /* ----------------------------------------------------------------
  *		ForeignNext
@@ -279,10 +283,18 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 		 * processing.  See also ExecForeignScan/ExecReScanForeignScan.
 		 */
 		if (estate->es_epq_active == NULL)
+		{
+			if (ForeignScanBegin_hook)
+				ForeignScanBegin_hook(scanstate, eflags);
 			fdwroutine->BeginDirectModify(scanstate, eflags);
+		}
 	}
 	else
+	{
+		if (ForeignScanBegin_hook)
+			ForeignScanBegin_hook(scanstate, eflags);
 		fdwroutine->BeginForeignScan(scanstate, eflags);
+	}
 
 	return scanstate;
 }
@@ -303,10 +315,18 @@ ExecEndForeignScan(ForeignScanState *node)
 	if (plan->operation != CMD_SELECT)
 	{
 		if (estate->es_epq_active == NULL)
+		{
 			node->fdwroutine->EndDirectModify(node);
+			if (ForeignScanEnd_hook)
+				ForeignScanEnd_hook(node);
+		}
 	}
 	else
+	{
 		node->fdwroutine->EndForeignScan(node);
+		if (ForeignScanEnd_hook)
+			ForeignScanEnd_hook(node);
+	}
 
 	/* Shut down any outer plan. */
 	if (outerPlanState(node))

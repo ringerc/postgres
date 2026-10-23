@@ -3105,6 +3105,14 @@
   boot_val => 'false',
 },
 
+{ name => 'trace_context_enabled', type => 'bool', context => 'PGC_SIGHUP', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Accept trace-context (\'M\') protocol messages from clients.',
+  long_desc => 'Runtime kill-switch for the trace-context protocol message. When off, any incoming TraceContext message is a protocol violation even from a 3.3 client. Clients at protocol 3.3 still connect normally.',
+  variable => 'trace_context_enabled',
+  boot_val => 'true',
+},
+
+
 { name => 'trace_lock_oidmin', type => 'int', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Sets the minimum OID of tables for tracking locks.',
   long_desc => 'Is used to avoid output on system tables.',

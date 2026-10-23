@@ -1,0 +1,5 @@
+# otel_postgres_tracing extension
+comment = 'OpenTelemetry instrumentation for PostgreSQL query execution'
+default_version = '0.1.1'
+module_pathname = '$libdir/otel_postgres_tracing'
+relocatable = true

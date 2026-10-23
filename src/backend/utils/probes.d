@@ -91,4 +91,7 @@ provider postgresql {
 	probe wal__switch();
 	probe wal__buffer__write__dirty__start();
 	probe wal__buffer__write__dirty__done();
+	probe syncrep__wait__start(unsigned long);
+	probe syncrep__wait__done(unsigned long);
+	probe recovery__xact__commit(const char *, unsigned long);
 };

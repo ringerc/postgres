@@ -25,6 +25,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/backend_status.h"
 #include "utils/guc.h"
+#include "utils/json.h"
 #include "utils/ps_status.h"
 
 
@@ -249,6 +250,36 @@ write_csvlog(ErrorData *edata)
 
 	/* query id */
 	appendStringInfo(&buf, "%" PRId64, pgstat_get_my_query_id());
+	appendStringInfoChar(&buf, ',');
+
+	/*
+	 * Annotations attached via errannot(), serialized as a single
+	 * JSON-encoded object.  Always emitted as one trailing column whether
+	 * or not any annotations are set, so the CSV column count is stable
+	 * regardless of how the annotation surface grows in future releases.
+	 */
+	if (edata->annotations)
+	{
+		StringInfoData annbuf;
+		bool		first = true;
+
+		initStringInfo(&annbuf);
+		appendStringInfoChar(&annbuf, '{');
+		for (ErrorAnnotation *ann = edata->annotations;
+			 ann != NULL;
+			 ann = ann->next)
+		{
+			if (!first)
+				appendStringInfoChar(&annbuf, ',');
+			first = false;
+			escape_json(&annbuf, ann->key);
+			appendStringInfoChar(&annbuf, ':');
+			escape_json(&annbuf, ann->value);
+		}
+		appendStringInfoChar(&annbuf, '}');
+		appendCSVLiteral(&buf, annbuf.data);
+		pfree(annbuf.data);
+	}
 
 	appendStringInfoChar(&buf, '\n');
 
