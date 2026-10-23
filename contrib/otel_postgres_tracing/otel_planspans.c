@@ -16,11 +16,13 @@
  *   SortState           -> pg.exec.sort  (+ sort method / space type / kB)
  *   IncrementalSortState -> pg.exec.sort
  *
- * Unlike the others, a sort span is minted at node_end, not node_begin: it is
- * back-dated by the node's instrumented time (the figure EXPLAIN ANALYZE
- * shows, children included) and ends at ExecutorEnd.  Nodes are not
- * timestamped as they run, so its start is a reconstruction, not a recorded
- * instant.
+ * Unlike the others, a sort span is minted at node_end, not node_begin.  For
+ * SortState, node_begin wraps ps->ExecProcNode to record the wall clock at
+ * entry to the first call (which does the whole sort) and at the return of its
+ * first tuple, then unwraps; node_end emits the span with those bounds.  An
+ * IncrementalSortState sorts group by group over the node's life, so it has no
+ * such interval: its span is back-dated by the node's instrumented time and
+ * ends at ExecutorEnd, a reconstruction rather than a recorded instant.
  *
  * The span nests under the active pgsql.execute span (span_link_to_active_
  * and_push).  This is deliberately a SMALL curated set -- spanning every plan
@@ -78,6 +80,59 @@ static struct
 static int	planspans_depth = 0;
 
 /*
+ * Timestamps recorded around the first ExecProcNode call of a Sort node, keyed
+ * by PlanState pointer.  Same lifetime rules as planspans_stack[]; no span
+ * exists until node_end, so nothing here is owned by the producer.
+ */
+static struct
+{
+	PlanState  *node;
+	ExecProcNodeMtd prev;		/* the ExecProcNode we replaced */
+	TimestampTz start;
+	TimestampTz end;			/* 0 until the first call returns */
+	int			subxact_level;
+} sortwrap_stack[OTEL_PLANSPANS_STACK_MAX];
+static int	sortwrap_depth = 0;
+
+static int
+sortwrap_find(PlanState *ps)
+{
+	for (int i = sortwrap_depth - 1; i >= 0; i--)
+		if (sortwrap_stack[i].node == ps)
+			return i;
+	return -1;
+}
+
+/*
+ * Replaces a Sort node's ExecProcNode until its first call returns.  The
+ * original is restored before it is called, so the executor's own
+ * ExecProcNodeFirst bookkeeping (stack check, instrumentation wrapper)
+ * proceeds as usual and later calls pay nothing.
+ */
+static TupleTableSlot *
+sortwrap_exec(PlanState *node)
+{
+	int			i = sortwrap_find(node);
+	ExecProcNodeMtd prev;
+	TupleTableSlot *slot;
+
+	if (i < 0)
+		elog(ERROR, "otel_planspans: sort node has no wrapper entry");
+
+	prev = sortwrap_stack[i].prev;
+	node->ExecProcNode = prev;
+	sortwrap_stack[i].start = GetCurrentTimestamp();
+
+	slot = prev(node);
+
+	/* Re-find: nested execution may have moved entries. */
+	i = sortwrap_find(node);
+	if (i >= 0)
+		sortwrap_stack[i].end = GetCurrentTimestamp();
+	return slot;
+}
+
+/*
  * Return the span name for a curated node kind, or NULL if this node is not
  * one we span.  Also the cheap membership test used on both begin and end.
  */
@@ -125,6 +180,18 @@ planspans_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 	const char *name = planspans_span_name(ps);
 	OtelSpanRef s;
 
+	if (IsA(ps, SortState) && sortwrap_depth < OTEL_PLANSPANS_STACK_MAX)
+	{
+		sortwrap_stack[sortwrap_depth].node = ps;
+		sortwrap_stack[sortwrap_depth].prev = ps->ExecProcNode;
+		sortwrap_stack[sortwrap_depth].start = 0;
+		sortwrap_stack[sortwrap_depth].end = 0;
+		sortwrap_stack[sortwrap_depth].subxact_level = GetCurrentTransactionNestLevel();
+		sortwrap_depth++;
+		ps->ExecProcNode = sortwrap_exec;
+		return;
+	}
+
 	if (name == NULL || planspans_depth >= OTEL_PLANSPANS_STACK_MAX)
 		return;
 
@@ -163,21 +230,40 @@ planspans_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 /*
  * Emit the pg.exec.sort span for a Sort / IncrementalSort node that ran.
  * Called during the end walk, so the node's tuplesort state is still live.
- * Needs the node's Instrumentation (otel_planwalk_want_instrumentation()
- * requests it); without it there is no duration to report, so no span.
+ * Bounds are the recorded wall-clock interval of a Sort's first call, or for
+ * IncrementalSort the back-dated instrumented time.  Returns nothing if the
+ * node never ran.
  */
 static void
 planspans_sort_span(PlanState *ps, OtelPlanwalkContext *ctx)
 {
 	OtelNodeInstr *ni = ps->instrument;
-	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz start;
+	TimestampTz end;
+	int			w = IsA(ps, SortState) ? sortwrap_find(ps) : -1;
 	OtelSpanRef s;
 
-	if (ni == NULL)
-		return;
-	InstrEndLoop(ni);
-	if (ni->nloops <= 0)
-		return;					/* never executed */
+	if (w >= 0)
+	{
+		start = sortwrap_stack[w].start;
+		end = sortwrap_stack[w].end;
+		/* Remove the entry; the node is done. */
+		for (int j = w; j < sortwrap_depth - 1; j++)
+			sortwrap_stack[j] = sortwrap_stack[j + 1];
+		sortwrap_depth--;
+		if (end == 0)
+			return;					/* never executed */
+	}
+	else
+	{
+		if (ni == NULL)
+			return;
+		InstrEndLoop(ni);
+		if (ni->nloops <= 0)
+			return;
+		end = GetCurrentTimestamp();
+		start = TimestampTzPlusMilliseconds(end, -(int64) OTEL_NI_TOTAL_MS(ni));
+	}
 
 	s = otel_span_start(.tracer = &otel_pg_tracer,
 						.name = "pg.exec.sort",
@@ -185,15 +271,15 @@ planspans_sort_span(PlanState *ps, OtelPlanwalkContext *ctx)
 						.detached = true,
 						.parent = OTEL_PARENT_SPAN,
 						.parent_span = planspans_parent(ctx),
-						.start_time = TimestampTzPlusMilliseconds(now,
-							-(int64) OTEL_NI_TOTAL_MS(ni)));
+						.start_time = start);
 	if (s.v == 0)
 		return;
 
 	otel_span_set_str(s, OTEL_ATTR_PG_PLAN_NODE_TYPE,
 					  IsA(ps, SortState) ? "Sort" : "IncrementalSort");
-	otel_span_set_int(s, OTEL_ATTR_PG_PLAN_NODE_ROWS,
-					  (int64) (ni->ntuples / ni->nloops));
+	if (ni != NULL && ni->nloops > 0)
+		otel_span_set_int(s, OTEL_ATTR_PG_PLAN_NODE_ROWS,
+						  (int64) (ni->ntuples / ni->nloops));
 
 	if (IsA(ps, SortState))
 	{
@@ -212,7 +298,7 @@ planspans_sort_span(PlanState *ps, OtelPlanwalkContext *ctx)
 		}
 	}
 
-	otel_span_end_at(s, now);
+	otel_span_end_at(s, end);
 }
 
 /*
@@ -297,8 +383,8 @@ otel_planspans_install(void)
 							 "Emit child spans for a curated set of plan node types.",
 							 "When on, sampled queries get pg.customscan / pg.funcscan / "
 							 "pg.tablefuncscan / pg.parallel.gather / pg.exec.sort child spans "
-							 "nested under pgsql.execute.  Only the sort spans carry timing "
-							 "(the node's instrumented time); off by default.",
+							 "nested under pgsql.execute.  Sort spans carry the measured "
+							 "time of the sort; off by default.",
 							 &otel_trace_plan_child_spans,
 							 false,
 							 PGC_USERSET,
@@ -322,10 +408,20 @@ otel_planspans_subxact_abort(SubXactEvent event)
 	int			new_depth;
 	int			i;
 
-	if (event != SUBXACT_EVENT_ABORT_SUB || planspans_depth == 0)
+	if (event != SUBXACT_EVENT_ABORT_SUB)
 		return;
 
 	current_level = GetCurrentTransactionNestLevel();
+
+	/* Sort wrapper entries pushed in the aborting subxact. */
+	new_depth = 0;
+	for (i = 0; i < sortwrap_depth; i++)
+		if (sortwrap_stack[i].subxact_level < current_level)
+			sortwrap_stack[new_depth++] = sortwrap_stack[i];
+	sortwrap_depth = new_depth;
+
+	if (planspans_depth == 0)
+		return;
 	new_depth = 0;
 
 	for (i = 0; i < planspans_depth; i++)
@@ -351,4 +447,5 @@ void
 otel_planspans_reset(void)
 {
 	planspans_depth = 0;
+	sortwrap_depth = 0;
 }

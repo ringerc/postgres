@@ -2,7 +2,7 @@
 #
 # With otel.trace_plan_child_spans on, a Sort plan node gets a pg.exec.sort
 # span carrying the sort method, space type and space used, and lasting as
-# long as the node's own instrumented time (not the whole statement).  The
+# long as the measured first call of the node (not the whole statement).  The
 # coarse SDT pg.sort family is not in the default family list.
 
 use strict;
@@ -91,8 +91,12 @@ cmp_ok($a->{'pg.sort.space_kb'}, '>', 0, 'space used reported');
 is($sorts[0]{parent_span_id}, $exec->{span_id},
 	'sort node span nests under pgsql.execute');
 cmp_ok(dur($sorts[0]), '>', 0, 'sort node span has a duration');
-cmp_ok(dur($sorts[0]), '<=', dur($exec),
-	'sort node span is no longer than the statement');
+cmp_ok(tod($sorts[0]{start_time}), '>=', tod($exec->{start_time}),
+	'sort node span starts within the statement');
+cmp_ok(tod($sorts[0]{end_time}), '<=', tod($exec->{end_time}),
+	'sort node span ends within the statement');
+cmp_ok(dur($sorts[0]), '<', dur($exec),
+	'sort node span is shorter than the statement');
 
 # Disk sort.
 ($exec, @spans) = run_spans(
