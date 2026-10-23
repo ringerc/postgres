@@ -29,6 +29,7 @@
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
 #include "otel_planwalk.h"
+#include "otel_planspans.h"
 
 /*
  * GUC: otel.trace_plan_node_stats (group-A feature gate).
@@ -245,5 +246,6 @@ otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpanRef stmt_span,
 bool
 otel_planwalk_want_instrumentation(void)
 {
-	return otel_trace_plan_node_stats || otel_trace_plan_node_events;
+	return otel_trace_plan_node_stats || otel_trace_plan_node_events ||
+		otel_trace_plan_child_spans;
 }

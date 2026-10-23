@@ -70,32 +70,6 @@
 #include "otel_planpath.h"
 #include "otel_planwalk.h"
 
-/*
- * PlanState.instrument accessors, papering over the PG18/PG19 divergence.
- *
- * On the patched PG19 core, PlanState.instrument is NodeInstrumentation* --
- * the per-node stats were split into executor/instrument_node.h, the base
- * Instrumentation is nested as .instr, and the timing counters (total,
- * startup) are instr_time (read via INSTR_TIME_GET_MILLISEC).
- *
- * On PG18 it is the stock Instrumentation*: total/startup are plain doubles in
- * *seconds* and bufusage is a top-level field.  These macros yield the same
- * millisecond / BufferUsage values from either layout so the collector body is
- * shared verbatim.  ntuples/nloops are top-level in both and used directly.
- */
-#if PG_VERSION_NUM >= 190000
-#include "executor/instrument_node.h"
-typedef NodeInstrumentation OtelNodeInstr;
-#define OTEL_NI_TOTAL_MS(ni)	INSTR_TIME_GET_MILLISEC((ni)->instr.total)
-#define OTEL_NI_STARTUP_MS(ni)	INSTR_TIME_GET_MILLISEC((ni)->startup)
-#define OTEL_NI_BUFUSAGE(ni)	((ni)->instr.bufusage)
-#else
-typedef Instrumentation OtelNodeInstr;
-#define OTEL_NI_TOTAL_MS(ni)	((ni)->total * 1000.0)
-#define OTEL_NI_STARTUP_MS(ni)	((ni)->startup * 1000.0)
-#define OTEL_NI_BUFUSAGE(ni)	((ni)->bufusage)
-#endif
-
 /* -------------------------------------------------------------------------
  * Local constants
  * -------------------------------------------------------------------------
