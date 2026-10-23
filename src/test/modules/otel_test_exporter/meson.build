@@ -43,6 +43,11 @@ tests += {
       't/008_scope.pl',
       't/009_order_independent.pl',
       't/010_cursor_spans.pl',
+      't/011_lock_xid_join.pl',
+      't/012_sdt_probe_guc_midstatement.pl',
+      't/013_parallel_worker_attrs.pl',
+      't/014_parallel_worker_sdt.pl',
+      't/015_sort_node_span.pl',
     ],
   },
 }
