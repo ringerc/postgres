@@ -13,6 +13,14 @@
  *   TableFuncScanState  -> pg.tablefuncscan
  *   GatherState         -> pg.parallel.gather  (+ workers planned/launched)
  *   GatherMergeState    -> pg.parallel.gather  (+ workers planned/launched)
+ *   SortState           -> pg.exec.sort  (+ sort method / space type / kB)
+ *   IncrementalSortState -> pg.exec.sort
+ *
+ * Unlike the others, a sort span is minted at node_end, not node_begin: it is
+ * back-dated by the node's instrumented time (the figure EXPLAIN ANALYZE
+ * shows, children included) and ends at ExecutorEnd.  Nodes are not
+ * timestamped as they run, so its start is a reconstruction, not a recorded
+ * instant.
  *
  * The span nests under the active pgsql.execute span (span_link_to_active_
  * and_push).  This is deliberately a SMALL curated set -- spanning every plan
@@ -43,6 +51,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "utils/tuplesort.h"
 
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
@@ -152,6 +161,61 @@ planspans_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 }
 
 /*
+ * Emit the pg.exec.sort span for a Sort / IncrementalSort node that ran.
+ * Called during the end walk, so the node's tuplesort state is still live.
+ * Needs the node's Instrumentation (otel_planwalk_want_instrumentation()
+ * requests it); without it there is no duration to report, so no span.
+ */
+static void
+planspans_sort_span(PlanState *ps, OtelPlanwalkContext *ctx)
+{
+	OtelNodeInstr *ni = ps->instrument;
+	TimestampTz now = GetCurrentTimestamp();
+	OtelSpanRef s;
+
+	if (ni == NULL)
+		return;
+	InstrEndLoop(ni);
+	if (ni->nloops <= 0)
+		return;					/* never executed */
+
+	s = otel_span_start(.tracer = &otel_pg_tracer,
+						.name = "pg.exec.sort",
+						.kind = OTEL_SPAN_KIND_INTERNAL,
+						.detached = true,
+						.parent = OTEL_PARENT_SPAN,
+						.parent_span = planspans_parent(ctx),
+						.start_time = TimestampTzPlusMilliseconds(now,
+							-(int64) OTEL_NI_TOTAL_MS(ni)));
+	if (s.v == 0)
+		return;
+
+	otel_span_set_str(s, OTEL_ATTR_PG_PLAN_NODE_TYPE,
+					  IsA(ps, SortState) ? "Sort" : "IncrementalSort");
+	otel_span_set_int(s, OTEL_ATTR_PG_PLAN_NODE_ROWS,
+					  (int64) (ni->ntuples / ni->nloops));
+
+	if (IsA(ps, SortState))
+	{
+		SortState  *ss = (SortState *) ps;
+
+		if (ss->sort_Done && ss->tuplesortstate != NULL)
+		{
+			TuplesortInstrumentation stats;
+
+			tuplesort_get_stats((Tuplesortstate *) ss->tuplesortstate, &stats);
+			otel_span_set_str(s, OTEL_ATTR_PG_SORT_METHOD,
+							  tuplesort_method_name(stats.sortMethod));
+			otel_span_set_str(s, OTEL_ATTR_PG_SORT_SPACE_TYPE,
+							  tuplesort_space_type_name(stats.spaceType));
+			otel_span_set_int(s, OTEL_ATTR_PG_SORT_SPACE_KB, stats.spaceUsed);
+		}
+	}
+
+	otel_span_end_at(s, now);
+}
+
+/*
  * node_end: locate the tracking entry for this node (non-LIFO), add any
  * runtime attributes, end the span, and compact the stack.
  */
@@ -159,6 +223,12 @@ static void
 planspans_node_end(PlanState *ps, OtelPlanwalkContext *ctx)
 {
 	int			i;
+
+	if (IsA(ps, SortState) || IsA(ps, IncrementalSortState))
+	{
+		planspans_sort_span(ps, ctx);
+		return;
+	}
 
 	if (planspans_span_name(ps) == NULL || planspans_depth == 0)
 		return;
@@ -226,8 +296,9 @@ otel_planspans_install(void)
 	DefineCustomBoolVariable("otel.trace_plan_child_spans",
 							 "Emit child spans for a curated set of plan node types.",
 							 "When on, sampled queries get pg.customscan / pg.funcscan / "
-							 "pg.tablefuncscan / pg.parallel.gather child spans nested under "
-							 "pgsql.execute.  Structural (no per-node timing); off by default.",
+							 "pg.tablefuncscan / pg.parallel.gather / pg.exec.sort child spans "
+							 "nested under pgsql.execute.  Only the sort spans carry timing "
+							 "(the node's instrumented time); off by default.",
 							 &otel_trace_plan_child_spans,
 							 false,
 							 PGC_USERSET,

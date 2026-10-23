@@ -50,10 +50,21 @@
 #define OTEL_ATTR_PG_EXEC_SLOWEST_NODES			"pg.exec.slowest_nodes"
 
 /* Curated child spans (otel_planspans.c) */
+#define OTEL_ATTR_PG_SORT_METHOD			"pg.sort.method"
+#define OTEL_ATTR_PG_SORT_SPACE_TYPE		"pg.sort.space_type"
+#define OTEL_ATTR_PG_SORT_SPACE_KB			"pg.sort.space_kb"
 #define OTEL_ATTR_PG_CUSTOMSCAN_METHOD		"pg.customscan.method"
 
 /* FDW scan spans (otel_fdw.c) */
 /* db.system.name / db.collection.name (semconv) cover this span's attrs. */
+
+/* Transaction / backend identity (otel_sdt_bridge.c) */
+#define OTEL_ATTR_PG_TXN_XID				"pg.txn.xid"
+#define OTEL_ATTR_PG_BACKEND_PID			"pg.backend.pid"
+
+/* Parallel query execute spans (otel_trace.c) */
+#define OTEL_ATTR_PG_PARALLEL_WORKER_NUMBER	"pg.parallel.worker_number"
+#define OTEL_ATTR_PG_PARALLEL_LEADER		"pg.parallel.leader"
 
 /* Lock-wait bridge span (otel_sdt_bridge.c) */
 #define OTEL_ATTR_PG_LOCK_TYPE			"pg.lock.type"
@@ -65,6 +76,7 @@
 #define OTEL_ATTR_PG_LOCK_XID			"pg.lock.xid"
 #define OTEL_ATTR_PG_LOCK_PROCNO			"pg.lock.procno"
 #define OTEL_ATTR_PG_LOCK_LOCALXID		"pg.lock.localxid"
+#define OTEL_ATTR_PG_LOCK_SPECTOKEN		"pg.lock.spectoken"
 #define OTEL_ATTR_PG_LOCK_FIELD1			"pg.lock.field1"
 #define OTEL_ATTR_PG_LOCK_FIELD2			"pg.lock.field2"
 #define OTEL_ATTR_PG_LOCK_FIELD3			"pg.lock.field3"

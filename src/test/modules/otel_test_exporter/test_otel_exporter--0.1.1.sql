@@ -41,3 +41,8 @@ CREATE FUNCTION test_otel_resource_attributes()
 RETURNS text
 AS 'MODULE_PATHNAME', 'test_otel_resource_attributes'
 LANGUAGE C VOLATILE PARALLEL SAFE;
+
+CREATE FUNCTION test_otel_spectoken_lock(xid bigint, token integer, mode text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'test_otel_spectoken_lock'
+LANGUAGE C VOLATILE;
