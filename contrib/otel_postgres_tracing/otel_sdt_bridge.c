@@ -73,6 +73,7 @@
 
 #include <string.h>
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
@@ -100,6 +101,7 @@
 #define SDT_STACK_SIZE	64
 
 static OtelSpanRef		sdt_stack[SDT_STACK_SIZE];
+static PgSdtProbeId		sdt_stack_start_id[SDT_STACK_SIZE];	/* START probe of each entry */
 static int				sdt_top = 0;	/* next free slot; 0 == empty */
 
 /*
@@ -163,6 +165,12 @@ static OtelSpanRef		txn_span = OTEL_SPAN_NONE;
  * SHOW / pg_settings can echo the configured value.
  */
 static char			   *otel_trace_sdt_probes_str = NULL;
+
+/*
+ * The mask the GUC asks for.  pg_sdt_probe_enabled_mask is this plus the
+ * DONE probes of every span still open (see sdt_sync_probe_mask()).
+ */
+static uint64			sdt_wanted_mask = 0;
 
 
 /* -----------------------------------------------------------------------
@@ -235,6 +243,7 @@ static const SdtFamilyMap sdt_family_map[] = {
 static void otel_sdt_hook(int id, const PgSdtArg *args, int nargs);
 static void otel_sdt_xact_cb(XactEvent event, void *arg);
 static void sdt_discard_open_spans(void);
+static void sdt_sync_probe_mask(void);
 static bool sdt_probes_parse(const char *value, uint64 *mask_out);
 static bool sdt_probes_check_hook(char **newval, void **extra, GucSource source);
 static void sdt_probes_assign_hook(const char *newval, void *extra);
@@ -334,7 +343,8 @@ sdt_probes_assign_hook(const char *newval, void *extra)
 {
 	uint64	   *extra_mask = (uint64 *) extra;
 
-	pg_sdt_probe_enabled_mask = extra_mask ? *extra_mask : 0;
+	sdt_wanted_mask = extra_mask ? *extra_mask : 0;
+	sdt_sync_probe_mask();
 }
 
 
@@ -356,12 +366,16 @@ otel_sdt_install(void)
 							   "tokens: txn, query, parse, rewrite, plan, execute, "
 							   "sort, smgr_read, smgr_write, smgr, syncrep, "
 							   "replica, lock_wait, plus all and none.  smgr "
-							   "families are high-volume and off by default.  "
+							   "families are high-volume and off by default, as is "
+							   "sort: its span runs from the Sort node's first "
+							   "fetch to executor shutdown, so it is far longer "
+							   "than the sort; use otel.trace_plan_child_spans "
+							   "for accurate sort spans.  "
 							   "This list drives pg_sdt_probe_enabled_mask, which "
 							   "gates the probes at the call site; families not "
 							   "listed never call into this extension.",
 							   &otel_trace_sdt_probes_str,
-							   "query,parse,rewrite,plan,execute,sort,syncrep,replica,lock_wait",
+							   "query,parse,rewrite,plan,execute,syncrep,replica,lock_wait",
 							   PGC_USERSET,
 							   GUC_LIST_INPUT,
 							   sdt_probes_check_hook,
@@ -426,6 +440,20 @@ sdt_locktag_type_name(int t)
 }
 
 
+/*
+ * Stamp the transaction's top-level xid on its pg.txn span so a waiter's
+ * pg.lock.xid joins to the holder.  Read-only transactions never get an
+ * xid; the attribute is then omitted.
+ */
+static void
+sdt_set_txn_xid(OtelSpanRef span)
+{
+	TransactionId xid = GetTopTransactionIdIfAny();
+
+	if (TransactionIdIsValid(xid))
+		otel_span_set_int(span, OTEL_ATTR_PG_TXN_XID, (int64) xid);
+}
+
 /* -----------------------------------------------------------------------
  * otel_sdt_hook
  *
@@ -447,10 +475,12 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	 * on.  The per-family in-hook gates below are likewise gone.
 	 */
 
-	/* Only trace client-connected backends — UNLESS this is the replica
-	 * apply probe, which fires in the startup/recovery process where
-	 * MyProcPort is always NULL. */
-	if (MyProcPort == NULL && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
+	/* Only trace client-connected backends and their parallel workers
+	 * (which have no MyProcPort) — UNLESS this is the replica apply probe,
+	 * which fires in the startup/recovery process where MyProcPort is
+	 * always NULL. */
+	if (MyProcPort == NULL && !IsParallelWorker() &&
+		(PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
 		return;
 
 	/* otel_api refuses every call inside a critical section. */
@@ -493,11 +523,14 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 										   .detached = true);
 				otel_span_set_str(txn_span, OTEL_PG_SPAN_SOURCE,
 								  SDT_SPAN_SOURCE_ATTR_VAL);
+				otel_span_set_int(txn_span, OTEL_ATTR_PG_BACKEND_PID,
+								  MyProcPid);
 			}
 			return;
 		case PG_SDT_TRANSACTION_COMMIT:
 			if (txn_span.v != 0)
 			{
+				sdt_set_txn_xid(txn_span);
 				otel_span_end(txn_span);
 				txn_span = OTEL_SPAN_NONE;
 			}
@@ -517,12 +550,14 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			 * run off the end of sort_stack[].
 			 */
 			sort_top = 0;
+			sdt_sync_probe_mask();
 			return;
 		case PG_SDT_TRANSACTION_ABORT:
 			if (txn_span.v != 0)
 			{
 				otel_span_set_status(txn_span, OTEL_STATUS_ERROR,
 									 "transaction aborted");
+				sdt_set_txn_xid(txn_span);
 				otel_span_end(txn_span);
 				txn_span = OTEL_SPAN_NONE;
 			}
@@ -785,6 +820,8 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				int			mode = (int) args[5].v.i;
 				const char *tname = sdt_locktag_type_name(locktag_type);
 
+				otel_span_set_int(s, OTEL_ATTR_PG_BACKEND_PID, MyProcPid);
+
 				if (tname != NULL)
 					otel_span_set_str(s, OTEL_ATTR_PG_LOCK_TYPE, tname);
 				else
@@ -815,6 +852,11 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_XID, field1);
 						break;
 
+					case LOCKTAG_SPECULATIVE_TOKEN:
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_XID, field1);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_SPECTOKEN, field2);
+						break;
+
 					case LOCKTAG_VIRTUALTRANSACTION:
 						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_PROCNO, field1);
 						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_LOCALXID, field2);
@@ -834,7 +876,10 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 		if ((PgSdtProbeId) id == PG_SDT_SORT_START)
 			sort_stack[sort_top++] = s;
 		else
+		{
+			sdt_stack_start_id[sdt_top] = (PgSdtProbeId) id;
 			sdt_stack[sdt_top++] = s;
+		}
 
 		/*
 		 * Associate the per-statement query trace with the
@@ -867,10 +912,15 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	}
 	else
 	{
-		if (sdt_top <= 0)
+		/*
+		 * A family enabled mid-statement delivers DONE probes whose START
+		 * was never seen; only end the span this DONE belongs to.
+		 */
+		if (sdt_top <= 0 || sdt_stack_start_id[sdt_top - 1] != id - 1)
 			return;				/* no matching START on our stack */
 		s = sdt_stack[--sdt_top];
 	}
+	sdt_sync_probe_mask();
 
 	/*
 	 * SDT start/done pairs are LIFO in the common case so our span is the
@@ -913,6 +963,32 @@ sdt_discard_open_spans(void)
 		otel_span_discard(sdt_stack[--sdt_top]);
 	while (sort_top > 0)
 		otel_span_discard(sort_stack[--sort_top]);
+	sdt_sync_probe_mask();
+}
+
+/*
+ * Set pg_sdt_probe_enabled_mask from the GUC's mask plus the DONE probes
+ * of every span still open.  otel.trace_sdt_probes can change between a
+ * START probe and its DONE (a SET in the statement being traced), and a
+ * span whose DONE is masked off would stay open until its resource owner
+ * is released, which reports it as a leak.  Only the DONE bit is kept, so
+ * no new spans start for a family that was turned off.
+ */
+static void
+sdt_sync_probe_mask(void)
+{
+	uint64		mask = sdt_wanted_mask;
+	int			i;
+
+	for (i = 0; i < sdt_top; i++)
+		mask |= SDT_BIT(sdt_stack_start_id[i] + 1);
+	if (sort_top > 0)
+		mask |= SDT_BIT(PG_SDT_SORT_DONE);
+	if (txn_span.v != 0)
+		mask |= SDT_BIT(PG_SDT_TRANSACTION_COMMIT) |
+			SDT_BIT(PG_SDT_TRANSACTION_ABORT);
+
+	pg_sdt_probe_enabled_mask = mask;
 }
 
 /* -----------------------------------------------------------------------
@@ -942,8 +1018,8 @@ otel_sdt_xact_cb(XactEvent event, void *arg)
 			 * still open, is force-ended by its TopTransactionResourceOwner
 			 * being released.
 			 */
-			sdt_discard_open_spans();
 			txn_span = OTEL_SPAN_NONE;
+			sdt_discard_open_spans();
 			break;
 
 		default:

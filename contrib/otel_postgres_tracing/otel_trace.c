@@ -60,6 +60,7 @@
 
 #include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
+#include "otel_pg_attrs.h"
 #include "otel_fdw.h"
 #include "otel_planwalk.h"
 #include "otel_planspans.h"
@@ -516,6 +517,17 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		push_stmt_span(queryDesc, s, is_cursor);
 
 	/*
+	 * Identify a parallel worker's span.  The worker number stays out of
+	 * the span name; workers' spans are otherwise identical.
+	 */
+	if (IsParallelWorker())
+	{
+		otel_span_set_int(s, OTEL_ATTR_PG_PARALLEL_WORKER_NUMBER,
+						  ParallelWorkerNumber);
+		otel_span_set_int(s, OTEL_ATTR_PG_BACKEND_PID, MyProcPid);
+	}
+
+	/*
 	 * If any group-A feature is enabled, turn on per-node Instrumentation
 	 * for this query so collectors can read timing/row counts at
 	 * ExecutorEnd.  Must happen BEFORE standard_ExecutorStart so the
@@ -592,6 +604,10 @@ static void
 otel_ExecutorEnd(QueryDesc *queryDesc)
 {
 	OtelSpanRef s = pop_stmt_span(queryDesc);
+
+	/* Mark the span of a statement that actually ran parallel workers. */
+	if (queryDesc->estate && queryDesc->estate->es_parallel_workers_launched > 0)
+		otel_span_set_bool(s, OTEL_ATTR_PG_PARALLEL_LEADER, true);
 
 	/*
 	 * Drive the planstate-walker end-walk before standard_ExecutorEnd
