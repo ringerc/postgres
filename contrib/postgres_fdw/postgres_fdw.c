@@ -3838,7 +3838,7 @@ create_cursor(ForeignScanState *node)
 
 	/* OTel: start a span covering the remote cursor declaration. */
 	span = otel_span_start(.tracer = &pgfdw_tracer,
-							.name = "pg.fdw.cursor",
+							.name = "pg.postgres_fdw.cursor",
 							.kind = OTEL_SPAN_KIND_CLIENT,
 							.scoped = true);
 	otel_span_set_str(span, "db.system", "postgresql");
@@ -3936,7 +3936,7 @@ fetch_more_data(ForeignScanState *node)
 
 	/* OTel: start span before context switch so callback binds to caller's ctx. */
 	span = otel_span_start(.tracer = &pgfdw_tracer,
-							.name = "pg.fdw.fetch",
+							.name = "pg.postgres_fdw.fetch",
 							.kind = OTEL_SPAN_KIND_CLIENT,
 							.scoped = true);
 	otel_span_set_str(span, "db.system", "postgresql");
@@ -4021,7 +4021,7 @@ fetch_more_data(ForeignScanState *node)
 	MemoryContextSwitchTo(oldcontext);
 
 	/* OTel: record row count and emit span. */
-	otel_span_set_int(span, "pg.fdw.fetch.rows", fsstate->num_tuples);
+	otel_span_set_int(span, "pg.postgres_fdw.fetch.rows", fsstate->num_tuples);
 	otel_span_end(span);
 }
 
@@ -4702,7 +4702,7 @@ execute_dml_stmt(ForeignScanState *node)
 
 	/* OTel: start span covering the remote DML execution. */
 	span = otel_span_start(.tracer = &pgfdw_tracer,
-							.name = "pg.fdw.modify",
+							.name = "pg.postgres_fdw.modify",
 							.kind = OTEL_SPAN_KIND_CLIENT,
 							.scoped = true);
 	otel_span_set_str(span, "db.system", "postgresql");

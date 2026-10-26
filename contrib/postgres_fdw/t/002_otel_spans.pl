@@ -8,13 +8,13 @@
 # every assertion below fails.
 #
 # Exercises two things:
-#  - pg.fdw.* CLIENT spans are produced locally for a foreign scan.
+#  - pg.postgres_fdw.* CLIENT spans are produced locally for a foreign scan.
 #  - the default "comment" trace-propagation mode (postgres_fdw.
 #    trace_propagation = comment) carries the SAME trace_id to the REMOTE
 #    backend that executes the pushed-down DECLARE CURSOR (a separate
 #    backend process, reached over a loopback FDW connection back to this
 #    same cluster), and that remote statement span is parented to our
-#    local pg.fdw.cursor span specifically -- proving genuine cross-process
+#    local pg.postgres_fdw.cursor span specifically -- proving genuine cross-process
 #    propagation, not just a locally-observed decoration.
 
 use strict;
@@ -184,7 +184,7 @@ send_startup(
 drain_to_rfq($sock);
 
 # ----------------------------------------------------------------------
-# Test 1: pg.fdw.* CLIENT spans are produced locally for a foreign scan,
+# Test 1: pg.postgres_fdw.* CLIENT spans are produced locally for a foreign scan,
 # and carry the propagated trace_id.
 # ----------------------------------------------------------------------
 
@@ -203,30 +203,32 @@ send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
 run_query($sock, 'SELECT a FROM fdw_otel_f ORDER BY a');
 
 my @msgs = run_query($sock,
-	"SELECT test_otel_pop_span_by_name('pg.fdw.cursor')");
+	"SELECT test_otel_pop_span_by_name('pg.postgres_fdw.cursor')");
 my $cursor_span = first_value(@msgs);
 ok(defined $cursor_span && length $cursor_span,
-	'pg.fdw.cursor span captured for the foreign scan');
+	'pg.postgres_fdw.cursor span captured for the foreign scan');
 like($cursor_span, qr/trace_id=$TRACE_ID/,
 	'fdw cursor span carries the propagated trace_id');
 like($cursor_span, qr/kind=2\n/, 'fdw cursor span is CLIENT kind');
+like($cursor_span, qr/^scope\.name=postgres_fdw$/m,
+	'fdw cursor span: scope.name identifies postgres_fdw');
 like($cursor_span, qr/attr=db\.system=postgresql/,
 	'fdw cursor span carries db.system=postgresql');
 
 my ($cursor_span_id) = $cursor_span =~ /span_id=([0-9a-f]{16})/;
 ok(defined $cursor_span_id, 'extracted the fdw cursor span_id');
 
-@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pg.fdw.fetch')");
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pg.postgres_fdw.fetch')");
 my $fetch_span = first_value(@msgs);
 ok(defined $fetch_span && length $fetch_span,
-	'pg.fdw.fetch span captured for the foreign scan');
+	'pg.postgres_fdw.fetch span captured for the foreign scan');
 like($fetch_span, qr/trace_id=$TRACE_ID/,
 	'fdw fetch span carries the propagated trace_id');
 
 # ----------------------------------------------------------------------
 # Test 2: the remote backend's own statement span (a SEPARATE process,
 # handling the loopback libpq connection) carries the same trace_id and
-# is parented to our local pg.fdw.cursor span specifically.  The
+# is parented to our local pg.postgres_fdw.cursor span specifically.  The
 # pushed-down statement is itself a DECLARE CURSOR, so the remote's
 # top-level statement span is named "DECLARE CURSOR" (the command tag;
 # see otel_postgres_tracing's ProcessUtility hook).
@@ -238,7 +240,7 @@ my $log_contents = slurp_file($node->logfile, $log_offset);
 like(
 	$log_contents,
 	qr/"trace_id":"$TRACE_ID"[^}]*"parent_span_id":"$cursor_span_id"/,
-	'remote statement span carries the same trace_id and is parented to the local pg.fdw.cursor span'
+	'remote statement span carries the same trace_id and is parented to the local pg.postgres_fdw.cursor span'
 );
 like(
 	$log_contents,
