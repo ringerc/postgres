@@ -1467,6 +1467,18 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 	if (entry == NULL)
 		return 0;				/* error msg already set */
 
+	/*
+	 * Argument validation has passed and we are committed to emitting
+	 * a protocol message.  Flush any pending trace context as a
+	 * TraceContext ('M') message immediately before the Query so
+	 * the server applies it to the right operation.
+	 */
+	if (pqFlushTraceContext(conn) != 0)
+	{
+		pqRecycleCmdQueueEntry(conn, entry);
+		return 0;
+	}
+
 	/* Send the query message(s) */
 	/* construct the outgoing Query message */
 	if (pqPutMsgStart(PqMsg_Query, conn) < 0 ||
@@ -1580,6 +1592,14 @@ PQsendPrepare(PGconn *conn,
 	entry = pqAllocCmdQueueEntry(conn);
 	if (entry == NULL)
 		return 0;				/* error msg already set */
+
+	/*
+	 * Argument validation has passed and we are committed to emitting
+	 * a protocol message.  Flush any pending trace context immediately
+	 * before the Parse so the server applies it to the right operation.
+	 */
+	if (pqFlushTraceContext(conn) != 0)
+		goto sendFailed;
 
 	/* construct the Parse message */
 	if (pqPutMsgStart(PqMsg_Parse, conn) < 0 ||
@@ -1715,6 +1735,16 @@ PQsendQueryStart(PGconn *conn, bool newQuery)
 		return false;
 	}
 
+	/*
+	 * Trace-context flushing is deferred to each caller's own send path
+	 * (pqFlushTraceContext, called just before the first pqPutMsgStart for
+	 * the operation) so that trace context is emitted only when
+	 * the caller is committed to emitting a protocol message.  If a
+	 * caller fails its own argument validation, the armed state stays
+	 * intact and the next attempt re-uses it instead of inheriting
+	 * stale metadata.
+	 */
+
 	if (conn->pipelineStatus != PQ_PIPELINE_OFF)
 	{
 		/*
@@ -1787,6 +1817,15 @@ PQsendQueryGuts(PGconn *conn,
 	entry = pqAllocCmdQueueEntry(conn);
 	if (entry == NULL)
 		return 0;				/* error msg already set */
+
+	/*
+	 * Caller has already validated arguments and we are committed to
+	 * emitting a protocol message.  Flush any pending trace context
+	 * immediately before the first Parse/Bind so the server applies
+	 * it to the right operation.
+	 */
+	if (pqFlushTraceContext(conn) != 0)
+		goto sendFailed;
 
 	/*
 	 * We will send Parse (if needed), Bind, Describe Portal, Execute, Sync
@@ -2617,6 +2656,15 @@ PQsendTypedCommand(PGconn *conn, char command, char type, const char *target)
 	entry = pqAllocCmdQueueEntry(conn);
 	if (entry == NULL)
 		return 0;				/* error msg already set */
+
+	/*
+	 * Argument validation has passed and we are committed to emitting
+	 * a protocol message.  Flush any pending trace context immediately
+	 * before the Close/Describe so the server applies it to the right
+	 * operation.
+	 */
+	if (pqFlushTraceContext(conn) != 0)
+		goto sendFailed;
 
 	/* construct the Close message */
 	if (pqPutMsgStart(command, conn) < 0 ||
